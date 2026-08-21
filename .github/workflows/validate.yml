@@ -11,14 +11,14 @@ jobs:
     name: hassfest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: home-assistant/actions/hassfest@master
 
   hacs:
     name: HACS
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: hacs/action@main
         with:
           category: integration
@@ -27,14 +27,19 @@ jobs:
     name: ruff + pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pytest pytest-asyncio pytest-homeassistant-custom-component pyyaml
+          # Home Assistant намеренно не ставится: набор тестов проверяет чистую
+          # логику — протокол SIP, разбор URL, хранилище — и специально написан так,
+          # чтобы работать без него. С ним тесты не станут лучше, зато сломаются о
+          # pytest-socket, который запрещает сокеты, а фальшивый регистратор на них
+          # и держится.
+          pip install ruff==0.16.4 pytest pytest-asyncio pyyaml
       - name: Ruff
         run: ruff check custom_components tests scripts
       - name: YAML
