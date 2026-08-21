@@ -38,10 +38,27 @@ blueprint:
         text:
           multiline: true
     open_title:
-      name: Текст кнопки
+      name: Текст кнопки открытия
       default: Открыть
       selector:
         text:
+    hangup_title:
+      name: Текст кнопки отказа
+      description: >
+        Вторая кнопка: убирает звонок из Home Assistant, не открывая дверь. Домофон
+        продолжает звонить на телефон жильца — отменить вызов целиком отсюда нельзя.
+
+
+        Пустое поле — кнопки не будет.
+      default: Сбросить
+      selector:
+        text:
+    dropped_caption:
+      name: Подпись после отказа
+      default: "🔕 Сброшено: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
     opened_caption:
       name: Подпись после открытия
       default: "✅ Открыто: {{ door_name }}"
@@ -91,6 +108,7 @@ actions:
       target_in: !input telegram_target
       base_in: !input base_url
       open_in: !input open_title
+      hangup_in: !input hangup_title
 
       device_id: "{{ trigger.event.data.device_id }}"
       door_name: "{{ trigger.event.data.device_name }}"
@@ -101,12 +119,24 @@ actions:
       # сегодня вечером: полезная нагрузка привязана к запуску, и ждёт её только
       # он. Telegram ограничивает её 64 байтами — сюда влезает с запасом.
       callback: "loki_open_{{ context.id }}"
+      callback_drop: "loki_drop_{{ context.id }}"
+
+      # One row, one or two buttons. An empty title means the person did not want
+      # the second one, and an empty label on a Telegram button is not a button --
+      # it is a crash.
+      keys: >-
+        {% set row = [[open_in, callback]] %}
+        {% if hangup_in | trim %}
+        {% set row = row + [[hangup_in, callback_drop]] %}
+        {% endif %}
+        {{ [row] }}
 
       # Объявлены ПОСЛЕ door_name: значения переменных рендерятся по порядку, и
       # шаблон пользователя, поставленный раньше, получил бы пустоту.
       caption_text: !input caption
       opened_text: !input opened_caption
       missed_text: !input missed_caption
+      dropped_text: !input dropped_caption
 
       picture: >-
         {{ state_attr(camera, 'entity_picture') if camera else '' }}
@@ -124,7 +154,7 @@ actions:
               entity_id: "{{ target_in }}"
               url: "{{ base_in | trim | regex_replace('/+$', '') }}{{ picture }}"
               caption: "{{ caption_text }}"
-              inline_keyboard: "{{ [[[open_in, callback]]] }}"
+              inline_keyboard: "{{ keys }}"
             response_variable: sent
     default:
       - alias: Камеры нет — только текст
@@ -133,7 +163,7 @@ actions:
         data:
           entity_id: "{{ target_in }}"
           message: "{{ caption_text }}"
-          inline_keyboard: "{{ [[[open_in, callback]]] }}"
+          inline_keyboard: "{{ keys }}"
         response_variable: sent
 
   - alias: Ждать нажатия или конца этого вызова
@@ -145,6 +175,11 @@ actions:
         event_type: telegram_callback
         event_data:
           data: "{{ callback }}"
+      - trigger: event
+        id: hangup
+        event_type: telegram_callback
+        event_data:
+          data: "{{ callback_drop }}"
       - trigger: event
         id: ended
         event_type: loki_event
@@ -187,6 +222,29 @@ actions:
               entity_id: "{{ target_in }}"
               message_id: "{{ wait.trigger.event.data.message.message_id }}"
               caption: "{{ opened_text }}"
+              inline_keyboard: "{{ [] }}"
+
+      - alias: Нажали «Сбросить»
+        conditions:
+          - condition: template
+            value_template: "{{ wait.trigger is defined and wait.trigger.id == 'hangup' }}"
+        sequence:
+          - action: telegram_bot.answer_callback_query
+            continue_on_error: true
+            data:
+              callback_query_id: "{{ wait.trigger.event.data.id }}"
+              message: Сбрасываю…
+              show_alert: false
+          - action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - action: telegram_bot.edit_caption
+            continue_on_error: true
+            data:
+              entity_id: "{{ target_in }}"
+              message_id: "{{ wait.trigger.event.data.message.message_id }}"
+              caption: "{{ dropped_text }}"
               inline_keyboard: "{{ [] }}"
 
       - alias: Звонок вытеснен новым звонком в ту же дверь

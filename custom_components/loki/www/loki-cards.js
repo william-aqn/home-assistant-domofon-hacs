@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.3.2";
+const CARD_VERSION = "1.4.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -52,7 +52,14 @@ const SHOT_TIMEOUT = 15;
 const TILE_SIZES = { compact: 200, medium: 320, large: 460 };
 const DEFAULT_TILE_SIZE = "medium";
 
+// How long a real visit at the door lasts before the bar is empty. Not the
+// integration's own CALL_TIMEOUT (120 s) -- that one is a safety net for a call whose
+// end was never announced, and draining over two minutes would leave the bar looking
+// full through the whole of an ordinary ring. Only the bar depends on this.
+const DEFAULT_CALL_TIMEOUT = 30;
+
 const ICON_OPEN = "mdi:lock-open-variant-outline";
+const ICON_HANGUP = "mdi:phone-hangup-outline";
 const ICON_LIVE = "mdi:video-outline";
 const ICON_STOP = "mdi:video-off-outline";
 const ICON_SHOT = "mdi:camera-outline";
@@ -87,6 +94,14 @@ const t = {
   noDoors: "Домофоны не найдены. Проверьте, что интеграция Loki настроена.",
   liveBlocked: "Видеохост недоступен — живое видео не откроется",
   opening: "Открываю…",
+  hangup: "Завершить",
+  hangingUp: "Завершаю…",
+  hungUp: "Завершён",
+  onCall: "Входящий вызов",
+  layout: "Раскладка",
+  layoutFull: "Обычная — большая картинка",
+  layoutCompact: "Компактная — одна строка",
+  callTimeout: "Сколько длится вызов, с",
   opened: "Открыто",
   failed: "Ошибка",
 };
@@ -480,6 +495,15 @@ const STYLE = `
   .loki-label[hidden],
   .loki-open[hidden],
   .loki-actions[hidden],
+  .loki-round[hidden],
+  .loki-round-wrap[hidden],
+  .loki-grid[hidden],
+  .loki-side[hidden],
+  .loki-head[hidden],
+  .loki-callbar[hidden],
+  .loki-callrow[hidden],
+  .loki-pill[hidden],
+  .loki-live-badge[hidden],
   .loki-icon-btn[hidden],
   .loki-ringing[hidden],
   .loki-note[hidden],
@@ -558,6 +582,183 @@ const STYLE = `
     --mdc-icon-size: 22px;
     width: 22px;
     height: 22px;
+  }
+
+  /* Declining is round, smaller and set apart from opening. The two do opposite
+     things, and a person reaching for one of them is usually in a hurry. */
+  .loki-round-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .loki-round {
+    width: 56px;
+    height: 56px;
+    border: none;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: #fff;
+    background: var(--error-color, #db4437);
+  }
+  .loki-round[disabled] { opacity: 0.65; cursor: default; }
+  .loki-round ha-icon { --mdc-icon-size: 26px; width: 26px; height: 26px; }
+  .loki-round-label {
+    font-size: 12px;
+    color: var(--secondary-text-color, #727272);
+  }
+
+  /* The head: who is at the door, and how long they have been waiting. */
+  .loki-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 12px 0;
+  }
+  .loki-title { flex: 1; min-width: 0; }
+  .loki-name {
+    font-size: 20px;
+    font-weight: 500;
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .loki-sub {
+    font-size: 13px;
+    color: var(--secondary-text-color, #727272);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .loki-sub[hidden] { display: none; }
+
+  .loki-callbar { padding: 8px 12px 0; }
+  .loki-callrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .loki-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    color: var(--warning-color, #ffa600);
+    background: color-mix(in srgb, var(--warning-color, #ffa600) 16%, transparent);
+  }
+  .loki-pill::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    /* Breathing, not blinking: a hard blink on a wall panel in a dark hallway is
+       the sort of thing people end up covering with tape. */
+    animation: loki-breathe 2s ease-in-out infinite;
+  }
+  @keyframes loki-breathe { 50% { opacity: 0.3; } }
+  @media (prefers-reduced-motion: reduce) {
+    .loki-pill::before { animation: none; }
+  }
+  .loki-timer {
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    color: var(--secondary-text-color, #727272);
+  }
+  /* Draining rather than filling: what is left is the useful number, and the call
+     ends by itself when it reaches zero. */
+  .loki-progress {
+    margin-top: 8px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--divider-color, #e0e0e0);
+    overflow: hidden;
+  }
+  .loki-progress > i {
+    display: block;
+    height: 100%;
+    background: var(--warning-color, #ffa600);
+    transition: width 1s linear;
+  }
+
+  .loki-live-badge {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: 999px;
+    color: #fff;
+    background: var(--error-color, #db4437);
+  }
+  .loki-live-badge::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #fff;
+  }
+
+  /* Two columns once there is room; stacked when there is not, which is also the
+     phone and the wall panel held upright. */
+  .loki-grid { display: grid; gap: 12px; }
+  .loki-side {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    justify-content: center;
+  }
+  .loki-side .loki-actions { width: 100%; }
+  @container (min-width: 520px) {
+    .loki-grid { grid-template-columns: 1fr minmax(150px, 30%); align-items: center; }
+  }
+
+  /* One row: preview, who and how long, and the buttons. For a dashboard where the
+     domofon is one line among many. */
+  .loki-compact .loki-grid {
+    grid-template-columns: 104px minmax(0, 1fr) auto;
+    align-items: center;
+  }
+  .loki-compact .loki-head,
+  .loki-compact .loki-callbar { display: none; }
+  .loki-compact .loki-strip { display: block; min-width: 0; }
+  .loki-compact .loki-side { flex-direction: row; gap: 8px; }
+  .loki-compact .loki-side .loki-actions { width: auto; }
+  .loki-compact .loki-round-label { display: none; }
+  .loki-compact .loki-round { width: 48px; height: 48px; }
+  .loki-compact .loki-open-lg {
+    width: 48px;
+    min-height: 48px;
+    padding: 0;
+    border-radius: 50%;
+    flex: none;
+  }
+  .loki-compact .loki-open-lg span { display: none; }
+  .loki-compact .loki-icon-btn { display: none; }
+
+  .loki-strip { display: none; }
+  .loki-strip-name {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .loki-strip-meta {
+    font-size: 13px;
+    color: var(--secondary-text-color, #727272);
   }
 
   /* A tile that leads to that card says so on hover, and answers the keyboard. */
@@ -733,18 +934,45 @@ class LokiDoorCard extends HTMLElement {
     // A live stream left running behind a dashboard nobody is looking at is the one
     // thing a card like this must not do.
     this._stopLive();
+    this._tickTimer(false);
     if (this._media) this._media.destroy();
   }
 
   _build() {
     const style = el("style");
     style.textContent = `${STYLE}
-      .loki-body { padding: 0 12px 12px; }
-      .card-header { padding-bottom: 8px; }
+      .loki-body { padding: 12px; container-type: inline-size; }
     `;
 
-    const card = document.createElement("ha-card");
-    this._header = el("div", "card-header");
+    this._card = document.createElement("ha-card");
+    const card = this._card;
+
+    this._name = el("div", "loki-name");
+    this._sub = el("div", "loki-sub");
+    this._sub.hidden = true;
+    const title = el("div", "loki-title");
+    title.append(this._name, this._sub);
+    this._header = el("div", "loki-head");
+    this._header.appendChild(title);
+
+    this._pill = el("span", "loki-pill", t.onCall);
+    this._timer = el("span", "loki-timer");
+    const callRow = el("div", "loki-callrow");
+    callRow.append(this._pill, this._timer);
+    this._bar = el("i");
+    const progress = el("div", "loki-progress");
+    progress.appendChild(this._bar);
+    this._callBar = el("div", "loki-callbar");
+    this._callBar.append(callRow, progress);
+    this._callBar.hidden = true;
+
+    // The compact row carries its own copy of the same two facts: the head is hidden
+    // in that layout, and a card whose name nobody can read is not a card.
+    this._stripName = el("div", "loki-strip-name");
+    this._stripMeta = el("div", "loki-strip-meta");
+    this._strip = el("div", "loki-strip");
+    this._strip.append(this._stripName, this._stripMeta);
+
     this._media = new DoorMedia();
 
     this._ringing = el("div", "loki-ringing", t.ringing);
@@ -778,10 +1006,29 @@ class LokiDoorCard extends HTMLElement {
     this._openLabel = el("span", null, t.open);
     this._openBtn.append(icon(ICON_OPEN), this._openLabel);
     this._openBtn.addEventListener("click", () => this._open());
+
+    // Only while a call is up: the rest of the time there is nothing to decline,
+    // and a dead button next to a live one is worse than no button.
+    this._hangupBtn = el("button", "loki-round");
+    this._hangupBtn.appendChild(icon(ICON_HANGUP));
+    this._hangupBtn.addEventListener("click", () => this._hangup());
+    this._hangupLabel = el("span", "loki-round-label", t.hangup);
+    this._hangupWrap = el("div", "loki-round-wrap");
+    this._hangupWrap.append(this._hangupBtn, this._hangupLabel);
+    this._hangupWrap.hidden = true;
+
     this._actions = el("div", "loki-actions");
     this._actions.appendChild(this._openBtn);
 
-    this._media.el.append(this._ringing, this._shotBtn, this._liveBtn);
+    this._liveBadge = el("div", "loki-live-badge", "LIVE");
+    this._liveBadge.hidden = true;
+
+    this._media.el.append(
+      this._ringing,
+      this._liveBadge,
+      this._shotBtn,
+      this._liveBtn
+    );
 
     this._note = el("div", "loki-note", t.unavailable);
     this._note.hidden = true;
@@ -789,10 +1036,16 @@ class LokiDoorCard extends HTMLElement {
     this._stamp = el("div", "loki-note loki-stamp");
     this._stamp.hidden = true;
 
-    const body = el("div", "loki-body");
-    body.append(this._media.el, this._actions);
+    this._side = el("div", "loki-side");
+    this._side.append(this._actions, this._hangupWrap);
 
-    card.append(this._header, body, this._note, this._stamp);
+    this._grid = el("div", "loki-grid");
+    this._grid.append(this._media.el, this._strip, this._side);
+
+    const body = el("div", "loki-body");
+    body.appendChild(this._grid);
+
+    card.append(this._header, this._callBar, body, this._note, this._stamp);
     this.append(style, card);
     this._built = true;
   }
@@ -801,7 +1054,7 @@ class LokiDoorCard extends HTMLElement {
     const hass = this._hass;
     const camera = this._config.camera;
     if (!camera) {
-      this._header.textContent = t.pickDoor;
+      this._name.textContent = t.pickDoor;
       this._media.el.hidden = true;
       this._note.hidden = true;
       return;
@@ -810,11 +1063,26 @@ class LokiDoorCard extends HTMLElement {
 
     const door = resolveDoor(hass, camera);
     this._door = door;
-    this._header.textContent = this._config.name || door.name;
+    const name = this._config.name || door.name;
+    this._name.textContent = name;
+    this._stripName.textContent = name;
+
+    const area = doorArea(hass, door);
+    this._sub.textContent = area;
+    this._sub.hidden = !area;
+
+    this._card.classList.toggle("loki-compact", this._config.layout === "compact");
     this._actions.hidden = !door.button;
 
     const call = door.call ? hass.states[door.call] : null;
-    this._ringing.hidden = !(call && call.state === "on");
+    const ringing = Boolean(call && call.state === "on");
+    // The badge on the picture said "Вызов" before there was a head to say it in.
+    // Two of them is one too many.
+    this._ringing.hidden = true;
+    this._callBar.hidden = !ringing;
+    this._hangupWrap.hidden = !ringing;
+    this._since = ringing ? call.last_changed : null;
+    this._tickTimer(ringing);
 
     const reachable = streamReachable(hass, this._config.stream_sensor);
     this._note.hidden = reachable;
@@ -841,7 +1109,31 @@ class LokiDoorCard extends HTMLElement {
       return;
     }
 
+    this._liveBadge.hidden = !(this._live && reachable);
     this._media.render(camera, this._live && reachable);
+  }
+
+  /** Keep the call timer running, and only while there is a call. */
+  _tickTimer(on) {
+    if (!on) {
+      if (this._clock) {
+        window.clearInterval(this._clock);
+        this._clock = null;
+      }
+      return;
+    }
+    this._paint();
+    if (!this._clock) this._clock = window.setInterval(() => this._paint(), 1000);
+  }
+
+  _paint() {
+    const seconds = sinceSeconds(this._since);
+    const text = asClock(seconds);
+    this._timer.textContent = text;
+    this._stripMeta.textContent = `${t.onCall} · ${text}`;
+    const total = Number(this._config.call_timeout) || DEFAULT_CALL_TIMEOUT;
+    const left = Math.max(0, Math.min(1, 1 - seconds / total));
+    this._bar.style.width = `${(left * 100).toFixed(1)}%`;
   }
 
   _toggleLive() {
@@ -882,6 +1174,15 @@ class LokiDoorCard extends HTMLElement {
 
   async _open() {
     await pressOpen(this._hass, this._door, this._openBtn, this._openLabel);
+  }
+
+  async _hangup() {
+    await pressHangup(
+      this._hass,
+      this._door,
+      this._hangupBtn,
+      this._hangupLabel
+    );
   }
 }
 
@@ -1347,6 +1648,57 @@ async function pressOpen(hass, door, button, label) {
   }
 }
 
+/** Seconds since an ISO timestamp, never negative. */
+function sinceSeconds(since) {
+  if (!since) return 0;
+  return Math.max(0, Math.floor((Date.now() - Date.parse(since)) / 1000));
+}
+
+/** Seconds as mm:ss. */
+function asClock(seconds) {
+  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
+  const ss = String(seconds % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
+/** The area a door sits in, for the line under its name. */
+function doorArea(hass, door) {
+  const areas = (hass && hass.areas) || {};
+  const devices = (hass && hass.devices) || {};
+  const device = door.device ? devices[door.device] : null;
+  const area = device && device.area_id ? areas[device.area_id] : null;
+  return (area && area.name) || "";
+}
+
+/** Release our own branch of a call in progress.
+ *
+ * Not a rejection: the intercom goes on ringing the resident's phone, and that is
+ * deliberate -- a global decline from here would cancel the call on every device at
+ * once, including the phone of somebody who was about to answer.
+ */
+async function pressHangup(hass, door, button, label) {
+  if (!hass || !door || button.disabled) return;
+  const id = lokiId(hass, door);
+  if (!id) return;
+  const original = label.textContent;
+  button.disabled = true;
+  label.textContent = t.hangingUp;
+  try {
+    await hass.callService("loki", "hangup", { device_id: id });
+    label.textContent = t.hungUp;
+  } catch (err) {
+    label.textContent = t.failed;
+    fire(button, "hass-notification", {
+      message: `${door.name}: ${(err && err.message) || t.failed}`,
+    });
+  } finally {
+    window.setTimeout(() => {
+      button.disabled = false;
+      label.textContent = original;
+    }, 2000);
+  }
+}
+
 /* ------------------------------------------------------------------ editors */
 
 /** Base editor: an ha-form driven by a schema, so nobody has to write YAML. */
@@ -1387,6 +1739,8 @@ class LokiEditorBase extends HTMLElement {
         tile_size: "Размер плиток",
         columns: "Плиток в ряд (пусто — по размеру)",
         live_timeout: "Сам выключить видео через, с",
+        layout: t.layout,
+        call_timeout: t.callTimeout,
       }[name] || name
     );
   }
@@ -1395,6 +1749,22 @@ class LokiEditorBase extends HTMLElement {
 class LokiDoorCardEditor extends LokiEditorBase {
   schema() {
     return [
+      {
+        name: "layout",
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: [
+              { value: "full", label: t.layoutFull },
+              { value: "compact", label: t.layoutCompact },
+            ],
+          },
+        },
+      },
+      {
+        name: "call_timeout",
+        selector: { number: { min: 5, max: 600, step: 5, mode: "box" } },
+      },
       {
         name: "camera",
         required: true,

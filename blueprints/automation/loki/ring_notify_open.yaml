@@ -27,6 +27,18 @@ blueprint:
       default: Открыть
       selector:
         text:
+    hangup_action_title:
+      name: Текст кнопки отказа
+      description: >
+        Вторая кнопка в уведомлении: убирает звонок из Home Assistant, не открывая
+        дверь. Домофон при этом продолжает звонить на телефон жильца — отменить
+        вызов целиком отсюда нельзя и не нужно.
+
+
+        Пустое поле — кнопки не будет.
+      default: Сбросить
+      selector:
+        text:
     notification_tag:
       name: Тег уведомления
       description: >
@@ -101,6 +113,8 @@ actions:
       # timeout would otherwise share one action name, and a single tap would open
       # the door twice.
       action_open: "LOKI_OPEN_{{ context.id }}"
+      action_hangup: "LOKI_DROP_{{ context.id }}"
+      hangup_title: !input hangup_action_title
 
       # The notification tag is per door. A second ring at the same door should
       # replace the first notification, which is what one shared tag gives -- but a
@@ -111,9 +125,13 @@ actions:
       # breaks attachment loading on Android, and an empty `clickAction` sends the tap
       # nowhere, so a key is either present and valid or absent entirely.
       notify_data: >-
+        {% set acts = [{'action': action_open, 'title': open_title}] %}
+        {% if hangup_title | trim %}
+        {% set acts = acts + [{'action': action_hangup, 'title': hangup_title}] %}
+        {% endif %}
         {% set data = {'tag': tag_door, 'channel': channel_in,
                        'importance': 'high', 'ttl': 0, 'priority': 'high',
-                       'actions': [{'action': action_open, 'title': open_title}],
+                       'actions': acts,
                        'push': {'interruption-level': 'time-sensitive'}} %}
         {% if camera_entity %}
         {% set data = dict(data, image='/api/camera_proxy/' ~ camera_entity,
@@ -143,6 +161,11 @@ actions:
         event_type: mobile_app_notification_action
         event_data:
           action: "{{ action_open }}"
+      - trigger: event
+        id: hangup
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_hangup }}"
       # Watching for the end of *this* call, matched on call_id, is what lets the run
       # finish the moment the caller gives up instead of idling for the whole timeout
       # -- and, more importantly, what tells a superseded run to keep its hands off a
@@ -178,6 +201,26 @@ actions:
             data:
               device_id: "{{ device_id }}"
           - alias: Убрать уведомление — кнопка уже нажата
+            domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            message: clear_notification
+            data: "{{ {'tag': tag_door} }}"
+
+      - alias: Нажали «Сбросить»
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is defined and wait.trigger.id == 'hangup' }}
+        sequence:
+          # Releases our own SIP branch and nothing else: the intercom goes on
+          # ringing the resident's phone, which is the whole point of never
+          # declining globally from here.
+          - action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Убрать уведомление — решение принято
             domain: mobile_app
             type: notify
             device_id: !input notify_device
