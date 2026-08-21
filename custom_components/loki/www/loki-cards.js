@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.4.0";
+const CARD_VERSION = "0.7.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -35,9 +35,13 @@ const DEFAULT_LIVE_TIMEOUT = 30;
 // faster only costs requests the backend answers from its own cache.
 const STILL_REFRESH = 10;
 
+// How long to wait for a forced snapshot before counting it as failed.
+const SHOT_TIMEOUT = 15;
+
 const ICON_OPEN = "mdi:lock-open-variant-outline";
 const ICON_LIVE = "mdi:video-outline";
 const ICON_STOP = "mdi:video-off-outline";
+const ICON_SHOT = "mdi:camera-outline";
 
 const t = {
   open: "Открыть",
@@ -45,8 +49,22 @@ const t = {
   stop: "Стоп",
   liveAll: "Все вживую",
   stopAll: "Остановить",
+  shot: "Текущий кадр",
+  shooting: "Обновляю…",
+  shotHint:
+    "Снять по одному кадру с каждого домофона. Дёшево: кадр вместо потока. "
+    + "Обычная картинка на плитке приходит с сервера и не меняется — это статика.",
+  shotBlocked: "Видеопоток недоступен — кадр снять неоткуда",
+  shotDone: "Сняты текущие кадры",
+  shotFail: "Кадры снять не удалось — нет видеопотока",
+  shotNone: "На карточке нет камер",
+  confirmLive: "Включить живое видео со всех камер? Это заметная нагрузка.",
+  yes: "Да",
+  no: "Нет",
   ringing: "Вызов",
-  unavailable: "Видео недоступно, показаны снимки",
+  unavailable:
+    "Видеопоток недоступен. На плитках — статичная картинка с сервера, "
+    + "не текущая обстановка.",
   pickDoor: "Выберите домофон в настройках карточки",
   noDoors: "Домофоны не найдены. Проверьте, что интеграция Loki настроена.",
   liveBlocked: "Видеохост недоступен — живое видео не откроется",
@@ -132,6 +150,19 @@ function findDoorCameras(hass) {
     .sort();
 }
 
+/** The numeric Loki device id behind a door, which the services take.
+ *
+ * It lives in the device registry identifier the integration set, so it survives every
+ * rename an entity id does not.
+ */
+function lokiId(hass, door) {
+  const device = hass && hass.devices ? hass.devices[door.device] : null;
+  for (const [domain, value] of (device && device.identifiers) || []) {
+    if (domain === "loki" && /^\d+$/.test(String(value))) return Number(value);
+  }
+  return null;
+}
+
 function fire(node, type, detail) {
   node.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
 }
@@ -192,6 +223,44 @@ class DoorMedia {
     this._hass = hass;
     if (this._child) this._child.hass = hass;
     if (!this._live) this._refreshStill();
+  }
+
+  /** Re-read the picture Home Assistant currently holds for this camera. */
+  reload() {
+    if (this._live) return;
+    this._refreshStill(true);
+  }
+
+  /** Fetch a new still right now, rather than waiting for the next tick.
+
+   * Resolves to whether a picture actually arrived -- not whether a request was sent.
+   * The difference matters: this integration's live video and its stills travel over
+   * different protocols to different hosts, so "video is down" and "snapshots are
+   * fine" are both routinely true at once, and a count of intentions would read as a
+   * lie to anyone looking at the unavailable-video banner directly above it.
+   */
+  refreshNow() {
+    return new Promise((resolve) => {
+      if (this._live || this._img.hidden || !this._hass || !this._camera) {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        this._img.removeEventListener("load", onLoad);
+        this._img.removeEventListener("error", onError);
+        resolve(ok);
+      };
+      const onLoad = () => done(true);
+      const onError = () => done(false);
+      this._img.addEventListener("load", onLoad);
+      this._img.addEventListener("error", onError);
+      // A picture that never arrives must not leave the count hanging.
+      window.setTimeout(() => done(false), SHOT_TIMEOUT * 1000);
+      this._refreshStill(true);
+    });
   }
 
   async render(camera, live) {
@@ -262,7 +331,7 @@ class DoorMedia {
     this._startTimer();
   }
 
-  _refreshStill() {
+  _refreshStill(force) {
     if (this._img.hidden || !this._hass || !this._camera) return;
     const state = this._hass.states[this._camera];
     const picture = state && state.attributes.entity_picture;
@@ -270,14 +339,25 @@ class DoorMedia {
     // entity_picture only changes when the access token rotates, a matter of minutes,
     // so the URL on its own would leave one frozen frame on screen. Only this URL is
     // safe to append to -- a signed path would fail its signature check.
-    const stamp = Math.floor(Date.now() / (STILL_REFRESH * 1000));
+    //
+    // The unforced stamp is bucketed, so the periodic tick asks for the same URL until
+    // the bucket rolls over and the browser can serve it from cache. A forced refresh
+    // is unique, so it always goes to Home Assistant. What comes back is at most ten
+    // seconds old: the camera entity caches that long on purpose, which is what keeps
+    // twenty-one tiles from hammering the operator's API.
+    const stamp = force
+      ? Date.now()
+      : Math.floor(Date.now() / (STILL_REFRESH * 1000));
     const src = `${picture}${picture.includes("?") ? "&" : "?"}_=${stamp}`;
     if (this._img.getAttribute("src") !== src) this._img.setAttribute("src", src);
   }
 
   _startTimer() {
     if (this._timer) return;
-    this._timer = window.setInterval(() => this._refreshStill(), STILL_REFRESH * 1000);
+    this._timer = window.setInterval(
+      () => this._refreshStill(),
+      STILL_REFRESH * 1000
+    );
   }
 
   _stopTimer() {
@@ -301,6 +381,31 @@ class DoorMedia {
 /* ------------------------------------------------------------- shared styles */
 
 const STYLE = `
+  /* These cards render into the light DOM, so this stylesheet applies to the whole
+     document -- which is why the rule is spelled out element by element instead of a
+     bare [hidden]. A global one did blank the entire dashboard: Home Assistant marks
+     its own layout pieces hidden and relies on its CSS to show them again.
+
+     The rule is needed at all because every selector below that sets display: flex
+     outranks the user-agent's [hidden] { display: none }, so element.hidden = true
+     silently does nothing -- which is how the live-view confirmation appeared unasked,
+     and how an open button stayed on a door that has no lock to open. */
+  .loki-media[hidden],
+  .loki-still[hidden],
+  .loki-live[hidden],
+  .loki-bar[hidden],
+  .loki-label[hidden],
+  .loki-open[hidden],
+  .loki-icon-btn[hidden],
+  .loki-ringing[hidden],
+  .loki-note[hidden],
+  .loki-stamp[hidden],
+  .loki-empty[hidden],
+  .loki-pill[hidden],
+  .loki-confirm[hidden] {
+    display: none;
+  }
+
   .loki-media {
     position: relative;
     overflow: hidden;
@@ -393,6 +498,71 @@ const STYLE = `
     border-radius: 8px;
   }
   .loki-empty { padding: 16px; color: var(--secondary-text-color); }
+  .loki-stamp {
+    border-left: 3px solid var(--success-color, #4caf50);
+  }
+  .loki-stamp.failed {
+    border-left-color: var(--error-color, #db4437);
+  }
+
+  .loki-pill {
+    font: inherit;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--primary-color, #03a9f4);
+    background: none;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    padding: 4px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .loki-pill ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .loki-pill[disabled] { opacity: 0.4; cursor: default; }
+  .loki-pill.on {
+    color: var(--text-primary-color, #fff);
+    background: currentColor;
+    border-color: transparent;
+  }
+  /* Red, because it is the expensive one. The colour is the warning; the dialog is
+     the brake. */
+  .loki-pill.costly { color: var(--error-color, #db4437); }
+  .loki-pill.costly.on {
+    color: var(--text-primary-color, #fff);
+    background: var(--error-color, #db4437);
+  }
+
+  .loki-confirm {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 0 12px 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+    color: var(--primary-text-color);
+    background: var(--secondary-background-color, rgba(127, 127, 127, 0.14));
+    border-left: 3px solid var(--error-color, #db4437);
+    border-radius: 8px;
+  }
+  .loki-confirm .loki-question { flex: 1; min-width: 180px; }
+  .loki-confirm button {
+    font: inherit;
+    font-size: 13px;
+    border-radius: 999px;
+    padding: 4px 16px;
+    cursor: pointer;
+    border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.4));
+    background: none;
+    color: var(--primary-text-color);
+  }
+  .loki-confirm button.danger {
+    background: var(--error-color, #db4437);
+    border-color: transparent;
+    color: #fff;
+  }
 `;
 
 /* ------------------------------------------------------------ the door card */
@@ -472,21 +642,42 @@ class LokiDoorCard extends HTMLElement {
     this._liveBtn = iconButton(ICON_LIVE, t.live);
     this._liveBtn.addEventListener("click", () => this._toggleLive());
 
+    this._shotBtn = iconButton(ICON_SHOT, t.shot);
+    this._shotBtn.style.right = "42px";
+    this._shotBtn.addEventListener("click", async () => {
+      this._shotBtn.disabled = true;
+      let ok = false;
+      try {
+        await this._hass.callService("loki", "capture_frame", {
+          device_id: lokiId(this._hass, this._door),
+        });
+        this._media.reload();
+        ok = true;
+      } catch (err) {
+        ok = false;
+      }
+      this._shotBtn.disabled = false;
+      this._showStamp(ok ? 1 : 0, 1);
+    });
+
     const parts = pictureBar();
     this._label = parts.label;
     this._openBtn = parts.open;
     this._openLabel = parts.openLabel;
     this._openBtn.addEventListener("click", () => this._open());
 
-    this._media.el.append(this._ringing, this._liveBtn, parts.bar);
+    this._media.el.append(this._ringing, this._shotBtn, this._liveBtn, parts.bar);
 
     this._note = el("div", "loki-note", t.unavailable);
     this._note.hidden = true;
 
+    this._stamp = el("div", "loki-note loki-stamp");
+    this._stamp.hidden = true;
+
     const body = el("div", "loki-body");
     body.appendChild(this._media.el);
 
-    card.append(this._header, body, this._note);
+    card.append(this._header, body, this._note, this._stamp);
     this.append(style, card);
     this._built = true;
   }
@@ -517,6 +708,8 @@ class LokiDoorCard extends HTMLElement {
     // Disabled rather than hidden: the button is the answer to "why can I not see
     // live video", and its tooltip says so. Letting it through would open an RTSP
     // connection already known to time out.
+    this._shotBtn.disabled = !reachable;
+    this._shotBtn.title = reachable ? t.shot : t.shotBlocked;
     this._liveBtn.disabled = !reachable;
     this._liveBtn.title = reachable ? (this._live ? t.stop : t.live) : t.liveBlocked;
     this._liveBtn.classList.toggle("on", this._live && reachable);
@@ -549,6 +742,19 @@ class LokiDoorCard extends HTMLElement {
     if (!this._live) return;
     this._live = false;
     if (this._hass && this._built) this._update();
+  }
+
+  _showStamp(loaded, total) {
+    const now = new Date().toLocaleTimeString("ru-RU");
+    this._stamp.textContent = loaded
+      ? `${t.shotDone} · ${now}`
+      : `${t.shotFail} · ${now}`;
+    this._stamp.classList.toggle("failed", Boolean(total) && !loaded);
+    this._stamp.hidden = false;
+    if (this._stampTimer) window.clearTimeout(this._stampTimer);
+    this._stampTimer = window.setTimeout(() => {
+      this._stamp.hidden = true;
+    }, 8000);
   }
 
   async _open() {
@@ -663,27 +869,69 @@ class LokiWallCard extends HTMLElement {
         border-color: transparent;
       }
       .loki-grid { display: grid; gap: 10px; padding: 0 12px 12px; }
+      .loki-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     `;
 
     const card = document.createElement("ha-card");
 
     const header = el("div", "loki-header");
     this._titleEl = el("div", "loki-title");
-    this._liveBtn = el("button", "loki-live-all");
+    const actions = el("div", "loki-actions");
+
+    this._shotBtn = el("button", "loki-pill");
+    this._shotIcon = icon(ICON_SHOT);
+    this._shotLabel = el("span", null, t.shot);
+    this._shotBtn.append(this._shotIcon, this._shotLabel);
+    this._shotBtn.title = t.shotHint;
+    this._shotBtn.addEventListener("click", () => this._refreshAll());
+
+    this._liveBtn = el("button", "loki-pill costly");
     this._liveIcon = icon(ICON_LIVE);
     this._liveLabel = el("span", null, t.liveAll);
     this._liveBtn.append(this._liveIcon, this._liveLabel);
-    this._liveBtn.addEventListener("click", () => this._toggleLive());
-    header.append(this._titleEl, this._liveBtn);
+    this._liveBtn.addEventListener("click", () => this._askLive());
+
+    actions.append(this._shotBtn, this._liveBtn);
+    header.append(this._titleEl, actions);
+
+    // Built once and shown on demand: a dialog imported from Home Assistant would be
+    // a private API, and a native confirm() looks like a browser error.
+    this._confirm = el("div", "loki-confirm");
+    this._confirm.hidden = true;
+    const question = el("div", "loki-question", t.confirmLive);
+    const yes = el("button", "danger", t.yes);
+    const no = el("button", null, t.no);
+    yes.addEventListener("click", () => {
+      this._confirm.hidden = true;
+      this._startLive();
+    });
+    no.addEventListener("click", () => {
+      this._confirm.hidden = true;
+    });
+    this._confirm.append(question, yes, no);
+    this._confirmQuestion = question;
 
     this._note = el("div", "loki-note", t.unavailable);
     this._note.hidden = true;
+
+    // A refreshed snapshot usually looks identical to the one it replaced -- the
+    // camera may not have moved, and the backend keeps a frame for ten seconds.
+    // Without a line saying so, the button reads as broken.
+    this._stamp = el("div", "loki-note loki-stamp");
+    this._stamp.hidden = true;
 
     this._grid = el("div", "loki-grid");
     this._empty = el("div", "loki-empty", t.noDoors);
     this._empty.hidden = true;
 
-    card.append(header, this._note, this._empty, this._grid);
+    card.append(
+      header,
+      this._confirm,
+      this._note,
+      this._stamp,
+      this._empty,
+      this._grid
+    );
     this.append(style, card);
     this._built = true;
   }
@@ -697,6 +945,11 @@ class LokiWallCard extends HTMLElement {
     this._empty.hidden = cameras.length > 0;
     this._note.hidden = reachable;
 
+    this._shotBtn.hidden = cameras.length === 0;
+    // A frame can only come from the stream, so when the stream is gone this button
+    // has nothing to do -- exactly like the live one next to it.
+    this._shotBtn.disabled = !reachable;
+    this._shotBtn.title = reachable ? t.shotHint : t.shotBlocked;
     this._liveBtn.hidden = cameras.length === 0;
     this._liveBtn.disabled = !reachable;
     this._liveBtn.title = reachable ? "" : t.liveBlocked;
@@ -706,6 +959,8 @@ class LokiWallCard extends HTMLElement {
       "icon",
       this._live && reachable ? ICON_STOP : ICON_LIVE
     );
+    if (!reachable) this._confirm.hidden = true;
+    this._confirmQuestion.textContent = `${t.confirmLive} Камер: ${cameras.length}.`;
 
     // Width-driven by default: a fixed column count is either cramped on a phone or
     // absurdly stretched on a monitor. `columns` remains as an explicit override.
@@ -790,17 +1045,74 @@ class LokiWallCard extends HTMLElement {
     return tile;
   }
 
-  _toggleLive() {
-    this._live = !this._live;
-    if (this._live) {
-      const seconds = Number(this._config.live_timeout) || 0;
-      if (seconds > 0) {
-        this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
-      }
-      if (this._hass) this._update();
-    } else {
-      this._stopLive();
+  /** One real frame from every door, now.
+   *
+   * Goes through the integration rather than just re-requesting the picture: the
+   * server's own still is static -- measured, the same bytes ninety seconds apart --
+   * so asking for it again shows the same scene. Only the stream knows what is
+   * actually out there, and one frame each is a fraction of the cost of watching.
+   */
+  async _refreshAll() {
+    const tiles = [...this._tiles.values()].filter((tile) => tile.door);
+    if (!tiles.length) {
+      this._showStamp(0, 0);
+      return;
     }
+    this._shotBtn.disabled = true;
+    this._shotLabel.textContent = t.shooting;
+
+    const results = await Promise.all(
+      tiles.map(async (tile) => {
+        try {
+          await this._hass.callService("loki", "capture_frame", {
+            device_id: lokiId(this._hass, tile.door),
+          });
+        } catch (err) {
+          return false;
+        }
+        tile.media.reload();
+        return true;
+      })
+    );
+
+    this._shotBtn.disabled = false;
+    this._shotLabel.textContent = t.shot;
+    this._showStamp(results.filter(Boolean).length, tiles.length);
+  }
+
+  _showStamp(loaded, total) {
+    const now = new Date().toLocaleTimeString("ru-RU");
+    if (!total) {
+      this._stamp.textContent = t.shotNone;
+    } else if (loaded) {
+      this._stamp.textContent = `${t.shotDone}: ${loaded} из ${total} · ${now}`;
+    } else {
+      this._stamp.textContent = `${t.shotFail} · ${now}`;
+    }
+    this._stamp.classList.toggle("failed", Boolean(total) && !loaded);
+    this._stamp.hidden = false;
+    if (this._stampTimer) window.clearTimeout(this._stampTimer);
+    this._stampTimer = window.setTimeout(() => {
+      this._stamp.hidden = true;
+    }, 8000);
+  }
+
+  /** Turning twenty streams on deserves a question, not a single tap. */
+  _askLive() {
+    if (this._live) {
+      this._stopLive();
+      return;
+    }
+    this._confirm.hidden = !this._confirm.hidden;
+  }
+
+  _startLive() {
+    this._live = true;
+    const seconds = Number(this._config.live_timeout) || 0;
+    if (seconds > 0) {
+      this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
+    }
+    if (this._hass) this._update();
   }
 
   _stopLive() {
@@ -826,6 +1138,16 @@ class LokiWallCard extends HTMLElement {
     }
     this._tiles.clear();
   }
+}
+
+/** Brief visual acknowledgement, so a press that changes nothing visible still lands. */
+function flash(button, label, busyText, restore) {
+  button.disabled = true;
+  if (label && busyText !== undefined) label.textContent = busyText;
+  window.setTimeout(() => {
+    button.disabled = false;
+    if (label && restore !== undefined) label.textContent = restore;
+  }, 900);
 }
 
 /* ------------------------------------------------------------------ opening */

@@ -4,19 +4,26 @@ from __future__ import annotations
 
 from typing import cast
 
+from homeassistant.components.camera.const import (
+    DATA_COMPONENT as CAMERA_DATA_COMPONENT,
+)
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 import voluptuous as vol
 
 from .api import LokiApiError, LokiAuthError, LokiDeviceForbidden
+from .camera import LokiCamera
 from .const import (
     ATTR_DEVICE_ID,
     DOMAIN,
+    SERVICE_CAPTURE,
     SERVICE_HANGUP,
     SERVICE_OPEN_DOOR,
     SERVICE_SIMULATE_RING,
 )
 from .coordinator import LokiConfigEntry
+from .entity import build_unique_id
 from .models import LokiDevice
 
 _DEVICE_ID_SCHEMA = vol.Schema(
@@ -26,6 +33,24 @@ _DEVICE_ID_SCHEMA = vol.Schema(
         vol.Required(ATTR_DEVICE_ID): vol.All(vol.Coerce(int), vol.Range(min=1))
     }
 )
+
+
+def _find_camera(
+    hass: HomeAssistant, entry: LokiConfigEntry, device_id: int
+) -> LokiCamera | None:
+    """This entry's camera object for a door, or None if it has no camera.
+
+    Goes through the entity registry rather than guessing an entity id: ids here are
+    derived from device names, and a rename would silently break this.
+    """
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "camera", DOMAIN, build_unique_id(entry.entry_id, device_id)
+    )
+    if entity_id is None:
+        return None
+    component = hass.data.get(CAMERA_DATA_COMPONENT)
+    entity = component.get_entity(entity_id) if component else None
+    return entity if isinstance(entity, LokiCamera) else None
 
 
 @callback
@@ -119,6 +144,32 @@ def async_setup_services(hass: HomeAssistant) -> None:
         entry, device = _find_device(call.data[ATTR_DEVICE_ID], door_only=True)
         entry.runtime_data.call_manager.async_end_call(device.id, reason="hangup")
 
+    async def _async_capture(call: ServiceCall) -> None:
+        """Grab one live frame off RTSP for a door, replacing its cached still.
+
+        Exists because the backend's own still is static: it does not follow the
+        camera, so "show me what is there now" cannot be answered by fetching it
+        again. The stream can answer it, one frame at a time, without paying for a
+        continuous view.
+        """
+        entry, device = _find_device(call.data[ATTR_DEVICE_ID])
+        camera = _find_camera(hass, entry, device.id)
+        if camera is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_camera",
+                translation_placeholders={
+                    "device_id": str(device.id),
+                    "device_name": device.name,
+                },
+            )
+        if not await camera.async_capture_from_stream():
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="capture_failed",
+                translation_placeholders={"device_name": device.name},
+            )
+
     hass.services.async_register(
         DOMAIN, SERVICE_OPEN_DOOR, _async_open_door, schema=_DEVICE_ID_SCHEMA
     )
@@ -127,4 +178,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_HANGUP, _async_hangup, schema=_DEVICE_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CAPTURE, _async_capture, schema=_DEVICE_ID_SCHEMA
     )

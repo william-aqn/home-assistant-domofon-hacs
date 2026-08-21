@@ -46,6 +46,9 @@
     },
     "hangup": {
       "service": "mdi:phone-hangup"
+    },
+    "capture_frame": {
+      "service": "mdi:camera-outline"
     }
   }
 }

@@ -136,6 +136,16 @@
           "description": "Numeric door id."
         }
       }
+    },
+    "capture_frame": {
+      "name": "Capture current frame",
+      "description": "Takes one frame from the intercom's video stream and makes it the current picture. Needed because the server's own snapshot is static and does not show what is happening now. Requires access to the video stream.",
+      "fields": {
+        "device_id": {
+          "name": "Device id",
+          "description": "Numeric id of the door or camera."
+        }
+      }
     }
   },
   "issues": {
@@ -181,6 +191,12 @@
     },
     "open_failed": {
       "message": "Could not open the door: {error}"
+    },
+    "no_camera": {
+      "message": "Device {device_id} ({device_name}) has no camera"
+    },
+    "capture_failed": {
+      "message": "Could not capture a frame from {device_name}: the video stream is unavailable. The server's own snapshot still works, but it is static."
     }
   }
 }

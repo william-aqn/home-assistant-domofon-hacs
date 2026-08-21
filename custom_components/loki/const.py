@@ -95,6 +95,7 @@ EVENT_RING: Final = "ring"
 SERVICE_OPEN_DOOR: Final = "open_door"
 SERVICE_SIMULATE_RING: Final = "simulate_ring"
 SERVICE_HANGUP: Final = "hangup"
+SERVICE_CAPTURE: Final = "capture_frame"
 
 ATTR_DEVICE_ID: Final = "device_id"
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -20,9 +22,18 @@ _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 0
 
-# The backend refreshes its stills on its own schedule, so re-fetching per dashboard
-# tile is wasted work. Short enough that a snapshot taken on a ring is still current.
+# The backend's own still is cheap and always available, but it is NOT a live frame:
+# measured on the real account, three fetches ninety seconds apart returned
+# byte-identical JPEGs. Treat it as a recent-ish picture of the door, never as "what is
+# there now". For that, see async_capture_from_stream.
+#
+# The TTL only stops twenty dashboard tiles from asking the operator's API the same
+# question at once.
 _SNAPSHOT_TTL = 10.0
+
+# A single frame off RTSP. Bounded because the media host is routinely unreachable --
+# a VPN, a firewall -- and a capture that hangs would hold a dashboard button hostage.
+_CAPTURE_TIMEOUT = 20.0
 
 
 async def async_setup_entry(
@@ -134,14 +145,47 @@ class LokiCamera(LokiEntity, Camera):
         device = self.device
         return device.stream.rtsp if device and device.stream else None
 
+    async def async_capture_from_stream(self) -> bool:
+        """Pull one frame off RTSP and make it the picture this camera serves.
+
+        This is what "current frame" has to mean here. The backend's own still does not
+        follow the camera -- it is the same bytes minutes later -- so re-fetching it
+        harder buys nothing. Only the stream knows what is in front of the door now.
+
+        Deliberately not wired into ``async_camera_image``: that would put an RTSP
+        connection behind every dashboard tile, which is the cost the cheap still
+        exists to avoid. This is an action somebody asks for, one frame at a time.
+        """
+        if not self._attr_supported_features & CameraEntityFeature.STREAM:
+            return False
+        try:
+            async with asyncio.timeout(_CAPTURE_TIMEOUT):
+                stream = await self.async_create_stream()
+                if stream is None:
+                    return False
+                # A keyframe rather than whatever partial frame is to hand: without it
+                # the first capture after connecting is usually a grey smear.
+                image = await stream.async_get_image(wait_for_next_keyframe=True)
+        except (TimeoutError, HomeAssistantError, OSError) as err:
+            _LOGGER.debug("Capture for device %s failed: %s", self._device_id, err)
+            return False
+
+        if not image:
+            return False
+        self._cached_image = image
+        self._cached_at = time.monotonic()
+        # Moves entity_picture on, so anything showing this camera re-fetches.
+        self.async_write_ha_state()
+        return True
+
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Return a still image, proxied from the backend.
+        """Return the picture to show for this camera.
 
-        Uses the backend's own periodically-updated still rather than decoding a frame
-        off RTSP: it is far cheaper and it works for devices whose stream is briefly
-        unavailable.
+        The backend's still by default: cheap, and it keeps working when the video host
+        does not. When somebody has asked for a live capture, that frame is served
+        instead until it ages out -- same cache, fresher contents.
         """
         now = time.monotonic()
         if self._cached_image is not None and now - self._cached_at < _SNAPSHOT_TTL:

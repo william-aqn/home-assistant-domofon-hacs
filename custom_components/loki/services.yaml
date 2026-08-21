@@ -30,3 +30,13 @@ hangup:
           min: 1
           max: 999999
           mode: box
+
+capture_frame:
+  fields:
+    device_id:
+      required: true
+      example: 123
+      selector:
+        number:
+          min: 1
+          mode: box
