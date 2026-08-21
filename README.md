@@ -97,6 +97,59 @@ data:
   call_id: sim-…
 ```
 
+## Карточка двери: видео, кнопка открытия и состояние потока
+
+Встроенный диалог камеры Home Assistant настроить нельзя — его вёрстка и кнопка
+«Сделать снимок» принадлежат Home Assistant. Зато карточка на дашборде делает всё,
+что нужно, средствами ядра: показывает картинку, кладёт поверх неё кнопку открытия
+и предупреждение, когда живое видео недоступно.
+
+Подставьте свои `entity_id` вместо `<дверь>` и `<аккаунт>`:
+
+```yaml
+type: picture-elements
+camera_image: camera.<дверь>
+# auto: снимок в обычном состоянии, живое видео при открытии карточки
+camera_view: auto
+elements:
+  - type: service-button
+    title: Открыть
+    service: button.press
+    service_data:
+      entity_id: button.<дверь>_open
+    style:
+      right: 4%
+      bottom: 4%
+      background: rgba(0, 0, 0, 0.55)
+      color: white
+      border-radius: 8px
+      padding: 6px 14px
+      font-size: 15px
+
+  # Появляется только когда медиа-хост недоступен.
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: binary_sensor.loki_<аккаунт>_video_stream_reachable
+        state: "off"
+    elements:
+      - type: state-label
+        entity: binary_sensor.loki_<аккаунт>_video_stream_reachable
+        prefix: "Живое видео недоступно — показан снимок "
+        style:
+          top: 6%
+          left: 50%
+          transform: translate(-50%, 0)
+          background: rgba(180, 30, 30, 0.85)
+          color: white
+          border-radius: 6px
+          padding: 4px 10px
+          font-size: 13px
+```
+
+Если нужен просто список дверей с кнопками, без видео, подойдёт и штатная карточка
+устройства: все сущности одной двери сгруппированы в одно устройство.
+
 ## Распознавание лиц (Frigate)
 
 Интеграция сама лица не распознаёт — она использует Frigate и лишь связывает его
