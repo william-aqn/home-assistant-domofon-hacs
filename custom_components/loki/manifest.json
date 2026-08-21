@@ -1,6 +1,10 @@
 {
   "domain": "loki",
   "name": "Loki",
+  "after_dependencies": [
+    "lovelace",
+    "panel_custom"
+  ],
   "codeowners": [
     "@william-aqn"
   ],
@@ -8,10 +12,6 @@
   "dependencies": [
     "http",
     "frontend"
-  ],
-  "after_dependencies": [
-    "lovelace",
-    "panel_custom"
   ],
   "documentation": "https://github.com/william-aqn/home-assistant-domofon-hacs",
   "integration_type": "hub",
