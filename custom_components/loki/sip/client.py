@@ -174,7 +174,16 @@ class LokiSipClient:
             host=config.host, user=config.user, port=config.port
         )
         self._transport: _Transport | None = None
-        self._pending: list[SipMessage | Ping | Pong] = []
+        # Exactly one coroutine may read a StreamReader, so a single reader task owns
+        # it and hands finished responses to whoever is waiting. Without this the
+        # refresh loop and the incoming-request loop race on the socket and asyncio
+        # raises -- which only happens once a registration is being held, i.e. not in
+        # any short-lived test.
+        self._reader_task: asyncio.Task[None] | None = None
+        self._responses: asyncio.Queue[SipMessage] = asyncio.Queue()
+        # Serialises request/response exchanges so one reply cannot be taken by the
+        # wrong sender.
+        self._request_lock = asyncio.Lock()
         self._challenges: dict[str, DigestChallenge] = {}
         self._seen_nonces: set[str] = set()
         self._failures = 0
@@ -290,8 +299,17 @@ class LokiSipClient:
         # never rings -- the worst possible failure, because everything looks healthy.
         if (rewritten := self._rewritten_contact(response)) is not None:
             _LOGGER.debug("Rewriting Contact from received/rport")
+            # The REGISTER above already created a binding for the address we guessed,
+            # which the registrar cannot reach. Withdraw it in the same message that
+            # creates the corrected one: leaving it behind fills the account's table
+            # with our own dead entries, and squeezing the resident's phone out of that
+            # table is precisely the harm this design exists to prevent.
+            superseded = self._state.contact_uri
             self._state.set_contact(rewritten)
-            response = await self._register_once(expires=expires, reap=reap)
+            response = await self._register_once(
+                expires=expires,
+                reap=[*reap, superseded] if superseded else reap,
+            )
 
         self._resolve_granted(response, requested=expires)
 
@@ -352,36 +370,26 @@ class LokiSipClient:
         self._state.granted_expires = requested
 
     async def _serve(self) -> None:
-        """Hold the registration: read, keep the connection warm, renew in time.
+        """Hold the registration: keep the connection warm and renew it in time.
 
-        All three run together and any one failing tears the flow down, because a
-        registration whose refresh task has died is a registration that will lapse
-        without anybody noticing.
+        The reader task is already running and owns the socket; these two only send.
+        Any one of the three failing tears the flow down, because a registration whose
+        refresh task has died is one that will lapse without anybody noticing.
         """
         try:
             async with asyncio.TaskGroup() as group:
-                group.create_task(self._read_loop())
                 group.create_task(self._keepalive_loop())
                 group.create_task(self._refresh_loop())
+                group.create_task(self._await_reader())
         except* (SipError, OSError, TimeoutError) as group_error:
             raise group_error.exceptions[0] from None
 
-    async def _read_loop(self) -> None:
-        """Answer whatever the registrar sends while we hold a binding."""
-        while not self._stopping:
-            message = await self._read(timeout=None)
-            if isinstance(message, Ping):
-                await self._send(CRLF)
-            elif isinstance(message, SipMessage) and not message.is_response:
-                # INVITE handling belongs to the next stage. Until it exists, decline
-                # the branch immediately rather than leave it hanging: an unresolved
-                # branch stops a forking proxy from delivering other branches' final
-                # responses, which would break the decline button on the phone.
-                await self._send(
-                    MessageBuilder.response(
-                        message, 486, "Busy Here", to_tag=secrets.token_hex(4)
-                    )
-                )
+    async def _await_reader(self) -> None:
+        """Fail the whole flow if the reader stops."""
+        if self._reader_task is None:
+            raise SipTransportError("reader is not running")
+        await self._reader_task
+        raise SipTransportError("соединение с регистратором закрыто")
 
     async def _keepalive_loop(self) -> None:
         """Send a CRLF now and then so the connection is not silently dropped.
@@ -407,17 +415,8 @@ class LokiSipClient:
             )
 
     async def _idle(self) -> None:
-        """Keep the connection alive and answer the registrar's pings."""
-        while not self._stopping:
-            message = await self._read(timeout=None)
-            if isinstance(message, Ping):
-                await self._send(b"\r\n")
-            elif isinstance(message, SipMessage) and not message.is_response:
-                # Nothing can legitimately be sent to us: we hold no binding, so no
-                # proxy has our address. Decline politely rather than ignore.
-                await self._send(
-                    MessageBuilder.response(message, 486, "Busy Here", to_tag=None)
-                )
+        """Hold the connection open in probe-only mode, doing nothing else."""
+        await self._await_reader()
 
     # ----------------------------------------------------------------- gates
 
@@ -590,7 +589,20 @@ class LokiSipClient:
     async def _register_request(
         self, *, contacts: Sequence[str], expires: int | None
     ) -> SipMessage:
-        """Send a REGISTER, answering at most one authentication challenge."""
+        """Send a REGISTER, answering at most one authentication challenge.
+
+        Serialised: responses are matched to requests by arrival order, so two
+        exchanges in flight at once would hand a reply to the wrong sender. In
+        practice the refresh loop and a manual withdrawal are the two that could
+        overlap.
+        """
+        async with self._request_lock:
+            return await self._register_exchange(contacts=contacts, expires=expires)
+
+    async def _register_exchange(
+        self, *, contacts: Sequence[str], expires: int | None
+    ) -> SipMessage:
+        """One REGISTER exchange, including the challenge round trip."""
         for attempt in (1, 2):
             auth = self._auth_headers()
             request = MessageBuilder.register(
@@ -694,6 +706,54 @@ class LokiSipClient:
         # concerned; keeping stale nonces would produce a replay on the first request.
         self._challenges.clear()
         self._seen_nonces.clear()
+        while not self._responses.empty():
+            self._responses.get_nowait()
+        self._reader_task = asyncio.create_task(self._reader_main())
+
+    async def _reader_main(self) -> None:
+        """The only coroutine that reads the socket.
+
+        Answers keepalives, declines anything sent to us, and queues final responses
+        for whoever issued the request. Everything else on this connection only writes.
+        """
+        assert self._transport is not None
+        transport = self._transport
+        try:
+            while True:
+                try:
+                    chunk = await transport.reader.read(MAX_HEADER_BYTES)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+
+                for item in transport.framer.feed(chunk):
+                    if isinstance(item, Ping):
+                        await self._send(CRLF)
+                    elif isinstance(item, Pong):
+                        continue
+                    elif item.is_response:
+                        if (item.status or 0) >= 200:
+                            await self._responses.put(item)
+                        # A 1xx to a REGISTER is legal, just uninteresting.
+                    else:
+                        await self._on_request(item)
+        except (SipError, OSError):
+            return
+
+    async def _on_request(self, request: SipMessage) -> None:
+        """Answer a request the registrar sent us.
+
+        Handling an INVITE properly belongs to the next stage. Until then the branch is
+        declined at once rather than left hanging: while our branch is unresolved a
+        forking proxy will not deliver other branches' final responses, which is what
+        makes the decline button on the resident's phone stop working.
+        """
+        await self._send(
+            MessageBuilder.response(
+                request, 486, "Busy Here", to_tag=secrets.token_hex(4)
+            )
+        )
 
     async def _send(self, data: bytes) -> None:
         """Write to the socket."""
@@ -705,47 +765,23 @@ class LokiSipClient:
         except OSError as err:
             raise SipTransportError(f"обрыв записи: {err}") from err
 
-    async def _read(self, *, timeout: float | None) -> SipMessage | Ping | Pong:
-        """Read the next framed item, answering nothing."""
-        if self._transport is None:
-            raise SipTransportError("not connected")
-
-        while True:
-            if self._pending:
-                return self._pending.pop(0)
-            try:
-                async with asyncio.timeout(timeout):
-                    chunk = await self._transport.reader.read(MAX_HEADER_BYTES)
-            except TimeoutError as err:
-                raise SipTransportError("регистратор не ответил") from err
-            except OSError as err:
-                raise SipTransportError(f"обрыв чтения: {err}") from err
-            if not chunk:
-                raise SipTransportError("регистратор закрыл соединение")
-            self._pending.extend(self._transport.framer.feed(chunk))
-
     async def _final_response(self) -> SipMessage:
-        """Read until a final response arrives, answering keepalives on the way."""
-        deadline = time.monotonic() + TIMER_F
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SipTransportError("регистратор не ответил вовремя")
-            item = await self._read(timeout=remaining)
-            if isinstance(item, Ping):
-                await self._send(b"\r\n")
-            elif (
-                isinstance(item, SipMessage)
-                and item.is_response
-                and (item.status or 0) >= 200
-            ):
-                return item
-                # A 100 to a REGISTER is legal, just uninteresting.
+        """Wait for the reader task to hand over a final response."""
+        try:
+            async with asyncio.timeout(TIMER_F):
+                return await self._responses.get()
+        except TimeoutError as err:
+            raise SipTransportError("регистратор не ответил вовремя") from err
 
     async def _close(self) -> None:
-        """Close the socket, tolerating one that is already gone."""
+        """Close the socket and stop the reader, tolerating an already-gone one."""
+        task, self._reader_task = self._reader_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
         transport, self._transport = self._transport, None
-        self._pending.clear()
         if transport is None:
             return
         transport.writer.close()

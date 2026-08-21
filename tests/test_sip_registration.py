@@ -204,6 +204,11 @@ async def test_contact_is_rewritten_from_received_and_rport() -> None:
     registered = [binding.uri for binding in registrar.bindings]
     assert registered, "nothing was registered"
     assert any("203.0.113.9:44444" in uri for uri in registered), registered
+    # The first REGISTER already created a binding for the address we guessed, which
+    # the registrar cannot reach. Leaving it behind fills the account's table with our
+    # own dead entries -- observed happening against a real Asterisk.
+    assert len(registered) == 1, f"a superseded binding was left behind: {registered}"
+    assert not any("127.0.0.1" in uri for uri in registered), registered
 
 
 @pytest.mark.asyncio
@@ -223,6 +228,76 @@ async def test_first_registration_uses_a_short_expiry() -> None:
         if row.lower().startswith("expires")
     ]
     assert "Expires: 60" in expires_rows, expires_rows
+
+
+@pytest.mark.asyncio
+async def test_registration_is_refreshed_while_held() -> None:
+    """The refresh must work while the reader is also running on the same socket.
+
+    Only one coroutine may read a stream, so a refresh that reads the socket itself
+    collides with the loop handling incoming requests -- and asyncio raises. That can
+    only happen once a registration is being held, so no short-lived test would catch
+    it: this one holds one and waits for a renewal.
+    """
+    registrar = WireTap(password=PASSWORD, max_contacts=3)
+    recorder = Recorder()
+    port = await registrar.start()
+    # Granted 10s means the client renews after about half of it.
+    client = LokiSipClient(_config(port, expires=10), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(30):
+            while not any(s is SipState.REGISTERED for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+            before = sum(
+                1
+                for request in registrar.seen
+                if request and request[0].startswith("REGISTER")
+            )
+            while True:
+                now = sum(
+                    1
+                    for request in registrar.seen
+                    if request and request[0].startswith("REGISTER")
+                )
+                if now > before:
+                    break
+                await asyncio.sleep(0.05)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is None, f"refresh failed: {recorder.terminal}"
+    assert len(registrar.bindings) == 1, "refresh must not create a second binding"
+
+
+@pytest.mark.asyncio
+async def test_an_incoming_request_is_declined_while_registered() -> None:
+    """A branch left hanging stops a proxy delivering other branches' replies."""
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_config(port), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(20):
+            while not any(s is SipState.REGISTERED for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+            replies = await registrar.send_invite()
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert replies, "the client sent nothing back"
+    assert replies[0].startswith("SIP/2.0 486"), replies
+    # A 6xx would cancel every other branch, the resident's phone included.
+    assert not any(reply.startswith("SIP/2.0 6") for reply in replies), replies
 
 
 # ----------------------------------------------------------------- ownership

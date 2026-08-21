@@ -109,6 +109,8 @@ class FakeRegistrar:
         self.wildcard_seen = False
         self.server: asyncio.Server | None = None
         self.port = 0
+        self._writer: asyncio.StreamWriter | None = None
+        self._replies: asyncio.Queue[str] = asyncio.Queue()
 
     def seed_foreign(self, count: int = 1) -> None:
         """Pretend somebody else's phone is already registered."""
@@ -135,10 +137,49 @@ class FakeRegistrar:
             self.server.close()
             await self.server.wait_closed()
 
+    async def send_invite(self, *, timeout: float = 5.0) -> list[str]:
+        """Push an INVITE down a live connection and collect what comes back.
+
+        Real registrars deliver an inbound call over the same connection the client
+        registered on, which is what makes this integration work without a port
+        forward. Reproducing that is the only way to test the client's answer.
+        """
+        if self._writer is None:
+            raise RuntimeError("no client connected")
+
+        self._replies = asyncio.Queue()
+        invite = CRLF.join(
+            [
+                "INVITE sip:1009999@fake SIP/2.0",
+                "Via: SIP/2.0/TCP fake:5060;branch=z9hG4bKinvite1",
+                "Max-Forwards: 70",
+                'From: "Дверь" <sip:1001@fake>;tag=callertag',
+                "To: <sip:1009999@fake>",
+                "Call-ID: invite-call-1",
+                "CSeq: 1 INVITE",
+                "Contact: <sip:1001@fake:5060>",
+                "Content-Length: 0",
+                "",
+                "",
+            ]
+        )
+        self._writer.write(invite.encode("utf-8"))
+        await self._writer.drain()
+
+        replies: list[str] = []
+        try:
+            async with asyncio.timeout(timeout):
+                while True:
+                    replies.append(await self._replies.get())
+        except TimeoutError:
+            pass
+        return replies
+
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         buf = b""
+        self._writer = writer
         try:
             while True:
                 chunk = await reader.read(65536)
@@ -149,6 +190,10 @@ class FakeRegistrar:
                     block, buf = buf[:end].decode("latin-1"), buf[end + 4 :]
                     rows = [row for row in block.split(CRLF) if row]
                     if not rows:
+                        continue
+                    if rows[0].startswith("SIP/2.0"):
+                        # A reply to something we sent, not a request to serve.
+                        await self._replies.put(rows[0])
                         continue
                     writer.write(self._respond(rows).encode("latin-1"))
                     await writer.drain()
