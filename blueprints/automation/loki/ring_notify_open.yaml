@@ -43,6 +43,22 @@ blueprint:
       default: Loki Domofon
       selector:
         text:
+    click_target:
+      name: Что открыть по нажатию на уведомление
+      description: >
+        Нажатие на кнопку «Открыть» открывает дверь. А нажатие на само уведомление
+        показывает это. Страница домофона и страница со всеми требуют, чтобы в
+        настройках интеграции была включена страница «Домофоны».
+      default: door
+      selector:
+        select:
+          options:
+            - label: Страницу этого домофона — картинка и кнопка открытия
+              value: door
+            - label: Страницу со всеми домофонами
+              value: all
+            - label: Ничего — просто откроет Home Assistant
+              value: none
     wait_timeout:
       name: Сколько ждать нажатия
       description: >
@@ -70,6 +86,7 @@ actions:
       # A blueprint input is a YAML tag, not a template variable: using
       # {{ notification_tag }} without binding it here renders as undefined.
       tag_in: !input notification_tag
+      click_in: !input click_target
       channel_in: !input notification_channel
       open_title: !input open_action_title
 
@@ -90,21 +107,24 @@ actions:
       # tag shared across *different* doors would make one door's ring wipe another's.
       tag_door: "{{ tag_in }}_{{ device_id }}"
 
-      # Built as a whole: an empty `image` breaks attachment loading on Android, so
-      # the key is either present and valid or absent entirely.
+      # Assembled key by key rather than as two whole literals: an empty `image`
+      # breaks attachment loading on Android, and an empty `clickAction` sends the tap
+      # nowhere, so a key is either present and valid or absent entirely.
       notify_data: >-
-        {% set acts = [{'action': action_open, 'title': open_title}] %}
+        {% set data = {'tag': tag_door, 'channel': channel_in,
+                       'importance': 'high', 'ttl': 0, 'priority': 'high',
+                       'actions': [{'action': action_open, 'title': open_title}],
+                       'push': {'interruption-level': 'time-sensitive'}} %}
         {% if camera_entity %}
-        {{ {'tag': tag_door, 'channel': channel_in, 'importance': 'high',
-            'ttl': 0, 'priority': 'high', 'actions': acts,
-            'push': {'interruption-level': 'time-sensitive'},
-            'image': '/api/camera_proxy/' ~ camera_entity,
-            'entity_id': camera_entity} }}
-        {% else %}
-        {{ {'tag': tag_door, 'channel': channel_in, 'importance': 'high',
-            'ttl': 0, 'priority': 'high', 'actions': acts,
-            'push': {'interruption-level': 'time-sensitive'}} }}
+        {% set data = dict(data, image='/api/camera_proxy/' ~ camera_entity,
+                           entity_id=camera_entity) %}
         {% endif %}
+        {% if click_in == 'door' %}
+        {% set data = dict(data, clickAction='/loki/' ~ device_id) %}
+        {% elif click_in == 'all' %}
+        {% set data = dict(data, clickAction='/loki') %}
+        {% endif %}
+        {{ data }}
 
   - alias: Отправить уведомление со снимком и кнопкой
     domain: mobile_app

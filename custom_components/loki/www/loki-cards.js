@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.0.0";
+const CARD_VERSION = "1.1.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -68,6 +68,8 @@ const t = {
   yes: "Да",
   no: "Нет",
   panelTitle: "Домофоны",
+  backToAll: "Все домофоны",
+  doorGone: "Этот домофон не найден",
   ringing: "Вызов",
   unavailable:
     "Видеопоток недоступен. На плитках — статичная картинка с сервера, "
@@ -166,6 +168,22 @@ function lokiId(hass, door) {
   const device = hass && hass.devices ? hass.devices[door.device] : null;
   for (const [domain, value] of (device && device.identifiers) || []) {
     if (domain === "loki" && /^\d+$/.test(String(value))) return Number(value);
+  }
+  return null;
+}
+
+/** The camera entity belonging to a numeric Loki device id, or null. */
+function cameraForLokiId(hass, wanted) {
+  const devices = (hass && hass.devices) || {};
+  let deviceId = null;
+  for (const [id, device] of Object.entries(devices)) {
+    for (const [domain, value] of device.identifiers || []) {
+      if (domain === "loki" && String(value) === String(wanted)) deviceId = id;
+    }
+  }
+  if (!deviceId) return null;
+  for (const [entityId, entry] of Object.entries((hass && hass.entities) || {})) {
+    if (entry.device_id === deviceId && entityId.startsWith("camera.")) return entityId;
   }
   return null;
 }
@@ -1318,16 +1336,34 @@ class LokiPanel extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._card) this._build();
-    this._card.hass = hass;
+    this._render();
   }
 
   /** panel_custom hands the panel its config here; we have nothing to read from it. */
   set panel(_panel) {}
 
+  /**
+   * ``/loki`` shows every door; ``/loki/<id>`` shows one.
+   *
+   * That second form is what a doorbell notification points at: tapping it should land
+   * on the door that rang, with its picture and its open button, not on a wall of
+   * twenty tiles to search through.
+   */
+  set route(route) {
+    const path = (route && route.path) || "";
+    const match = path.match(/(\d+)/);
+    const door = match ? match[1] : null;
+    if (door === this._door) return;
+    this._door = door;
+    this._card = null;
+    this.innerHTML = "";
+    this._render();
+  }
+
   set narrow(narrow) {
     if (this._narrow === narrow) return;
     this._narrow = narrow;
+    if (this._door) return;
     // setConfig tears the card down and it only rebuilds when hass is set again, so
     // reconfiguring without re-feeding hass leaves an empty page. panel_custom sets
     // narrow after hass, which is exactly when that happens.
@@ -1345,12 +1381,54 @@ class LokiPanel extends HTMLElement {
     };
   }
 
+  _render() {
+    if (!this._hass) return;
+    if (!this._card) this._build();
+    this._card.hass = this._hass;
+  }
+
+  _buildOne() {
+    const camera = cameraForLokiId(this._hass, this._door);
+    const wrap = el("div", "loki-panel");
+
+    const back = document.createElement("a");
+    back.className = "loki-back";
+    back.href = "/loki";
+    back.textContent = `← ${t.backToAll}`;
+    wrap.appendChild(back);
+
+    if (!camera) {
+      wrap.appendChild(el("div", "loki-empty", t.doorGone));
+      this.appendChild(wrap);
+      // Something has to answer the hass setter; an inert stub keeps _render simple.
+      this._card = { set hass(_v) {} };
+      return wrap;
+    }
+
+    this._card = document.createElement("loki-door-card");
+    this._card.setConfig({ camera });
+    wrap.appendChild(this._card);
+    return wrap;
+  }
+
   _build() {
     const style = el("style");
     style.textContent = `
       .loki-panel { padding: 8px; box-sizing: border-box; }
-      .loki-panel loki-wall-card { display: block; }
+      .loki-panel loki-wall-card, .loki-panel loki-door-card { display: block; }
+      .loki-panel loki-door-card { max-width: 760px; margin: 0 auto; }
+      .loki-back {
+        display: inline-block;
+        margin: 4px 8px 10px;
+        font-size: 14px;
+        color: var(--primary-color, #03a9f4);
+        text-decoration: none;
+      }
     `;
+    if (this._door) {
+      this.append(style, this._buildOne());
+      return;
+    }
     const wrap = el("div", "loki-panel");
     this._card = document.createElement("loki-wall-card");
     this._card.setConfig(this._config());
