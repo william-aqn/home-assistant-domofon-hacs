@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.7.0";
+const CARD_VERSION = "0.8.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -37,6 +37,12 @@ const STILL_REFRESH = 10;
 
 // How long to wait for a forced snapshot before counting it as failed.
 const SHOT_TIMEOUT = 15;
+
+// Minimum tile width per size. The grid fills the card with as many columns of at
+// least this width as fit, so the setting reads as "how big", not "how many" -- which
+// is the thing that stays right when the same dashboard is opened on a phone.
+const TILE_SIZES = { compact: 200, medium: 320, large: 460 };
+const DEFAULT_TILE_SIZE = "medium";
 
 const ICON_OPEN = "mdi:lock-open-variant-outline";
 const ICON_LIVE = "mdi:video-outline";
@@ -770,7 +776,7 @@ class LokiWallCard extends HTMLElement {
   }
 
   static getStubConfig(hass) {
-    return { cameras: findDoorCameras(hass) };
+    return { cameras: findDoorCameras(hass), tile_size: DEFAULT_TILE_SIZE };
   }
 
   constructor() {
@@ -787,6 +793,7 @@ class LokiWallCard extends HTMLElement {
     this._config = {
       title: "Домофоны",
       live_timeout: DEFAULT_LIVE_TIMEOUT,
+      tile_size: DEFAULT_TILE_SIZE,
       cameras: [],
       ...(config || {}),
     };
@@ -805,6 +812,16 @@ class LokiWallCard extends HTMLElement {
 
   getCardSize() {
     return 2 + Math.ceil(this._cameras().length / 3) * 3;
+  }
+
+  /** Roughly how many tiles fit across, for the size hints below. */
+  _columnGuess() {
+    const columns = Number(this._config.columns);
+    if (columns) return Math.max(1, columns);
+    const width = this.getBoundingClientRect().width || 900;
+    const min =
+      TILE_SIZES[this._config.tile_size] || TILE_SIZES[DEFAULT_TILE_SIZE];
+    return Math.max(1, Math.floor(width / (min + 10)));
   }
 
   /** Sizing for sections views. A wall of doors wants the whole width.
@@ -965,12 +982,14 @@ class LokiWallCard extends HTMLElement {
     // Width-driven by default: a fixed column count is either cramped on a phone or
     // absurdly stretched on a monitor. `columns` remains as an explicit override.
     const columns = Number(this._config.columns);
-    // min(100%, …) so a narrow card shrinks the tile instead of overflowing, and 210px
-    // because a wall of doors is for recognising a person: past a certain point more
-    // columns stop helping and start hiding faces.
+    // min(100%, …) so a narrow card shrinks the tile instead of overflowing rather
+    // than pushing the page sideways. A wall of doors is for recognising a person, so
+    // past a certain point more columns stop helping and start hiding faces.
+    const minWidth =
+      TILE_SIZES[this._config.tile_size] || TILE_SIZES[DEFAULT_TILE_SIZE];
     this._grid.style.gridTemplateColumns = columns
       ? `repeat(${Math.max(1, columns)}, minmax(0, 1fr))`
-      : "repeat(auto-fill, minmax(min(100%, 210px), 1fr))";
+      : `repeat(auto-fill, minmax(min(100%, ${minWidth}px), 1fr))`;
 
     for (const [camera, tile] of this._tiles) {
       if (!cameras.includes(camera)) {
@@ -1217,7 +1236,8 @@ class LokiEditorBase extends HTMLElement {
         cameras: "Какие домофоны показывать",
         name: "Заголовок (необязательно)",
         title: "Заголовок",
-        columns: "Плиток в ряд (пусто — по ширине)",
+        tile_size: "Размер плиток",
+        columns: "Плиток в ряд (пусто — по размеру)",
         live_timeout: "Сам выключить видео через, с",
       }[name] || name
     );
@@ -1249,6 +1269,19 @@ class LokiWallCardEditor extends LokiEditorBase {
         name: "cameras",
         selector: {
           entity: { multiple: true, filter: { integration: "loki", domain: "camera" } },
+        },
+      },
+      {
+        name: "tile_size",
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: [
+              { value: "compact", label: "Мелкие — больше в ряд" },
+              { value: "medium", label: "Средние" },
+              { value: "large", label: "Крупные — видно лица" },
+            ],
+          },
         },
       },
       {
