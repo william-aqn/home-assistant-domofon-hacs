@@ -130,12 +130,25 @@ class RegistrationState:
 
     cseq: int = 0
 
+    def adopt_prior_contacts(self, uris: Sequence[str]) -> None:
+        """Seed Contact URIs a previous process registered with.
+
+        A restart otherwise cannot recognise its own binding. The source port changes
+        with the connection, and a registrar that does not echo ``+sip.instance``
+        leaves nothing else to match on -- so the client reads its own leftover
+        binding as somebody else's and refuses to register on its own account.
+
+        Only the caller can judge how old these are; anything stale must be dropped
+        before it gets here, because a NAT port can be handed to another device.
+        """
+        self.prior_contacts = [
+            PriorContact(uri, time.monotonic()) for uri in uris if uri
+        ][-MAX_PRIOR_CONTACTS:]
+
     def set_contact(self, uri: str) -> None:
         """Adopt a new Contact URI, remembering the old one so it can be withdrawn."""
         if self.contact_uri and self.contact_uri != uri:
-            self.prior_contacts.append(
-                PriorContact(self.contact_uri, time.monotonic())
-            )
+            self.prior_contacts.append(PriorContact(self.contact_uri, time.monotonic()))
             # Bounded: a flapping connection must not accumulate an unbounded list of
             # URIs we would keep trying to withdraw.
             del self.prior_contacts[:-MAX_PRIOR_CONTACTS]
@@ -218,8 +231,7 @@ class RegistrationState:
             if "*" in live:
                 raise SipSafetyError("never build a wildcard Contact")
             rows.append(
-                f"<{live}>;"
-                f'+sip.instance="<urn:uuid:{self.instance_id}>";reg-id=1'
+                f'<{live}>;+sip.instance="<urn:uuid:{self.instance_id}>";reg-id=1'
             )
 
         for uri in reap:
@@ -227,8 +239,8 @@ class RegistrationState:
                 raise SipSafetyError("never build a wildcard Contact")
             if uri == live:
                 raise SipSafetyError(
-                "refusing to withdraw the contact being registered"
-            )
+                    "refusing to withdraw the contact being registered"
+                )
             rows.append(f"<{uri}>;expires=0")
 
         return rows

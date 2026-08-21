@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from custom_components.loki.sip import client as client_module
 from custom_components.loki.sip.client import (
     LokiSipClient,
     SipConfig,
@@ -306,3 +307,69 @@ async def test_a_phone_appearing_during_baseline_blocks() -> None:
     assert recorder.terminal is not None
     assert recorder.terminal[0] is SipState.BLOCKED
     assert registrar.contact_rows == []
+
+
+# ------------------------------------------------------------------ keepalive
+
+
+@pytest.mark.asyncio
+async def test_the_connection_is_pinged_before_any_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The keepalive belongs to the connection, not to the registered phase.
+
+    Measured against the live registrar: with the keepalive confined to the registered
+    phase, the third baseline probe went unanswered and the flow restarted -- so the
+    baseline never finished and the client could never register at all.
+    """
+    monkeypatch.setattr(client_module, "KEEPALIVE", 0.15)
+    registrar = FakeRegistrar(password=PASSWORD)
+    port = await registrar.start()
+    client = LokiSipClient(_config(port), Recorder())
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(10):
+            while registrar.pings < 2:
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert registrar.pings >= 2
+    assert registrar.bindings == [], "probe-only mode must still change nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_connection_dropped_during_baseline_is_noticed_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Otherwise it surfaces 32 seconds later as an unexplained request timeout."""
+    monkeypatch.setattr(client_module, "KEEPALIVE", 3600.0)
+    recorder = Recorder()
+    registrar = FakeRegistrar(password=PASSWORD)
+    port = await registrar.start()
+    client = LokiSipClient(
+        _config(port, require_baseline=True, baseline_interval=30.0), recorder
+    )
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(10):
+            while not any(s is SipState.BASELINE for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+            registrar.drop_connection()
+            while not any(s is SipState.BACKOFF for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    # Reaching backoff at all proves it: the baseline interval is 30 s and the request
+    # timeout is 32 s, so a client that only noticed on the next probe would have
+    # blown the 10 s deadline above.
+    assert any(s is SipState.BACKOFF for s, _ in recorder.states)

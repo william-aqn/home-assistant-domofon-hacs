@@ -6,6 +6,12 @@ from typing import Final
 
 CRLF: Final = b"\r\n"
 
+# RFC 5626 §4.4.1 keepalive, and the two forms are not interchangeable: the *client*
+# pings with a double CRLF and the server answers with a single one. Sending the single
+# form outbound is answering a ping nobody made -- a server is entitled to ignore it,
+# and a registrar that reclaims our idle connection takes the doorbell with it.
+PING: Final = b"\r\n\r\n"
+
 # Identify honestly. Impersonating the official client here would buy nothing and
 # would make a support conversation with the operator impossible.
 USER_AGENT: Final = "Loki-HomeAssistant/1.0"

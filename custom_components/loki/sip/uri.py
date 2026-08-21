@@ -77,6 +77,25 @@ def has_header_param(value: str, name: str) -> bool:
     return name.lower() in parse_params(pieces[1:] if pieces else [])
 
 
+def name_addr(raw: str) -> str:
+    """A header value with its header parameters removed.
+
+    Used on ``From`` before the value leaves the SIP layer. The tag changes on every
+    call, and the value is handed to a backend lookup that matches on the whole
+    string; the official client never includes it, because pjsua's ``getRemoteUri()``
+    prints the name-addr alone. All three forms were measured to resolve the same
+    door, so this is about matching the reference rather than about correctness.
+
+    In the bracket-less form every parameter is a header parameter (RFC 3261 §20.10
+    requires angle brackets to carry URI parameters), so the first one ends the value.
+    """
+    text = raw.strip()
+    if ">" in text:
+        return text[: text.index(">") + 1].strip()
+    pieces = split_semis(text)
+    return pieces[0] if pieces else text
+
+
 @dataclass(frozen=True, slots=True)
 class SipUri:
     """A parsed SIP URI, enough of one to compare and rebuild."""
@@ -91,8 +110,10 @@ class SipUri:
     def bare(self) -> str:
         """``scheme:user@host[:port]`` with no parameters."""
         authority = self.host if self.port is None else f"{self.host}:{self.port}"
-        return f"{self.scheme}:{self.user}@{authority}" if self.user else (
-            f"{self.scheme}:{authority}"
+        return (
+            f"{self.scheme}:{self.user}@{authority}"
+            if self.user
+            else (f"{self.scheme}:{authority}")
         )
 
     def equivalent(self, other: SipUri) -> bool:

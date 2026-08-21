@@ -22,7 +22,7 @@ import random
 import time
 from typing import Protocol
 
-from .const import ALLOW, CRLF, MAX_HEADER_BYTES, TIMER_F
+from .const import ALLOW, CRLF, MAX_HEADER_BYTES, PING, TIMER_F
 from .digest import DigestChallenge, challenges_from
 from .errors import (
     SipBlockedError,
@@ -36,7 +36,7 @@ from .errors import (
 from .messages import MessageBuilder, Ping, Pong, SipMessage, StreamFramer
 from .registration import Binding, RegistrationState, parse_bindings, uri_equal
 from .transactions import InviteTransaction, TransactionTable, transaction_key
-from .uri import parse_params, split_semis
+from .uri import name_addr, parse_params, split_semis
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,7 +101,12 @@ class SipSnapshot:
 
     state: SipState
     detail: str | None = None
+    # Everything the registrar reported, and the subset that is not ours. Two fields
+    # rather than one because a count of "somebody else is here" is what gates the
+    # whole design, and deriving it from the full list at each call site is how one
+    # of those sites eventually forgets to.
     bindings: tuple[Binding, ...] = ()
+    foreign: tuple[Binding, ...] = ()
     realm: str | None = None
     algorithm: str | None = None
     local: str | None = None
@@ -111,7 +116,7 @@ class SipSnapshot:
     @property
     def foreign_count(self) -> int:
         """How many bindings belong to somebody else."""
-        return len(self.bindings)
+        return len(self.foreign)
 
 
 class SipEvents(Protocol):
@@ -192,6 +197,7 @@ class LokiSipClient:
         # raises -- which only happens once a registration is being held, i.e. not in
         # any short-lived test.
         self._reader_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._responses: asyncio.Queue[SipMessage] = asyncio.Queue()
         # Serialises request/response exchanges so one reply cannot be taken by the
         # wrong sender.
@@ -211,6 +217,16 @@ class LokiSipClient:
     def state(self) -> SipState:
         """Current state."""
         return self._current
+
+    @property
+    def contact_uri(self) -> str | None:
+        """The Contact URI our binding is registered at, once there is one.
+
+        Persisted by the bridge. Without it a restart cannot recognise its own
+        binding: the source port changes, and this registrar does not echo
+        ``+sip.instance``, so the only handle left is the URI itself.
+        """
+        return self._state.contact_uri
 
     # ------------------------------------------------------------- supervisor
 
@@ -300,9 +316,7 @@ class LokiSipClient:
         self._set_state(SipState.REGISTERING, None)
 
         first_time = not self._config.first_registration_done
-        expires = (
-            self._config.first_expires if first_time else self._config.expires
-        )
+        expires = self._config.first_expires if first_time else self._config.expires
         # Withdraw our own leftovers in the same message that creates the new binding,
         # so the table never holds two of ours at once.
         reap = [binding.uri for binding in before if self._reapable(binding)]
@@ -336,13 +350,9 @@ class LokiSipClient:
         self._assert_bindings_visible(after)
         await self._assert_no_eviction(before, after, time.monotonic() - started)
 
-    async def _register_once(
-        self, *, expires: int, reap: Sequence[str]
-    ) -> SipMessage:
+    async def _register_once(self, *, expires: int, reap: Sequence[str]) -> SipMessage:
         """Send one REGISTER carrying our live Contact."""
-        contacts = self._state.build_contacts(
-            live=self._state.contact_uri, reap=reap
-        )
+        contacts = self._state.build_contacts(live=self._state.contact_uri, reap=reap)
         return await self._register_request(contacts=contacts, expires=expires)
 
     def _rewritten_contact(self, response: SipMessage) -> str | None:
@@ -395,7 +405,6 @@ class LokiSipClient:
         """
         try:
             async with asyncio.TaskGroup() as group:
-                group.create_task(self._keepalive_loop())
                 group.create_task(self._refresh_loop())
                 group.create_task(self._await_reader())
         except* (SipError, OSError, TimeoutError) as group_error:
@@ -409,23 +418,44 @@ class LokiSipClient:
         raise SipTransportError("соединение с регистратором закрыто")
 
     async def _keepalive_loop(self) -> None:
-        """Send a CRLF now and then so the connection is not silently dropped.
+        """Ping now and then so the connection is not silently dropped.
 
-        RFC 5626 §4.4.1. Mains-powered, so the interval is short: the cost of an
-        idle NAT mapping expiring is a doorbell that does not ring.
+        RFC 5626 §4.4.1. Runs for the whole life of the connection, not just while a
+        registration is held: the baseline phase leaves the socket idle for minutes at
+        a time, and a registrar that has no binding for us has every reason to reclaim
+        it. Measured against the live registrar -- without this the third baseline
+        probe went unanswered and the flow restarted, so the baseline never finished
+        and the client could never register at all.
         """
-        while not self._stopping:
-            await asyncio.sleep(random.uniform(0.8 * KEEPALIVE, KEEPALIVE))  # noqa: S311
-            await self._send(CRLF)
+        try:
+            while not self._stopping:
+                delay = random.uniform(0.8 * KEEPALIVE, KEEPALIVE)  # noqa: S311
+                await asyncio.sleep(delay)
+                await self._send(PING)
+        except (SipError, OSError):
+            # The reader notices the same failure and is the one that reports it.
+            return
+
+    async def _sleep_watching_reader(self, delay: float) -> None:
+        """Sleep, but give up at once if the connection dies underneath us.
+
+        Only ``_serve`` used to watch the reader, so a connection lost during the
+        baseline went unnoticed until the next probe timed out thirty seconds later --
+        reported as an unexplained timeout rather than as the dropped connection it
+        was.
+        """
+        if self._reader_task is None:
+            raise SipTransportError("reader is not running")
+        done, _pending = await asyncio.wait({self._reader_task}, timeout=delay)
+        if done:
+            raise SipTransportError("соединение с регистратором закрыто")
 
     async def _refresh_loop(self) -> None:
         """Renew the registration before the granted expiry runs out."""
         while not self._stopping:
             await asyncio.sleep(self._state.refresh_delay())
             self._state.forget_stale_priors(self._state.granted_expires or 300)
-            response = await self._register_once(
-                expires=self._config.expires, reap=[]
-            )
+            response = await self._register_once(expires=self._config.expires, reap=[])
             self._resolve_granted(response, requested=self._config.expires)
             _LOGGER.debug(
                 "Registration refreshed, granted %ss", self._state.granted_expires
@@ -506,9 +536,7 @@ class LokiSipClient:
             return
 
         await self._withdraw_own_contact()
-        raise SipEvictionError(
-            f"регистрация вытеснила чужих привязок: {len(vanished)}"
-        )
+        raise SipEvictionError(f"регистрация вытеснила чужих привязок: {len(vanished)}")
 
     def _vanished(
         self, before: Sequence[Binding], after: Sequence[Binding], elapsed: float
@@ -574,7 +602,7 @@ class LokiSipClient:
         latest: list[Binding] = []
 
         for sample in range(2, self._config.baseline_samples + 1):
-            await asyncio.sleep(self._config.baseline_interval)
+            await self._sleep_watching_reader(self._config.baseline_interval)
             latest, response = await self._probe()
             self._publish(SipState.BASELINE, latest, response)
             self._gate(latest)
@@ -597,9 +625,7 @@ class LokiSipClient:
         response = await self._register_request(contacts=(), expires=None)
         return parse_bindings(
             tuple(
-                header.value
-                for header in response.headers
-                if header.name == "contact"
+                header.value for header in response.headers if header.name == "contact"
             )
         ), response
 
@@ -670,9 +696,7 @@ class LokiSipClient:
         """Remember a challenge to answer. False if it cannot be answered."""
         proxy = response.status == 407
         name = "proxy-authenticate" if proxy else "www-authenticate"
-        rows = [
-            header.value for header in response.headers if header.name == name
-        ]
+        rows = [header.value for header in response.headers if header.name == name]
         offers = challenges_from(rows, proxy=proxy)
         if not offers:
             return False
@@ -726,6 +750,7 @@ class LokiSipClient:
         while not self._responses.empty():
             self._responses.get_nowait()
         self._reader_task = asyncio.create_task(self._reader_main())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def _reader_main(self) -> None:
         """The only coroutine that reads the socket.
@@ -769,9 +794,7 @@ class LokiSipClient:
             return  # nothing to answer
         elif request.method == "OPTIONS":
             await self._send(
-                MessageBuilder.response(
-                    request, 200, "OK", extra=[("Allow", ALLOW)]
-                )
+                MessageBuilder.response(request, 200, "OK", extra=[("Allow", ALLOW)])
             )
         else:
             await self._send(
@@ -804,7 +827,7 @@ class LokiSipClient:
             return
 
         from_header = request.first("from")
-        remote_uri = from_header.text() if from_header else ""
+        remote_uri = name_addr(from_header.text()) if from_header else ""
         transaction = self._transactions.add(
             key, InviteTransaction(call_id=request.call_id, remote_uri=remote_uri)
         )
@@ -812,16 +835,12 @@ class LokiSipClient:
 
         await self._send(MessageBuilder.response(request, 100, "Trying"))
         await self._send(
-            MessageBuilder.response(
-                request, 180, "Ringing", to_tag=transaction.to_tag
-            )
+            MessageBuilder.response(request, 180, "Ringing", to_tag=transaction.to_tag)
         )
 
         delivered = False
         try:
-            delivered = await self._events.on_incoming(
-                transaction.call_id, remote_uri
-            )
+            delivered = await self._events.on_incoming(transaction.call_id, remote_uri)
         except Exception:
             _LOGGER.exception("Failed to announce the incoming call")
 
@@ -931,8 +950,11 @@ class LokiSipClient:
             deadline.cancel()
         self._branch_deadlines.clear()
 
-        task, self._reader_task = self._reader_task, None
-        if task is not None:
+        keepalive, self._keepalive_task = self._keepalive_task, None
+        reader, self._reader_task = self._reader_task, None
+        for task in (keepalive, reader):
+            if task is None:
+                continue
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -963,6 +985,7 @@ class LokiSipClient:
             SipSnapshot(
                 state=state,
                 bindings=tuple(bindings),
+                foreign=tuple(self._foreign(bindings)),
                 realm=challenge.realm if challenge else None,
                 algorithm=challenge.algorithm if challenge else None,
                 local=self._state.sent_by,

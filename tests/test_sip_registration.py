@@ -165,9 +165,7 @@ async def test_eviction_is_detected_and_the_client_stops() -> None:
 
     # The guard would normally refuse outright; switch it off to reach the detector
     # that exists for the case where the phone registers between probe and REGISTER.
-    await _run_until(
-        registrar, recorder, {"strict_guard": False}, done="registered"
-    )
+    await _run_until(registrar, recorder, {"strict_guard": False}, done="registered")
 
     assert recorder.terminal is not None
     state, kind, _ = recorder.terminal
@@ -317,6 +315,10 @@ async def test_an_incoming_call_rings_and_is_never_answered() -> None:
     assert recorder.calls, "the ring was not announced"
     _call_id, remote_uri = recorder.calls[0]
     assert "Дверь" in remote_uri, remote_uri
+    # ...and without the From tag. The value goes to a backend lookup that matches on
+    # the whole string, and the tag makes it unique to this one call.
+    assert "tag=" not in remote_uri, remote_uri
+    assert remote_uri.endswith(">"), remote_uri
 
 
 @pytest.mark.asyncio
@@ -421,3 +423,103 @@ def test_a_phone_that_only_changed_port_has_not_vanished() -> None:
     after = Binding("sip:other@h:41234;transport=tcp", 3600, instance, None)
 
     assert client._vanished([before], [after], elapsed=1.0) == []
+
+
+# -------------------------------------------------------------------- restart
+
+
+async def _register_once(port: int, instance_id: str) -> str:
+    """Register, then walk away without de-registering. Returns the Contact URI."""
+    state = RegistrationState(
+        host="127.0.0.1", user=USER, port=port, instance_id=instance_id
+    )
+    client = LokiSipClient(_config(port), Recorder(), state=state)
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(15):
+            while client.state is not SipState.REGISTERED:
+                await asyncio.sleep(0.02)
+        contact = client.contact_uri
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert contact
+    return contact
+
+
+@pytest.mark.asyncio
+async def test_a_restart_without_its_old_contact_blocks_itself() -> None:
+    """The failure this exists to prevent, pinned so it cannot come back unnoticed.
+
+    Observed on the live registrar: Home Assistant restarted, its own binding from the
+    previous process was still on the account, and -- new source port, and a registrar
+    that does not echo ``+sip.instance`` -- the fresh process read it as another
+    device and refused to register on its own account.
+    """
+    # No echoed instance id: this is what the live registrar does, and it is what
+    # leaves the Contact URI as the only handle on our own binding.
+    registrar = WireTap(password=PASSWORD, echo_instance_id=False)
+    port = await registrar.start()
+    recorder = Recorder()
+    instance_id = "11111111-2222-3333-4444-555555555555"
+    try:
+        await _register_once(port, instance_id)
+        assert len(registrar.bindings) == 1
+
+        # Same instance id -- it is persisted across restarts -- and it still does not
+        # help, because the registrar never gives it back.
+        restarted = RegistrationState(
+            host="127.0.0.1", user=USER, port=port, instance_id=instance_id
+        )
+        client = LokiSipClient(_config(port), recorder, state=restarted)
+        task = asyncio.create_task(client.async_run())
+        try:
+            async with asyncio.timeout(15):
+                while recorder.terminal is None:
+                    await asyncio.sleep(0.02)
+        finally:
+            await client.async_stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        await registrar.stop()
+
+    assert recorder.terminal is not None
+    assert recorder.terminal[0] is SipState.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_a_restart_carrying_its_old_contact_reclaims_the_binding() -> None:
+    """With the URI remembered, the leftover is recognised and withdrawn."""
+    registrar = WireTap(password=PASSWORD, echo_instance_id=False)
+    port = await registrar.start()
+    recorder = Recorder()
+    instance_id = "11111111-2222-3333-4444-555555555555"
+    try:
+        previous = await _register_once(port, instance_id)
+        assert len(registrar.bindings) == 1
+
+        state = RegistrationState(
+            host="127.0.0.1", user=USER, port=port, instance_id=instance_id
+        )
+        state.adopt_prior_contacts([previous])
+        client = LokiSipClient(_config(port), recorder, state=state)
+        task = asyncio.create_task(client.async_run())
+        try:
+            async with asyncio.timeout(15):
+                while client.state is not SipState.REGISTERED:
+                    assert recorder.terminal is None, recorder.terminal
+                    await asyncio.sleep(0.02)
+        finally:
+            await client.async_stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        await registrar.stop()
+
+    assert recorder.terminal is None
+    # One binding, not two: the old one was withdrawn in the same message that
+    # created the new one, so our own restarts cannot fill the account's table.
+    assert len(registrar.bindings) == 1
+    assert registrar.bindings[0].uri != previous

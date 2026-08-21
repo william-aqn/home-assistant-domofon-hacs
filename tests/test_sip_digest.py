@@ -16,6 +16,7 @@ from custom_components.loki.sip.errors import SipPermanentError
 from custom_components.loki.sip.uri import (
     display_name,
     has_header_param,
+    name_addr,
     parse_params,
     parse_uri,
     split_commas,
@@ -231,3 +232,25 @@ def test_display_name_survives_a_uri_without_angle_brackets() -> None:
     assert display_name("sip:1001@example") == "sip:1001@example"
     assert display_name('"Подъезд 1" <sip:1001@example>') == "Подъезд 1"
     assert display_name("Gate <sip:1001@example>") == "Gate"
+
+
+def test_name_addr_drops_the_from_tag() -> None:
+    """The tag changes per call; the backend door lookup matches on the whole string."""
+    raw = '"Подъезд 1" <sip:1001@example>;tag=abc-123'
+    assert name_addr(raw) == '"Подъезд 1" <sip:1001@example>'
+
+
+def test_name_addr_leaves_a_value_without_parameters_alone() -> None:
+    value = '"Подъезд 1" <sip:1001@example>'
+    assert name_addr(value) == value
+
+
+def test_name_addr_keeps_a_semicolon_inside_the_display_name() -> None:
+    """A quoted display name may contain anything, including the parameter separator."""
+    raw = '"Вход; служебный" <sip:1001@example>;tag=zz'
+    assert name_addr(raw) == '"Вход; служебный" <sip:1001@example>'
+
+
+def test_name_addr_on_a_bracketless_uri_strips_header_parameters() -> None:
+    """Without angle brackets every parameter is a header one (RFC 3261 §20.10)."""
+    assert name_addr("sip:1001@example;tag=abc") == "sip:1001@example"

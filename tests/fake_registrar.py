@@ -36,12 +36,12 @@ class Binding:
     reg_id: str | None
     registered_at: float = field(default_factory=time.monotonic)
 
-    def render(self) -> str:
+    def render(self, *, echo_instance_id: bool = True) -> str:
         """Format as a Contact header value."""
         parts = [f"<{self.uri}>", f"expires={self.expires}"]
-        if self.instance_id:
+        if self.instance_id and echo_instance_id:
             parts.append(f'+sip.instance="<urn:uuid:{self.instance_id}>"')
-        if self.reg_id:
+        if self.reg_id and echo_instance_id:
             parts.append(f"reg-id={self.reg_id}")
         return ";".join(parts)
 
@@ -95,6 +95,7 @@ class FakeRegistrar:
         require_auth: bool = True,
         report_bindings: bool = True,
         rewrite_contact: bool = False,
+        echo_instance_id: bool = True,
     ) -> None:
         """Configure the policies that matter to the probe."""
         self.password = password
@@ -104,9 +105,16 @@ class FakeRegistrar:
         # blind, so the probe has to detect it. This switch reproduces that.
         self.report_bindings = report_bindings
         self.rewrite_contact = rewrite_contact
+        # The live registrar (Asterisk) does NOT echo +sip.instance or reg-id, which
+        # makes URI comparison the primary way a client recognises its own binding
+        # rather than the fallback. Switchable so both worlds can be tested.
+        self.echo_instance_id = echo_instance_id
         self.bindings: list[Binding] = []
         self.evictions = 0
         self.wildcard_seen = False
+        # RFC 5626 §4.4.1 pings. Counted because an idle connection that is never
+        # pinged is one the registrar is entitled to reclaim.
+        self.pings = 0
         self.server: asyncio.Server | None = None
         self.port = 0
         self._writer: asyncio.StreamWriter | None = None
@@ -175,6 +183,12 @@ class FakeRegistrar:
             pass
         return replies
 
+    def drop_connection(self) -> None:
+        """Close the client's connection, as a registrar reclaiming an idle one does."""
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -190,6 +204,9 @@ class FakeRegistrar:
                     block, buf = buf[:end].decode("latin-1"), buf[end + 4 :]
                     rows = [row for row in block.split(CRLF) if row]
                     if not rows:
+                        # An empty block between messages is a keepalive, not a
+                        # message: the client's double-CRLF ping lands exactly here.
+                        self.pings += 1
                         continue
                     if rows[0].startswith("SIP/2.0"):
                         # A reply to something we sent, not a request to serve.
@@ -320,7 +337,10 @@ class FakeRegistrar:
         ]
         rows += extra or []
         if bindings and self.report_bindings:
-            rows += [f"Contact: {b.render()}" for b in self.bindings]
+            rows += [
+                f"Contact: {b.render(echo_instance_id=self.echo_instance_id)}"
+                for b in self.bindings
+            ]
         rows += ["Content-Length: 0", "", ""]
         return CRLF.join(rows)
 
