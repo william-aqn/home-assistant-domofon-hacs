@@ -66,8 +66,7 @@ def test_compact_header_forms_are_expanded() -> None:
 def test_folded_headers_are_unfolded() -> None:
     """§7.3.1: a line starting with whitespace continues the previous header."""
     raw = (
-        b"SIP/2.0 200 OK\r\nContact: <sip:a@b>,\r\n <sip:c@d>\r\n"
-        b"Content-Length: 0\r\n"
+        b"SIP/2.0 200 OK\r\nContact: <sip:a@b>,\r\n <sip:c@d>\r\nContent-Length: 0\r\n"
     )
 
     message = parse_message(raw)

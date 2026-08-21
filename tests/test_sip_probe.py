@@ -193,9 +193,7 @@ async def test_policy_test_confirms_coexistence() -> None:
 @pytest.mark.asyncio
 async def test_registrar_that_hides_bindings_is_flagged() -> None:
     """If bindings are invisible, the eviction guard is blind and SIP must not run."""
-    registrar = FakeRegistrar(
-        password=PASSWORD, max_contacts=1, report_bindings=False
-    )
+    registrar = FakeRegistrar(password=PASSWORD, max_contacts=1, report_bindings=False)
     registrar.seed_foreign(1)
 
     code, result = await _run_probe(registrar, policy_test=True)

@@ -116,7 +116,7 @@ def _all_placeholder_keys() -> set[str]:
     sources = "\n".join(
         path.read_text(encoding="utf-8") for path in COMPONENT.rglob("*.py")
     )
-    return set(re.findall(r'[\"\']([a-z_][a-z0-9_]*)[\"\']\s*:', sources))
+    return set(re.findall(r"[\"\']([a-z_][a-z0-9_]*)[\"\']\s*:", sources))
 
 
 def test_exception_placeholders_are_supplied(strings: dict[str, Any]) -> None:

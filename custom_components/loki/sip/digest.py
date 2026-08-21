@@ -71,9 +71,7 @@ class DigestChallenge:
         algorithm = self.algorithm.lower()
         factory = _ALGORITHMS.get(algorithm)
         if factory is None:
-            raise SipPermanentError(
-                f"unsupported digest algorithm {self.algorithm!r}"
-            )
+            raise SipPermanentError(f"unsupported digest algorithm {self.algorithm!r}")
 
         def h(text: str) -> str:
             return factory(text.encode("utf-8")).hexdigest()

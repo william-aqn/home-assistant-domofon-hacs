@@ -210,9 +210,9 @@ class Wire:
                         headers.setdefault(name.strip().lower(), []).append(
                             value.strip()
                         )
-                raw_len = (
-                    headers.get("content-length") or headers.get("l") or ["0"]
-                )[0]
+                raw_len = (headers.get("content-length") or headers.get("l") or ["0"])[
+                    0
+                ]
                 length = int(raw_len or 0)
                 if length > MAX_BODY:
                     raise ProbeError("absurd Content-Length")
@@ -314,9 +314,7 @@ class Session:
             return value.replace("\\", "\\\\").replace('"', '\\"')
 
         name = (
-            "Proxy-Authorization"
-            if challenge.get("_proxy") == "1"
-            else "Authorization"
+            "Proxy-Authorization" if challenge.get("_proxy") == "1" else "Authorization"
         )
         body = ", ".join(
             [f'{key}="{esc(value)}"' for key, value in quoted]
@@ -534,9 +532,7 @@ def run(
         ]
 
         # Withdraw OUR contact and nothing else, whatever the outcome.
-        session.register(
-            contacts=[f"<{session.contact_uri()}>;expires=0"], expires=0
-        )
+        session.register(contacts=[f"<{session.contact_uri()}>;expires=0"], expires=0)
         result["withdrew_own_contact"] = True
 
         if not any(item["instance_id"] == session.instance for item in after):
