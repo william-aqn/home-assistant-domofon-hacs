@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.1.1";
+const CARD_VERSION = "1.2.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -613,6 +613,7 @@ class LokiDoorCard extends HTMLElement {
     this._live = false;
     this._built = false;
     this._liveTimer = null;
+    this._autoLive = false;
   }
 
   setConfig(config) {
@@ -620,6 +621,7 @@ class LokiDoorCard extends HTMLElement {
     // and on an install with no doors that would put a red error tile where the card
     // somebody came to add should be.
     this._config = { live_timeout: DEFAULT_LIVE_TIMEOUT, ...(config || {}) };
+    this._autoLive = false;
     if (this._built) {
       this._media.destroy();
       this.innerHTML = "";
@@ -746,6 +748,16 @@ class LokiDoorCard extends HTMLElement {
       "icon",
       this._live && reachable ? ICON_STOP : ICON_LIVE
     );
+
+    // ``live: true`` -- what /loki/<id>?live=1 sets, and what a wall panel woken by a
+    // ring wants: the stream, not a still somebody has to walk over and tap. Once per
+    // configuration, and never against an unreachable stream: after the timeout has
+    // stopped it, or after somebody stopped it by hand, it stays stopped.
+    if (this._config.live && !this._autoLive && reachable) {
+      this._autoLive = true;
+      this._toggleLive();
+      return;
+    }
 
     this._media.render(camera, this._live && reachable);
   }
@@ -1336,6 +1348,8 @@ class LokiPanel extends HTMLElement {
   constructor() {
     super();
     this._card = null;
+    this._door = null;
+    this._live = false;
   }
 
   set hass(hass) {
@@ -1357,7 +1371,12 @@ class LokiPanel extends HTMLElement {
     const path = (route && route.path) || "";
     const match = path.match(/(\d+)/);
     const door = match ? match[1] : null;
-    if (door === this._door) return;
+    // ``?live=1`` opens straight into the stream. The router hands us the path only,
+    // so the query is read off the address bar -- which is where a panel woken by a
+    // doorbell lands, and it should be showing the door by the time somebody looks.
+    const live = new URLSearchParams(window.location.search).get("live") === "1";
+    if (door === this._door && live === this._live) return;
+    this._live = live;
     this._door = door;
     this._card = null;
     this.innerHTML = "";
@@ -1410,7 +1429,7 @@ class LokiPanel extends HTMLElement {
     }
 
     this._card = document.createElement("loki-door-card");
-    this._card.setConfig({ camera });
+    this._card.setConfig({ camera, live: this._live });
     wrap.appendChild(this._card);
     return wrap;
   }

@@ -39,7 +39,31 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
 
     _attr_translation_key = "sip_status"
     _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options: ClassVar[list[str]] = [state.value for state in SipState]
+    # The order is the colour.
+    #
+    # Home Assistant draws an enum sensor's history by looking the state up in this
+    # list and taking the palette entry at that index -- `options.indexOf(state)` into
+    # `--color-1..54`. So position 8 is green (#01ab63), 2 is red (#ff725c), 1 and 10
+    # are amber, 6 is brown. In enum order `registered` landed on brown and `blocked`
+    # on green, which is the wrong way round for the one chart anybody opens.
+    #
+    # Hence an explicit list rather than the enum's own order: green for the state we
+    # want, red and amber for the ones that need attention, cool colours for the steps
+    # on the way. `test_sip_status_options_cover_every_state` keeps it honest -- a new
+    # SipState missing from here would be a state the sensor cannot report at all.
+    _attr_options: ClassVar[list[str]] = [
+        SipState.CONNECTING.value,  # 0  blue
+        SipState.BACKOFF.value,  # 1  amber -- waiting to retry
+        SipState.FAILED.value,  # 2  red
+        SipState.PROBING.value,  # 3  mint
+        SipState.REGISTERING.value,  # 4  purple
+        SipState.VERIFYING.value,  # 5  pink
+        SipState.EVICTED.value,  # 6  brown
+        SipState.DISABLED.value,  # 7  pale blue -- off, not broken
+        SipState.REGISTERED.value,  # 8  green
+        SipState.BASELINE.value,  # 9  deep blue -- the long quiet watch
+        SipState.BLOCKED.value,  # 10 deep amber -- refused, on purpose
+    ]
 
     def __init__(self, coordinator: LokiCoordinator, bridge: SipBridge) -> None:
         """Initialise the sensor."""

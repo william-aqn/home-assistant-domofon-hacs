@@ -1,0 +1,249 @@
+blueprint:
+  name: Loki — звонок в дверь на настенной панели (Fully Kiosk)
+  description: >
+    При звонке будит планшет и открывает на нём страницу этого домофона: видео и
+    кнопка «Открыть». Пока идёт вызов, экран не гаснет. Когда вызов закончится,
+    панель возвращается к своей обычной странице, и если экран до звонка был
+    выключен — снова гаснет.
+
+
+    Нужны: интеграция **Fully Kiosk Browser**, включённая страница «Домофоны» в
+    настройках Loki и планшет, на котором Home Assistant уже открыт и не разлогинен —
+    иначе вместо домофона он покажет страницу входа.
+
+
+    Для проверки без реального звонка вызовите действие **Loki: Сымитировать звонок**
+    (`loki.simulate_ring`) с id нужной двери.
+  domain: automation
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/ring_kiosk_show.yaml
+  author: william-aqn
+  input:
+    kiosk_device:
+      name: Планшет
+      description: Устройство из интеграции Fully Kiosk Browser.
+      selector:
+        device:
+          filter:
+            integration: fully_kiosk
+    ha_url:
+      name: Адрес Home Assistant
+      description: >
+        Так, как его открывает сам планшет: со схемой и портом, без пути —
+        например `http://192.168.1.20:8123`. Home Assistant не знает, каким адресом
+        до него дотягивается планшет, поэтому его приходится указать руками.
+        Подсмотреть можно в сенсоре «Текущая страница» этого же планшета.
+      selector:
+        text:
+    what:
+      name: Что показать
+      description: >
+        Живое видео нагляднее, но идёт с домофона напрямую и работает не везде.
+        Если поток не проходит, карточка честно скажет об этом и покажет картинку.
+      default: door_live
+      selector:
+        select:
+          options:
+            - label: Этот домофон, сразу живое видео
+              value: door_live
+            - label: Этот домофон, картинка (живое — по кнопке)
+              value: door
+            - label: Все домофоны
+              value: all
+    hold:
+      name: Не давать экрану гаснуть
+      description: >
+        Fully Kiosk гасит экран по своему таймеру бездействия, а до планшета в
+        прихожей никто не дотрагивается. Пока идёт вызов, экран включается заново
+        каждые двадцать секунд.
+      default: true
+      selector:
+        boolean:
+    max_show:
+      name: Сколько держать на экране, с
+      description: >
+        Верхняя граница на случай, если о конце вызова никто не сообщил.
+        Имеет смысл держать не меньше, чем длится сам вызов (по умолчанию 120 с).
+      default: 120
+      selector:
+        number:
+          min: 15
+          max: 900
+          step: 5
+          unit_of_measurement: с
+          mode: box
+    linger:
+      name: Задержка после вызова, с
+      description: Сколько ещё показывать домофон после того, как вызов закончился.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 5
+          unit_of_measurement: с
+          mode: box
+    after:
+      name: Что делать после
+      default: restore
+      selector:
+        select:
+          options:
+            - label: Вернуть обычную страницу и погасить экран, если он был выключен
+              value: restore
+            - label: Вернуть обычную страницу, экран не трогать
+              value: page
+            - label: Ничего не делать
+              value: nothing
+    screen_switch:
+      name: Переключатель экрана
+      description: >
+        Обычно определяется сам. Заполните, только если переключатель «Экран» у этого
+        планшета переименован и автоматика его не нашла.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            integration: fully_kiosk
+            domain: switch
+
+# Панель одна, а дверей много: показываем ту, что звонит сейчас. Прошлый прогон при
+# этом обрывается вместе со своей уборкой — её сделает новый, когда закончит.
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: call_incoming
+
+conditions: []
+
+actions:
+  - alias: Подготовить переменные
+    variables:
+      # Вход блюпринта — это YAML-тег, а не переменная шаблона: без такой привязки
+      # {{ kiosk }} внутри шаблона окажется пустым.
+      kiosk: !input kiosk_device
+      base_in: !input ha_url
+      what_in: !input what
+      hold_in: !input hold
+      after_in: !input after
+      max_show_in: !input max_show
+      linger_in: !input linger
+      screen_in: !input screen_switch
+
+      device_id: "{{ trigger.event.data.device_id }}"
+      call_id: "{{ trigger.event.data.call_id }}"
+
+      # Косая черта на конце — самая частая опечатка в таком поле, и она превратила бы
+      # адрес в `http://ha:8123//loki/5`.
+      base: >-
+        {{ base_in | trim | regex_replace('/+$', '') }}
+      path: >-
+        {{ '/loki' if what_in == 'all' else '/loki/' ~ device_id ~ ('?live=1' if what_in == 'door_live' else '') }}
+      target_url: "{{ base }}{{ path }}"
+
+      # Идентификаторы сущностей Home Assistant собирает из английских названий при
+      # каком угодно языке интерфейса, поэтому поиск по окончанию работает на любой
+      # установке. `_screensaver` под это условие не попадает — оно требует конца
+      # строки. На переименованной сущности выручает вход «Переключатель экрана».
+      screen_auto: >-
+        {{ device_entities(kiosk) | select('search', '^switch\..*_screen$') | list | first | default('', true) }}
+      screen: "{{ (screen_in | first) if screen_in else screen_auto }}"
+      screensaver: >-
+        {{ device_entities(kiosk) | select('search', '^switch\..*_screensaver$') | list | first | default('', true) }}
+      start_url_button: >-
+        {{ device_entities(kiosk) | select('search', '^button\..*_load_start_url$') | list | first | default('', true) }}
+
+      # Снимается до того, как мы его включим: гасить экран после вызова нужно только
+      # если он и был выключен. На планшете, который всегда горит, это выключило бы
+      # то, что никто не просил выключать.
+      screen_was: "{{ states(screen) if screen else 'unknown' }}"
+
+      # Один круг ожидания — двадцать секунд, и его же хватает, чтобы не дать экрану
+      # заснуть по таймеру бездействия Fully.
+      rounds: "{{ [1, (max_show_in | int / 20) | round(0, 'ceil') | int] | max }}"
+
+  - alias: Разбудить экран
+    # continue_on_error везде ниже: планшет может быть выключен или вне сети, и это
+    # не повод бросать остальное — на телефон уведомление всё равно уйдёт.
+    if:
+      - condition: template
+        value_template: "{{ screen != '' }}"
+    then:
+      - action: switch.turn_on
+        continue_on_error: true
+        target:
+          entity_id: "{{ screen }}"
+
+  - alias: Убрать заставку, если она включена
+    if:
+      - condition: template
+        value_template: "{{ screensaver != '' and is_state(screensaver, 'on') }}"
+    then:
+      - action: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: "{{ screensaver }}"
+
+  - alias: Открыть на планшете страницу домофона
+    action: fully_kiosk.load_url
+    continue_on_error: true
+    data:
+      device_id: !input kiosk_device
+      url: "{{ target_url }}"
+
+  - alias: Держать экран, пока идёт вызов
+    repeat:
+      sequence:
+        - if:
+            - condition: template
+              value_template: "{{ hold_in and screen != '' }}"
+          then:
+            - action: switch.turn_on
+              continue_on_error: true
+              target:
+                entity_id: "{{ screen }}"
+        - alias: Ждать конца этого вызова
+          wait_for_trigger:
+            # Именно этого вызова, по call_id: иначе конец соседнего звонка убрал бы
+            # с экрана дверь, в которую звонят прямо сейчас.
+            - trigger: event
+              event_type: loki_event
+              event_data:
+                type: call_ended
+                call_id: "{{ call_id }}"
+          timeout:
+            seconds: 20
+          continue_on_timeout: true
+      until:
+        - condition: template
+          # `is not none`, а не `is defined`: по таймауту wait.trigger определён и
+          # равен none, так что проверка на определённость выходила бы из цикла сразу.
+          value_template: "{{ wait.trigger is not none or repeat.index >= rounds | int }}"
+
+  - alias: Дать посмотреть ещё немного
+    delay:
+      seconds: "{{ linger_in | int }}"
+
+  - alias: Вернуть панель к обычной странице
+    if:
+      - condition: template
+        value_template: "{{ after_in in ['restore', 'page'] and start_url_button != '' }}"
+    then:
+      - action: button.press
+        continue_on_error: true
+        target:
+          entity_id: "{{ start_url_button }}"
+
+  - alias: Погасить экран, если до звонка он был выключен
+    if:
+      - condition: template
+        value_template: "{{ after_in == 'restore' and screen != '' and screen_was == 'off' }}"
+    then:
+      - action: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: "{{ screen }}"

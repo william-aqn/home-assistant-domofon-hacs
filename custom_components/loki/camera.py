@@ -198,10 +198,7 @@ class LokiCamera(LokiEntity, Camera):
         still, which is cheap and keeps working when the video host does not.
         """
         now = time.monotonic()
-        if (
-            self._captured_image is not None
-            and now - self._captured_at < _CAPTURE_TTL
-        ):
+        if self._captured_image is not None and now - self._captured_at < _CAPTURE_TTL:
             return self._captured_image
 
         if self._cached_image is not None and now - self._cached_at < _SNAPSHOT_TTL:
