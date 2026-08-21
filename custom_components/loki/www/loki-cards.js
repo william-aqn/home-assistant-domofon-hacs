@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.2.1";
+const CARD_VERSION = "0.2.2";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -702,9 +702,12 @@ class LokiWallCard extends HTMLElement {
     // Width-driven by default: a fixed column count is either cramped on a phone or
     // absurdly stretched on a monitor. `columns` remains as an explicit override.
     const columns = Number(this._config.columns);
+    // min(100%, …) so a narrow card shrinks the tile instead of overflowing, and 210px
+    // because a wall of doors is for recognising a person: past a certain point more
+    // columns stop helping and start hiding faces.
     this._grid.style.gridTemplateColumns = columns
       ? `repeat(${Math.max(1, columns)}, minmax(0, 1fr))`
-      : "repeat(auto-fill, minmax(180px, 1fr))";
+      : "repeat(auto-fill, minmax(min(100%, 210px), 1fr))";
 
     for (const [camera, tile] of this._tiles) {
       if (!cameras.includes(camera)) {
