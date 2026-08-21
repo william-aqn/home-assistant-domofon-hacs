@@ -255,9 +255,21 @@ class LokiClient:
     async def async_get_device_by_sip_name(self, sip_uri: str) -> LokiDevice | None:
         """Resolve which door is calling, from the raw SIP remote URI.
 
-        The lookup is done server-side; the full URI including display name and angle
-        brackets is passed through verbatim, exactly as the official client does.
+        The lookup is server-side and the whole ``From`` value is passed verbatim --
+        display name, angle brackets and all -- exactly as the official client does.
+
+        The URI must be complete. Passing only the user part was measured against the
+        live backend and resolved to a *different door*: the match is not exact, so a
+        bare extension silently answers with somebody else's entrance. Since the
+        result is used to decide which door to open, that is refused rather than
+        risked.
         """
+        if "sip:" not in sip_uri.lower():
+            raise ValueError(
+                "the full SIP URI is required: a bare extension resolves to the "
+                "wrong door"
+            )
+
         response = await self._post("/api/device/list/", {"name": sip_uri})
         if not isinstance(response, dict):
             return None
