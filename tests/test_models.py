@@ -110,6 +110,42 @@ def test_device_from_api_rejects_entries_without_a_numeric_id() -> None:
     assert LokiDevice.from_api({"id": "695", "name": "x"}, is_door=True) is None
 
 
+def test_area_skips_a_segment_that_repeats_the_device_name() -> None:
+    """Home Assistant builds entity ids as <area>_<device>_<entity>.
+
+    An area equal to the device name yields ``floor_06_floor_06_call_in_progress``,
+    and the backend really does name per-floor devices after their floor.
+    """
+    device = LokiDevice.from_api(
+        {"id": 1, "name": "Этаж 06", "rname": "Комплекс->Строение 2->Этаж 06"},
+        is_door=True,
+    )
+
+    assert device is not None
+    assert device.area == "Строение 2"
+
+
+def test_area_uses_the_deepest_segment_when_it_differs() -> None:
+    """The normal case is unchanged: the most specific location wins."""
+    device = LokiDevice.from_api(
+        {"id": 1, "name": "Центральный вход", "rname": "Комплекс->Строение 2"},
+        is_door=True,
+    )
+
+    assert device is not None
+    assert device.area == "Строение 2"
+
+
+def test_area_is_none_when_every_segment_repeats_the_name() -> None:
+    """Nothing useful left to suggest."""
+    device = LokiDevice.from_api(
+        {"id": 1, "name": "Этаж 06", "rname": "Этаж 06"}, is_door=True
+    )
+
+    assert device is not None
+    assert device.area is None
+
+
 def test_device_from_api_rejects_boolean_ids() -> None:
     """bool subclasses int, and True would collide with device 1."""
     assert LokiDevice.from_api({"id": True, "name": "x"}, is_door=True) is None

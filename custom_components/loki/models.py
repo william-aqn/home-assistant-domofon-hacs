@@ -173,11 +173,26 @@ class LokiDevice:
 
     @property
     def area(self) -> str | None:
-        """Deepest segment of the ``->``-delimited location path, for suggested_area."""
+        """Deepest useful segment of the ``->`` path, for suggested_area.
+
+        Home Assistant builds an entity_id as ``<area>_<device>_<entity>``, so an area
+        that merely repeats the device name produces ids like
+        ``binary_sensor.floor_06_floor_06_call_in_progress``. The backend does exactly
+        that for per-floor devices, so the matching segment is skipped in favour of its
+        parent.
+        """
         if not self.area_path:
             return None
-        segment = self.area_path.split("->")[-1].strip()
-        return segment or None
+
+        segments = [
+            stripped
+            for segment in self.area_path.split("->")
+            if (stripped := segment.strip())
+        ]
+        for segment in reversed(segments):
+            if segment.casefold() != self.name.casefold():
+                return segment
+        return None
 
 
 def parse_device_list(payload: dict[str, Any]) -> list[LokiDevice]:
