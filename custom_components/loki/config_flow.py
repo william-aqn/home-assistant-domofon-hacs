@@ -40,6 +40,7 @@ from .const import (
     DISCLAIMER_URL,
     DOMAIN,
     OPT_SCAN_INTERVAL,
+    OPT_SIP_STRICT_GUARD,
 )
 from .coordinator import LokiConfigEntry
 from .protocol import normalize_phone
@@ -298,21 +299,30 @@ class LokiOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
+        options = self.config_entry.options
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            # Merged rather than replaced: the SIP switch writes OPT_SIP_ENABLED
+            # straight into the options, and this form does not offer that field --
+            # so saving user_input alone would silently switch SIP off.
+            return self.async_create_entry(data={**options, **user_input})
 
-        current = self.config_entry.options.get(OPT_SCAN_INTERVAL, 300)
         schema = vol.Schema(
             {
                 # NumberSelector yields a float, which would be stored as 300.0.
-                vol.Optional(OPT_SCAN_INTERVAL, default=current): vol.All(
+                vol.Optional(
+                    OPT_SCAN_INTERVAL, default=options.get(OPT_SCAN_INTERVAL, 300)
+                ): vol.All(
                     NumberSelector(
                         NumberSelectorConfig(
                             min=60, max=3600, step=30, mode=NumberSelectorMode.BOX
                         )
                     ),
                     vol.Coerce(int),
-                )
+                ),
+                vol.Optional(
+                    OPT_SIP_STRICT_GUARD,
+                    default=options.get(OPT_SIP_STRICT_GUARD, True),
+                ): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

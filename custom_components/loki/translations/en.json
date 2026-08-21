@@ -53,10 +53,12 @@
       "init": {
         "title": "Settings",
         "data": {
-          "scan_interval": "Device list refresh interval, seconds"
+          "scan_interval": "Device list refresh interval, seconds",
+          "sip_strict_guard": "Strict check before registering SIP"
         },
         "data_description": {
-          "scan_interval": "Doors and cameras change rarely, so polling often gains nothing."
+          "scan_interval": "Doors and cameras change rarely, so polling often gains nothing.",
+          "sip_strict_guard": "Do not register while somebody else holds a binding on the SIP account. Turning this off removes the only check that prevents rather than detects: the intercom may stop ringing the resident's phone."
         }
       }
     }
@@ -78,6 +80,29 @@
     "event": {
       "doorbell": {
         "name": "Doorbell"
+      }
+    },
+    "sensor": {
+      "sip_status": {
+        "name": "SIP status",
+        "state": {
+          "disabled": "Off",
+          "connecting": "Connecting",
+          "probing": "Checking bindings",
+          "baseline": "Watching the account",
+          "registering": "Registering",
+          "verifying": "Verifying",
+          "registered": "Registered",
+          "backoff": "Waiting to retry",
+          "blocked": "Stopped: account in use",
+          "evicted": "Stopped: displaced another device",
+          "failed": "Failed"
+        }
+      }
+    },
+    "switch": {
+      "sip": {
+        "name": "SIP"
       }
     }
   },
@@ -124,6 +149,18 @@
           }
         }
       }
+    },
+    "sip_terminal_blocked": {
+      "title": "Loki: SIP not started — account “{title}” is in use",
+      "description": "Another device is already registered on the SIP account, almost certainly a phone running the operator's app. Loki did not register, because doing so could displace that binding and the intercom would stop ringing the phone with nothing to show for it.\n\nDetails: {detail}\n\n**What to do.** Get a separate phone number for Home Assistant and add it to the allowed numbers in the official app. Then switch “SIP” off and on again — that is the only way to clear this.\n\nIf you understand the risk and want to register anyway, turn off the strict check in the integration options."
+    },
+    "sip_terminal_evicted": {
+      "title": "Loki: SIP stopped — registering displaced another device",
+      "description": "A binding that was not ours disappeared after we registered. Loki withdrew its own registration and stopped.\n\nDetails: {detail}\n\n**Check that the intercom still rings the phone.** If it does not, restart the operator's app on the phone and it will register again.\n\nDo not turn SIP back on until Home Assistant has a phone number of its own, or the same thing will happen."
+    },
+    "sip_terminal_failed": {
+      "title": "Loki: SIP stopped for account “{title}”",
+      "description": "The SIP client stopped and will not restart itself.\n\nReason: {detail}\n\nMost often this means the SIP credentials are stale, which a fresh SMS sign-in fixes. To try again, switch “SIP” off and on."
     }
   },
   "exceptions": {

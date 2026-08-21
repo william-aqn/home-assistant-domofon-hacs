@@ -112,8 +112,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def _async_hangup(call: ServiceCall) -> None:
         """End the active call for a door.
 
-        Today this just clears the tracked state, which is what ends a simulated call.
-        Phase 3 will also make the SIP client decline its own leg.
+        Clearing the tracked state is all a simulated call needs. For a real one the
+        SIP bridge is listening to the same signal and declines its own branch, which
+        is what lets the resident's phone finish the call.
         """
         entry, device = _find_device(call.data[ATTR_DEVICE_ID], door_only=True)
         entry.runtime_data.call_manager.async_end_call(device.id, reason="hangup")

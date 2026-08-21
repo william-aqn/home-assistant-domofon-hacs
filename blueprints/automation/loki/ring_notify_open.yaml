@@ -127,6 +127,19 @@ actions:
       - action: loki.open_door
         data:
           device_id: "{{ device_id }}"
+      - alias: Завершить вызов — дверь открыта, держать его больше незачем
+        # Also releases the SIP branch. Sitting on 180 Ringing after the door has
+        # opened keeps a forking proxy from delivering the other branches' final
+        # responses, so the resident's phone would go on ringing for no reason.
+        action: loki.hangup
+        data:
+          device_id: "{{ device_id }}"
+      - alias: Убрать уведомление — кнопка уже нажата
+        domain: mobile_app
+        type: notify
+        device_id: !input notify_device
+        message: clear_notification
+        data: "{{ {'tag': tag_in} }}"
     else:
       - alias: Убрать «висящее» уведомление после таймаута
         domain: mobile_app

@@ -14,11 +14,13 @@ from homeassistant.helpers.typing import ConfigType
 
 from .api import LokiApiError, LokiAuthError, LokiClient
 from .call import CallManager
-from .const import CONF_REFRESH_TOKEN, DOMAIN
+from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_SIP_ENABLED
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
 from .repairs import async_clear_reauth_unrecoverable
 from .services import async_setup_services
+from .sip_bridge import SipBridge, sip_credentials
+from .sip_store import SipStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.CAMERA,
     Platform.EVENT,
+    Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 # Required by hassfest as soon as async_setup exists.
@@ -73,23 +77,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
     await coordinator.async_config_entry_first_refresh()
 
     call_manager = CallManager(hass, entry.entry_id)
+
+    bridge: SipBridge | None = None
+    if sip_credentials(entry) is not None:
+        store = SipStore(hass, entry.entry_id)
+        await store.async_load()
+        bridge = SipBridge(hass, entry, client, call_manager, store)
+
     entry.runtime_data = LokiRuntimeData(
-        client=client, coordinator=coordinator, call_manager=call_manager
+        client=client,
+        coordinator=coordinator,
+        call_manager=call_manager,
+        sip_bridge=bridge,
     )
     entry.async_on_unload(call_manager.async_shutdown)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # SIP starts last, and only after the platforms exist. An INVITE arriving in the
+    # window before then would reach a CallManager with no subscribers: the event
+    # entity and the call sensor would both miss it, and the ring would be lost with
+    # nothing in the log to say why.
+    if bridge is not None and entry.options.get(OPT_SIP_ENABLED, False):
+        await bridge.async_start()
+
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool:
     """Unload a config entry."""
+    # Stopped before the platforms go, mirroring the setup order: while the client is
+    # running it can announce a call, and announcing one into a half-dismantled entry
+    # is how a stale timer outlives its own integration.
+    if (bridge := entry.runtime_data.sip_bridge) is not None:
+        await bridge.async_stop()
+
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unloaded:
         # on_unload callbacks only run on a successful unload; don't leave call
         # timeouts armed against an entry that is going away regardless.
         entry.runtime_data.call_manager.async_shutdown()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> None:
+    """Delete the entry's SIP state file when the account is removed."""
+    await SipStore(hass, entry.entry_id).async_remove()
 
 
 async def async_remove_config_entry_device(

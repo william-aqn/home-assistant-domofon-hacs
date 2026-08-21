@@ -51,6 +51,11 @@ class CallUpdate:
 
     device_id: int
     kind: str  # "start" | "end"
+    # Carried so a listener can tell *which* call ended. Without it, a second ring at
+    # the same door would make an "end" ambiguous, and the SIP bridge could release
+    # the branch belonging to the call that replaced it.
+    call_id: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -158,7 +163,7 @@ class CallManager:
         async_dispatcher_send(
             self.hass,
             signal_call_update(self.entry_id),
-            CallUpdate(device_id=device.id, kind="start"),
+            CallUpdate(device_id=device.id, kind="start", call_id=call.call_id),
         )
         self._fire_bus_event(EVENT_TYPE_CALL_INCOMING, call)
         return call
@@ -184,7 +189,9 @@ class CallManager:
         async_dispatcher_send(
             self.hass,
             signal_call_update(self.entry_id),
-            CallUpdate(device_id=device_id, kind="end"),
+            CallUpdate(
+                device_id=device_id, kind="end", call_id=call.call_id, reason=reason
+            ),
         )
         self._fire_bus_event(EVENT_TYPE_CALL_ENDED, call, reason=reason)
 

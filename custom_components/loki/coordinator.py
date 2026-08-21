@@ -27,6 +27,7 @@ from .reauth import async_clear_auth_failed, async_fire_auth_failed
 
 if TYPE_CHECKING:
     from .call import CallManager
+    from .sip_bridge import SipBridge
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ class LokiRuntimeData:
     client: LokiClient
     coordinator: LokiCoordinator
     call_manager: CallManager
+    # None only for an account the operator issued no SIP credentials for; the SIP
+    # platforms then create no entities rather than showing permanently dead ones.
+    sip_bridge: SipBridge | None = None
 
 
 type LokiConfigEntry = ConfigEntry[LokiRuntimeData]

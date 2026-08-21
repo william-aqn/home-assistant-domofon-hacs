@@ -20,7 +20,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import issue_registry as ir
 import voluptuous as vol
 
-from .const import DOMAIN, ISSUE_REAUTH_UNRECOVERABLE
+from .const import DOMAIN, ISSUE_REAUTH_UNRECOVERABLE, ISSUE_SIP_TERMINAL
 
 
 class ReauthUnrecoverableFlow(RepairsFlow):
@@ -83,6 +83,34 @@ def async_create_reauth_unrecoverable(
 @callback
 def async_clear_reauth_unrecoverable(hass: HomeAssistant, entry_id: str) -> None:
     """Drop the card once the entry sets up again."""
-    ir.async_delete_issue(
-        hass, DOMAIN, f"{ISSUE_REAUTH_UNRECOVERABLE}_{entry_id}"
+    ir.async_delete_issue(hass, DOMAIN, f"{ISSUE_REAUTH_UNRECOVERABLE}_{entry_id}")
+
+
+@callback
+def async_create_sip_terminal(
+    hass: HomeAssistant, entry_id: str, title: str, state: str, detail: str
+) -> None:
+    """Raise a card for a SIP client that stopped for good.
+
+    Deliberately not fixable. Each of these states means the client decided that
+    carrying on risked the resident's doorbell, and a one-click "fix" button would
+    clear that decision without the person ever reading why it was made. The recovery
+    -- switching SIP off and on again -- is spelled out in the description instead, so
+    restarting is a choice rather than a reflex.
+    """
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        f"{ISSUE_SIP_TERMINAL}_{entry_id}",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=f"{ISSUE_SIP_TERMINAL}_{state}",
+        translation_placeholders={"title": title, "detail": detail},
     )
+
+
+@callback
+def async_clear_sip_terminal(hass: HomeAssistant, entry_id: str) -> None:
+    """Drop the SIP card once the latch is cleared."""
+    ir.async_delete_issue(hass, DOMAIN, f"{ISSUE_SIP_TERMINAL}_{entry_id}")

@@ -15,6 +15,26 @@
       "open": {
         "default": "mdi:door-open"
       }
+    },
+    "sensor": {
+      "sip_status": {
+        "default": "mdi:phone-settings-outline",
+        "state": {
+          "registered": "mdi:phone-check-outline",
+          "blocked": "mdi:phone-lock",
+          "evicted": "mdi:phone-remove-outline",
+          "failed": "mdi:phone-alert-outline",
+          "disabled": "mdi:phone-off-outline"
+        }
+      }
+    },
+    "switch": {
+      "sip": {
+        "default": "mdi:phone-off-outline",
+        "state": {
+          "on": "mdi:phone-outline"
+        }
+      }
     }
   },
   "services": {

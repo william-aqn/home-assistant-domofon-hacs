@@ -42,7 +42,7 @@ CONF_MAX_PHONES: Final = "max_phones"
 # logged; deliberately not used to guess *why* it failed.
 CONF_AUTH_TIME: Final = "auth_time"
 
-# --- phase 3 (SIP), not yet wired --------------------------------------------
+# --- SIP ---------------------------------------------------------------------
 # Keys inside the ``sip`` object stored at entry.data[CONF_SIP]. Note CONF_SIP_USER
 # is also the string "phone": harmless only while the SIP data stays nested.
 
@@ -51,6 +51,10 @@ CONF_SIP_USER: Final = "phone"
 CONF_SIP_PASSWORD: Final = "password"
 
 OPT_SIP_ENABLED: Final = "sip_enabled"
+# Refuse to register while somebody else holds a binding on the account. The only
+# check that prevents rather than detects, so it defaults on and turning it off is
+# an informed decision the options flow spells out.
+OPT_SIP_STRICT_GUARD: Final = "sip_strict_guard"
 
 # --- phase 4 (Frigate), not yet wired ----------------------------------------
 
@@ -75,10 +79,12 @@ EVENT_LOKI: Final = "loki_event"
 EVENT_TYPE_CALL_INCOMING: Final = "call_incoming"
 EVENT_TYPE_CALL_ENDED: Final = "call_ended"
 EVENT_TYPE_AUTH_FAILED: Final = "auth_failed"
+EVENT_TYPE_SIP_TERMINAL: Final = "sip_terminal"
 
 # --- repairs -----------------------------------------------------------------
 
 ISSUE_REAUTH_UNRECOVERABLE: Final = "reauth_unrecoverable"
+ISSUE_SIP_TERMINAL: Final = "sip_terminal"
 
 # Matches HA's DoorbellEventType.RING. Imported as a literal rather than from
 # homeassistant.components.event because that enum postdates our minimum version.
