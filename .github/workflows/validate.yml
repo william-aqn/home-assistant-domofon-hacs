@@ -39,5 +39,10 @@ jobs:
         run: ruff check custom_components tests scripts
       - name: YAML
         run: python scripts/validate_yaml.py
+      - name: Карточки
+        # Карточки идут без сборки, поэтому больше ничто не заметит, что модуль
+        # падает при загрузке — а падающий модуль уносит с собой все остальные
+        # пользовательские карточки на дашборде.
+        run: node scripts/check_cards.js
       - name: Pytest
         run: pytest tests -q

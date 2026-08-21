@@ -11,11 +11,13 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
 from .api import LokiApiError, LokiAuthError, LokiClient
 from .call import CallManager
 from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_SIP_ENABLED
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
+from .frontend import async_register_cards
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
 from .repairs import async_clear_reauth_unrecoverable, async_clear_sip_terminal
 from .services import async_setup_services
@@ -38,8 +40,16 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register the actions once, before any account is loaded."""
+    """Register the actions and the dashboard cards once, before any account loads."""
     async_setup_services(hass)
+    # Once per Home Assistant start, not per config entry: registering a static path
+    # adds a route, and doing that on every reload would stack duplicates.
+    #
+    # The version comes from the already-loaded manifest rather than from reading the
+    # file again -- a blocking read on the event loop is exactly what Home Assistant
+    # now warns about, and the loader has the answer in memory.
+    integration = await async_get_integration(hass, DOMAIN)
+    await async_register_cards(hass, str(integration.version or "0"))
     return True
 
 
