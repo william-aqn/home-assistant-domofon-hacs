@@ -22,6 +22,10 @@ const CARD_VERSION = "0.1.0";
 // everything live" has to be a deliberate act with an end to it.
 const DEFAULT_LIVE_TIMEOUT = 180;
 
+// How often the fallback snapshot is re-fetched. Matches the camera's own frame
+// interval: asking faster only costs the backend requests it will answer from cache.
+const FALLBACK_REFRESH = 10;
+
 const t = {
   open: "Открыть",
   live: "Смотреть вживую",
@@ -135,6 +139,7 @@ class DoorMedia {
     this._hass = null;
     this._camera = null;
     this._token = 0;
+    this._fallbackTimer = null;
 
     this._fallback = document.createElement("img");
     this._fallback.className = "loki-fallback";
@@ -197,6 +202,10 @@ class DoorMedia {
       this.el.insertBefore(child, this.el.firstChild);
       this._child = child;
       this._fallback.hidden = true;
+      if (this._fallbackTimer) {
+        window.clearInterval(this._fallbackTimer);
+        this._fallbackTimer = null;
+      }
     } catch (err) {
       this._useFallback();
     }
@@ -212,19 +221,40 @@ class DoorMedia {
   _useFallback() {
     this._fallback.hidden = false;
     this._refreshFallback();
+    this._startFallbackTimer();
   }
 
   _refreshFallback() {
     if (this._fallback.hidden || !this._hass || !this._camera) return;
     const state = this._hass.states[this._camera];
     const picture = state && state.attributes.entity_picture;
-    if (picture && this._fallback.getAttribute("src") !== picture) {
-      this._fallback.setAttribute("src", picture);
+    if (!picture) return;
+    // A camera's entity_picture only changes when its access token rotates, which is
+    // a matter of minutes -- so the URL alone would leave a frozen frame on screen.
+    // The cache buster is what makes this a live-ish snapshot rather than a photo of
+    // whenever the card happened to load.
+    const stamp = Math.floor(Date.now() / (FALLBACK_REFRESH * 1000));
+    const src = `${picture}${picture.includes("?") ? "&" : "?"}_=${stamp}`;
+    if (this._fallback.getAttribute("src") !== src) {
+      this._fallback.setAttribute("src", src);
     }
+  }
+
+  /** Keep the snapshot moving while the composed card is unavailable. */
+  _startFallbackTimer() {
+    if (this._fallbackTimer) return;
+    this._fallbackTimer = window.setInterval(
+      () => this._refreshFallback(),
+      FALLBACK_REFRESH * 1000
+    );
   }
 
   destroy() {
     this._token++;
+    if (this._fallbackTimer) {
+      window.clearInterval(this._fallbackTimer);
+      this._fallbackTimer = null;
+    }
     if (this._child) {
       this._child.remove();
       this._child = null;
