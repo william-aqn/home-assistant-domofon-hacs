@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.2.0";
+const CARD_VERSION = "1.3.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -38,6 +38,10 @@ const DEFAULT_LIVE_TIMEOUT = 30;
 // per tick, and it was actively harmful, overwriting a frame the user had just asked
 // for. Anything genuinely new arrives either from the capture button or from a ring.
 const STILL_REFRESH = 60;
+
+// The sidebar page's address. One constant because three places have to agree on it:
+// the panel itself, the link out of a tile, and the check that the page exists.
+const PANEL_PATH = "loki";
 
 // How long to wait for a forced snapshot before counting it as failed.
 const SHOT_TIMEOUT = 15;
@@ -73,6 +77,7 @@ const t = {
   no: "Нет",
   panelTitle: "Домофоны",
   backToAll: "Все домофоны",
+  openPage: "открыть страницу домофона",
   doorGone: "Этот домофон не найден",
   ringing: "Вызов",
   unavailable:
@@ -96,7 +101,13 @@ const t = {
  * detach the button from the picture above it.
  */
 function resolveDoor(hass, cameraId) {
-  const out = { camera: cameraId, button: null, call: null, name: cameraId };
+  const out = {
+    camera: cameraId,
+    button: null,
+    call: null,
+    name: cameraId,
+    loki: null,
+  };
   if (!hass || !cameraId) return out;
 
   const state = hass.states[cameraId];
@@ -106,6 +117,7 @@ function resolveDoor(hass, cameraId) {
   const deviceId = registry[cameraId] ? registry[cameraId].device_id : null;
   if (!deviceId) return out;
   out.device = deviceId;
+  out.loki = lokiIdForDevice(hass, deviceId);
 
   for (const [entityId, entry] of Object.entries(registry)) {
     if (entry.device_id !== deviceId || entry.platform !== "loki") continue;
@@ -176,6 +188,16 @@ function lokiId(hass, door) {
   return null;
 }
 
+/** The numeric Loki device id behind a Home Assistant device, or null. */
+function lokiIdForDevice(hass, deviceId) {
+  const device = ((hass && hass.devices) || {})[deviceId];
+  if (!device) return null;
+  for (const [domain, value] of device.identifiers || []) {
+    if (domain === "loki") return String(value);
+  }
+  return null;
+}
+
 /** The camera entity belonging to a numeric Loki device id, or null. */
 function cameraForLokiId(hass, wanted) {
   const devices = (hass && hass.devices) || {};
@@ -190,6 +212,25 @@ function cameraForLokiId(hass, wanted) {
     if (entry.device_id === deviceId && entityId.startsWith("camera.")) return entityId;
   }
   return null;
+}
+
+/** Whether the "Домофоны" page exists on this install.
+ *
+ * It is optional -- a question asked once during setup -- and a tile that led to a
+ * page that is not there would be worse than a tile that does nothing.
+ */
+function panelReady(hass) {
+  return Boolean(hass && hass.panels && hass.panels[PANEL_PATH]);
+}
+
+/** Go to a page inside Home Assistant, the way the frontend's own links do.
+ *
+ * pushState alone changes the address and nothing else: the router only redraws when
+ * it hears `location-changed`.
+ */
+function goTo(path) {
+  history.pushState(null, "", path);
+  fire(window, "location-changed", { replace: false });
 }
 
 function fire(node, type, detail) {
@@ -425,6 +466,7 @@ const STYLE = `
   .loki-bar[hidden],
   .loki-label[hidden],
   .loki-open[hidden],
+  .loki-actions[hidden],
   .loki-icon-btn[hidden],
   .loki-ringing[hidden],
   .loki-note[hidden],
@@ -486,6 +528,31 @@ const STYLE = `
   }
   .loki-open ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
   .loki-open[disabled] { opacity: 0.65; cursor: default; }
+
+  /* The same button on a card that has room for it: its own row under the picture,
+     wide enough to hit without looking, and out of the way of the view it covers. */
+  .loki-actions { display: flex; gap: 8px; padding: 10px 0 2px; }
+  .loki-open-lg {
+    flex: 1;
+    justify-content: center;
+    font-size: 15px;
+    font-weight: 500;
+    gap: 8px;
+    padding: 12px 18px;
+    min-height: 48px;
+  }
+  .loki-open-lg ha-icon {
+    --mdc-icon-size: 22px;
+    width: 22px;
+    height: 22px;
+  }
+
+  /* A tile that leads to that card says so on hover, and answers the keyboard. */
+  .loki-linked { cursor: pointer; }
+  .loki-linked:focus-visible {
+    outline: 2px solid var(--primary-color, #03a9f4);
+    outline-offset: 2px;
+  }
 
   .loki-icon-btn {
     position: absolute;
@@ -691,13 +758,17 @@ class LokiDoorCard extends HTMLElement {
       this._showStamp(ok ? 1 : 0, 1);
     });
 
-    const parts = pictureBar();
-    this._label = parts.label;
-    this._openBtn = parts.open;
-    this._openLabel = parts.openLabel;
+    // Not the overlay strip the tiles use. This card is the one somebody opens to
+    // look at the picture properly, and a button lying across the bottom of it covers
+    // exactly the ground a visitor stands on. Here it gets a row of its own.
+    this._openBtn = el("button", "loki-open loki-open-lg");
+    this._openLabel = el("span", null, t.open);
+    this._openBtn.append(icon(ICON_OPEN), this._openLabel);
     this._openBtn.addEventListener("click", () => this._open());
+    this._actions = el("div", "loki-actions");
+    this._actions.appendChild(this._openBtn);
 
-    this._media.el.append(this._ringing, this._shotBtn, this._liveBtn, parts.bar);
+    this._media.el.append(this._ringing, this._shotBtn, this._liveBtn);
 
     this._note = el("div", "loki-note", t.unavailable);
     this._note.hidden = true;
@@ -706,7 +777,7 @@ class LokiDoorCard extends HTMLElement {
     this._stamp.hidden = true;
 
     const body = el("div", "loki-body");
-    body.appendChild(this._media.el);
+    body.append(this._media.el, this._actions);
 
     card.append(this._header, body, this._note, this._stamp);
     this.append(style, card);
@@ -727,9 +798,7 @@ class LokiDoorCard extends HTMLElement {
     const door = resolveDoor(hass, camera);
     this._door = door;
     this._header.textContent = this._config.name || door.name;
-    // The name is already in the header; repeating it on the picture is noise.
-    this._label.textContent = "";
-    this._openBtn.hidden = !door.button;
+    this._actions.hidden = !door.button;
 
     const call = door.call ? hass.states[door.call] : null;
     this._ringing.hidden = !(call && call.state === "on");
@@ -1051,6 +1120,21 @@ class LokiWallCard extends HTMLElement {
       tile.label.textContent = door.name;
       tile.open.hidden = !door.button;
 
+      // Only a tile that leads somewhere looks and behaves like one: a pointer, a
+      // stop on the tab order, and a name for whoever is listening rather than
+      // looking.
+      const linked = Boolean(door.loki) && panelReady(hass);
+      tile.root.classList.toggle("loki-linked", linked);
+      if (linked) {
+        tile.root.tabIndex = 0;
+        tile.root.setAttribute("role", "link");
+        tile.root.setAttribute("aria-label", `${door.name} — ${t.openPage}`);
+      } else {
+        tile.root.removeAttribute("tabindex");
+        tile.root.removeAttribute("role");
+        tile.root.removeAttribute("aria-label");
+      }
+
       const call = door.call ? hass.states[door.call] : null;
       tile.ringing.hidden = !(call && call.state === "on");
 
@@ -1095,6 +1179,22 @@ class LokiWallCard extends HTMLElement {
     parts.open.addEventListener("click", () =>
       pressOpen(this._hass, tile.door, parts.open, parts.openLabel)
     );
+
+    // Tapping the picture opens that door on its own page. A tile is a thumbnail, and
+    // the question a thumbnail raises -- who is that by the gate? -- wants a bigger
+    // picture, not a squint. The buttons drawn on top keep doing their own job.
+    const follow = (event) => {
+      if (event.target.closest("button")) return;
+      if (!tile.door || !tile.door.loki || !panelReady(this._hass)) return;
+      goTo(`/${PANEL_PATH}/${tile.door.loki}`);
+    };
+    media.el.addEventListener("click", follow);
+    media.el.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      // Space scrolls the page unless somebody says otherwise.
+      event.preventDefault();
+      follow(event);
+    });
 
     return tile;
   }
@@ -1416,7 +1516,7 @@ class LokiPanel extends HTMLElement {
 
     const back = document.createElement("a");
     back.className = "loki-back";
-    back.href = "/loki";
+    back.href = `/${PANEL_PATH}`;
     back.textContent = `← ${t.backToAll}`;
     wrap.appendChild(back);
 

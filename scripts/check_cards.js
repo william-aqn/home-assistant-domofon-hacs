@@ -191,6 +191,28 @@ check(
   Boolean(camerasField && camerasField.selector.entity.multiple === true)
 );
 
+// Every class that lays itself out with flex or grid must also say what [hidden] means
+// for it. The cards live in the light DOM, where a blanket `[hidden] { display: none }`
+// would blank Home Assistant's own layout -- so the rule is spelled out per class, and
+// a class added without one silently ignores `element.hidden = true`. That has bitten
+// twice: a confirmation strip that appeared unasked, and an open button that stayed on
+// a door with no lock to open.
+const STYLE_BLOCK = SOURCE.match(/const STYLE = `([\s\S]*?)`;/);
+check("the stylesheet is where this check expects it", Boolean(STYLE_BLOCK));
+if (STYLE_BLOCK) {
+  const css = STYLE_BLOCK[1];
+  const missing = [];
+  for (const [, name, body] of css.matchAll(/\.(loki-[a-z-]+)\s*\{([^}]*)\}/g)) {
+    if (!/display:\s*(?:inline-)?(?:flex|grid)/.test(body)) continue;
+    if (!css.includes(`.${name}[hidden]`)) missing.push(name);
+  }
+  check(
+    "every flex/grid class says what [hidden] means for it",
+    missing.length === 0,
+    missing.join(", ")
+  );
+}
+
 if (failures.length) {
   console.error(`\n${failures.length} check(s) failed`);
   process.exit(1);
