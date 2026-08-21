@@ -8,13 +8,21 @@ and pushing somebody else's out of the table.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+import random
 import re
 import secrets
+import time
 import uuid
 
 from .const import BRANCH_MAGIC, SIP_PORT
+from .errors import SipSafetyError
 from .uri import parse_params, parse_uri, split_commas, split_semis
+
+# Enough to clean up after a burst of reconnects, few enough that a flapping link
+# cannot turn the withdrawal list into a message the registrar rejects.
+MAX_PRIOR_CONTACTS = 8
 
 # pjsua derives its instance-id from a hash of the hostname rather than a UUID:
 # 26 zeros then 8 hex digits. On Android gethostname() is very often "localhost", so
@@ -81,6 +89,22 @@ def uri_equal(first: str, second: str) -> bool:
     return left.equivalent(right)
 
 
+@dataclass(frozen=True, slots=True)
+class PriorContact:
+    """A Contact URI we used before, kept only long enough to withdraw it.
+
+    Every reconnect gets a new source port and therefore a new Contact. Without
+    withdrawing the old ones our own reconnects would fill the account's binding table
+    and push the resident's phone out of it -- the very thing the whole design exists
+    to prevent. They expire from this list because a NAT port can be reused by somebody
+    else, and withdrawing a binding that is no longer ours would be exactly the harm
+    we are avoiding.
+    """
+
+    uri: str
+    recorded_at: float
+
+
 @dataclass
 class RegistrationState:
     """Constant identity plus the mutable counters of one registration."""
@@ -98,8 +122,46 @@ class RegistrationState:
 
     # Filled in once the socket exists, and rewritten from received/rport.
     sent_by: str = ""
+    contact_uri: str | None = None
+    prior_contacts: list[PriorContact] = field(default_factory=list)
+
+    # What the registrar actually granted, which may be less than we asked for.
+    granted_expires: int | None = None
 
     cseq: int = 0
+
+    def set_contact(self, uri: str) -> None:
+        """Adopt a new Contact URI, remembering the old one so it can be withdrawn."""
+        if self.contact_uri and self.contact_uri != uri:
+            self.prior_contacts.append(
+                PriorContact(self.contact_uri, time.monotonic())
+            )
+            # Bounded: a flapping connection must not accumulate an unbounded list of
+            # URIs we would keep trying to withdraw.
+            del self.prior_contacts[:-MAX_PRIOR_CONTACTS]
+        self.contact_uri = uri
+
+    def forget_stale_priors(self, ttl: float) -> None:
+        """Drop old Contact URIs once the registrar would have expired them anyway."""
+        now = time.monotonic()
+        self.prior_contacts = [
+            prior for prior in self.prior_contacts if now - prior.recorded_at < ttl
+        ]
+
+    def refresh_delay(self) -> float:
+        """How long to wait before renewing the registration.
+
+        Measured against what the registrar GRANTED, not what we asked for, and with a
+        wide lead: a refresh may have to rebuild the TCP connection and redo an
+        authentication handshake before it can even send the REGISTER.
+        """
+        granted = self.granted_expires or 300
+        if granted < 20:
+            return max(1.0, granted / 2)
+        lead = min(60, max(5, granted // 10))
+        # Jitter downwards only, never later than the lead allows. Not a
+        # cryptographic choice: it just spreads refreshes in time.
+        return granted - lead - random.uniform(0, 5)  # noqa: S311
 
     @property
     def registrar_uri(self) -> str:
@@ -120,18 +182,53 @@ class RegistrationState:
         """A fresh transaction identifier (§8.1.1.7)."""
         return f"{BRANCH_MAGIC}{secrets.token_hex(8)}"
 
+    def make_contact_uri(self, host: str, port: int) -> str:
+        """The Contact URI naming an address the registrar can reach us at."""
+        authority = f"[{host}]" if ":" in host else host
+        return f"sip:{self.user}@{authority}:{port};transport=tcp"
+
     def contact(self, *, expires: int | None = None) -> str:
-        """Our Contact value.
+        """Our live Contact value.
 
         Carries the instance id so the registrar can tell a re-registration from a
-        second device. ``expires=0`` withdraws this one binding and nothing else --
-        the only form of removal this integration ever sends.
+        second device -- which is what stops our own reconnects from accumulating
+        bindings and squeezing the resident's phone out of the table.
         """
+        uri = self.contact_uri or f"sip:{self.user}@{self.sent_by};transport=tcp"
         parts = [
-            f"<sip:{self.user}@{self.sent_by};transport=tcp>",
+            f"<{uri}>",
             f'+sip.instance="<urn:uuid:{self.instance_id}>"',
             "reg-id=1",
         ]
         if expires is not None:
             parts.append(f"expires={expires}")
         return ";".join(parts)
+
+    def build_contacts(self, *, live: str | None, reap: Sequence[str]) -> list[str]:
+        """Assemble the Contact rows for one REGISTER.
+
+        This is the second place the wildcard rule is enforced, and the only place a
+        ``;expires=0`` row can be produced. Every such row must name a URI this object
+        minted and that the caller positively attributed to us -- withdrawing anything
+        else is indistinguishable, from the resident's side, from us evicting them.
+        """
+        rows: list[str] = []
+
+        if live is not None:
+            if "*" in live:
+                raise SipSafetyError("never build a wildcard Contact")
+            rows.append(
+                f"<{live}>;"
+                f'+sip.instance="<urn:uuid:{self.instance_id}>";reg-id=1'
+            )
+
+        for uri in reap:
+            if "*" in uri:
+                raise SipSafetyError("never build a wildcard Contact")
+            if uri == live:
+                raise SipSafetyError(
+                "refusing to withdraw the contact being registered"
+            )
+            rows.append(f"<{uri}>;expires=0")
+
+        return rows

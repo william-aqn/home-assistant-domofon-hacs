@@ -1,12 +1,13 @@
-"""The SIP client: connect, look, decide whether it is safe to proceed.
+"""The SIP client: look before registering, and keep watching afterwards.
 
-This stage deliberately cannot register. It connects, asks the registrar what bindings
-the account already has, and decides whether registering would displace one -- and then
-stops. That is a genuinely useful thing to ship on its own: it answers the only
-question that matters before any risk is taken, and it cannot take that risk itself,
-because nothing here is able to build a Contact header.
+The account is a single address-of-record that the resident's phone may already be
+registered to. Displacing that binding is invisible from their side -- the phone does
+not notice, and simply stops ringing until its own timer fires minutes later. So the
+client looks first, refuses to proceed if somebody else is there, and after registering
+proves that nobody vanished.
 
-Registration arrives in the next stage, on top of the gate proven here.
+``SipConfig.register=False`` keeps it in probe-only mode, where it reports what it finds
+and is structurally unable to change anything.
 """
 
 from __future__ import annotations
@@ -18,19 +19,23 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import logging
 import random
+import secrets
 import time
 from typing import Protocol
 
-from .const import MAX_HEADER_BYTES, TIMER_F
+from .const import CRLF, MAX_HEADER_BYTES, TIMER_F
 from .digest import DigestChallenge, challenges_from
 from .errors import (
     SipBlockedError,
+    SipError,
+    SipEvictionError,
     SipFramingError,
     SipPermanentError,
     SipTransportError,
+    SipUnverifiableError,
 )
 from .messages import MessageBuilder, Ping, Pong, SipMessage, StreamFramer
-from .registration import Binding, RegistrationState, parse_bindings
+from .registration import Binding, RegistrationState, parse_bindings, uri_equal
 from .uri import parse_params, split_semis
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +52,15 @@ BASELINE_INTERVAL = 150.0
 BACKOFF_BASE = 30.0
 BACKOFF_MAX = 1800.0
 
+# RFC 5626 §4.4.1 keepalive. Short because a lapsed NAT mapping costs a doorbell.
+KEEPALIVE = 90.0
+
+# A binding this close to its own expiry vanished on its own, not because of us.
+EXPIRY_SLACK = 90.0
+
+# A single observation is not enough to latch a permanent failure.
+EVICTION_CONFIRM_DELAY = 5.0
+
 
 class SipState(StrEnum):
     """Where the client is. Surfaced to the user as a sensor."""
@@ -55,11 +69,25 @@ class SipState(StrEnum):
     CONNECTING = "connecting"
     PROBING = "probing"
     BASELINE = "baseline"
+    REGISTERING = "registering"
+    VERIFYING = "verifying"
+    REGISTERED = "registered"
     BACKOFF = "backoff"
     # Terminal states. Each latches: a restart must not quietly retry a manoeuvre we
     # have already decided is unsafe.
     BLOCKED = "blocked"
+    EVICTED = "evicted"
     FAILED = "failed"
+
+
+# Which terminal state each permanent failure lands in. Anything not listed is a
+# plain failure; eviction and blocking are called out because they mean something
+# different happened to the resident's phone.
+_TERMINAL_STATES: dict[type[Exception], SipState] = {
+    SipBlockedError: SipState.BLOCKED,
+    SipEvictionError: SipState.EVICTED,
+    SipUnverifiableError: SipState.FAILED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +137,15 @@ class SipConfig:
     require_baseline: bool = True
     baseline_samples: int = BASELINE_SAMPLES
     baseline_interval: float = BASELINE_INTERVAL
+    # False keeps the client in the probe-only mode: it looks and reports, and cannot
+    # change anything on the account.
+    register: bool = False
+    expires: int = 300
+    # The first registration ever made on an account uses a short expiry so that a
+    # mistake -- or Home Assistant being killed mid-flow -- heals in a minute rather
+    # than in the several minutes a phone takes to notice on its own timer.
+    first_expires: int = 60
+    first_registration_done: bool = False
 
 
 @dataclass
@@ -161,11 +198,7 @@ class LokiSipClient:
                     raise
                 except SipPermanentError as err:
                     kind = type(err).__name__
-                    terminal = (
-                        SipState.BLOCKED
-                        if isinstance(err, SipBlockedError)
-                        else SipState.FAILED
-                    )
+                    terminal = _TERMINAL_STATES.get(type(err), SipState.FAILED)
                     self._set_state(terminal, str(err))
                     self._events.on_terminal(terminal, kind, str(err))
                     return
@@ -220,12 +253,158 @@ class LokiSipClient:
         if self._config.require_baseline:
             bindings = await self._baseline()
 
-        # Registration belongs to the next stage. Until then the useful outcome is the
-        # answer itself, so hold the connection open rather than reconnecting in a
-        # loop: an idle TCP session costs the registrar nothing and keeps the reported
-        # snapshot fresh.
+        if not self._config.register:
+            # Probe-only mode. The useful outcome is the answer itself, so hold the
+            # connection open rather than reconnecting in a loop: an idle TCP session
+            # costs the registrar nothing and keeps the reported snapshot fresh.
+            self._failures = 0
+            await self._idle()
+            return
+
+        await self._register_and_verify(bindings)
         self._failures = 0
-        await self._idle()
+        self._set_state(
+            SipState.REGISTERED,
+            f"срок действия {self._state.granted_expires} с",
+        )
+        await self._serve()
+
+    async def _register_and_verify(self, before: Sequence[Binding]) -> None:
+        """Register, correct the Contact if needed, then prove nothing was displaced."""
+        self._set_state(SipState.REGISTERING, None)
+
+        first_time = not self._config.first_registration_done
+        expires = (
+            self._config.first_expires if first_time else self._config.expires
+        )
+        # Withdraw our own leftovers in the same message that creates the new binding,
+        # so the table never holds two of ours at once.
+        reap = [binding.uri for binding in before if self._reapable(binding)]
+        started = time.monotonic()
+
+        response = await self._register_once(expires=expires, reap=reap)
+
+        # The registrar tells us the address it actually sees. Behind a container
+        # bridge the socket's own address is a private one the registrar can never
+        # reach, so without this correction the registration succeeds and the phone
+        # never rings -- the worst possible failure, because everything looks healthy.
+        if (rewritten := self._rewritten_contact(response)) is not None:
+            _LOGGER.debug("Rewriting Contact from received/rport")
+            self._state.set_contact(rewritten)
+            response = await self._register_once(expires=expires, reap=reap)
+
+        self._resolve_granted(response, requested=expires)
+
+        self._set_state(SipState.VERIFYING, None)
+        after, verify_response = await self._probe()
+        self._publish(SipState.VERIFYING, after, verify_response)
+        self._assert_bindings_visible(after)
+        await self._assert_no_eviction(before, after, time.monotonic() - started)
+
+    async def _register_once(
+        self, *, expires: int, reap: Sequence[str]
+    ) -> SipMessage:
+        """Send one REGISTER carrying our live Contact."""
+        contacts = self._state.build_contacts(
+            live=self._state.contact_uri, reap=reap
+        )
+        return await self._register_request(contacts=contacts, expires=expires)
+
+    def _rewritten_contact(self, response: SipMessage) -> str | None:
+        """A corrected Contact URI, if the registrar sees us at another address."""
+        via = response.value("via")
+        if not via:
+            return None
+        params = parse_params(split_semis(via)[1:])
+        received, rport = params.get("received"), params.get("rport")
+        if not received or not rport or not rport.isdigit():
+            return None
+
+        corrected = self._state.make_contact_uri(received, int(rport))
+        return None if corrected == self._state.contact_uri else corrected
+
+    def _resolve_granted(self, response: SipMessage, *, requested: int) -> None:
+        """Work out how long the registration actually lasts.
+
+        In order of authority: the expires parameter on the Contact the registrar
+        echoed back for us, then the response's Expires header, then what we asked for.
+        Renewing against the requested value when the server granted less is how a
+        registration silently lapses.
+        """
+        rows = tuple(
+            header.value for header in response.headers if header.name == "contact"
+        )
+        for binding in parse_bindings(rows):
+            if binding.expires is not None and self._is_ours(binding):
+                self._state.granted_expires = binding.expires
+                return
+
+        header = response.value("expires")
+        if header.isdigit():
+            self._state.granted_expires = int(header)
+            return
+
+        _LOGGER.warning(
+            "Регистратор не сообщил срок действия регистрации; исходим из "
+            "запрошенных %s с",
+            requested,
+        )
+        self._state.granted_expires = requested
+
+    async def _serve(self) -> None:
+        """Hold the registration: read, keep the connection warm, renew in time.
+
+        All three run together and any one failing tears the flow down, because a
+        registration whose refresh task has died is a registration that will lapse
+        without anybody noticing.
+        """
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(self._read_loop())
+                group.create_task(self._keepalive_loop())
+                group.create_task(self._refresh_loop())
+        except* (SipError, OSError, TimeoutError) as group_error:
+            raise group_error.exceptions[0] from None
+
+    async def _read_loop(self) -> None:
+        """Answer whatever the registrar sends while we hold a binding."""
+        while not self._stopping:
+            message = await self._read(timeout=None)
+            if isinstance(message, Ping):
+                await self._send(CRLF)
+            elif isinstance(message, SipMessage) and not message.is_response:
+                # INVITE handling belongs to the next stage. Until it exists, decline
+                # the branch immediately rather than leave it hanging: an unresolved
+                # branch stops a forking proxy from delivering other branches' final
+                # responses, which would break the decline button on the phone.
+                await self._send(
+                    MessageBuilder.response(
+                        message, 486, "Busy Here", to_tag=secrets.token_hex(4)
+                    )
+                )
+
+    async def _keepalive_loop(self) -> None:
+        """Send a CRLF now and then so the connection is not silently dropped.
+
+        RFC 5626 §4.4.1. Mains-powered, so the interval is short: the cost of an
+        idle NAT mapping expiring is a doorbell that does not ring.
+        """
+        while not self._stopping:
+            await asyncio.sleep(random.uniform(0.8 * KEEPALIVE, KEEPALIVE))  # noqa: S311
+            await self._send(CRLF)
+
+    async def _refresh_loop(self) -> None:
+        """Renew the registration before the granted expiry runs out."""
+        while not self._stopping:
+            await asyncio.sleep(self._state.refresh_delay())
+            self._state.forget_stale_priors(self._state.granted_expires or 300)
+            response = await self._register_once(
+                expires=self._config.expires, reap=[]
+            )
+            self._resolve_granted(response, requested=self._config.expires)
+            _LOGGER.debug(
+                "Registration refreshed, granted %ss", self._state.granted_expires
+            )
 
     async def _idle(self) -> None:
         """Keep the connection alive and answer the registrar's pings."""
@@ -242,8 +421,118 @@ class LokiSipClient:
 
     # ----------------------------------------------------------------- gates
 
+    def _is_ours(self, binding: Binding) -> bool:
+        """Whether a binding is one of ours.
+
+        Deciding this on the instance id alone would be wrong: only outbound-aware
+        registrars store that parameter, so on the first reconnect our own previous
+        binding -- new source port, no instance id echoed -- would read as somebody
+        else's and the client would block itself on a perfectly healthy account.
+        """
+        if binding.instance_id:
+            return binding.instance_id == self._state.instance_id.lower()
+
+        known = [
+            self._state.contact_uri,
+            *(prior.uri for prior in self._state.prior_contacts),
+        ]
+        return any(uri and uri_equal(binding.uri, uri) for uri in known)
+
+    def _reapable(self, binding: Binding) -> bool:
+        """Whether we may withdraw this binding.
+
+        A ``;expires=0`` row is only ever aimed at a binding present in the current
+        snapshot, positively attributable to us, and not carrying somebody else's
+        instance id. A NAT port can be handed to another device, so "it used to be
+        our address" is not on its own good enough.
+        """
+        if binding.uri == self._state.contact_uri:
+            return False
+        if (
+            binding.instance_id
+            and binding.instance_id != self._state.instance_id.lower()
+        ):
+            return False
+        return self._is_ours(binding)
+
+    def _foreign(self, bindings: Sequence[Binding]) -> list[Binding]:
+        """Bindings that belong to somebody else."""
+        return [binding for binding in bindings if not self._is_ours(binding)]
+
+    def _assert_bindings_visible(self, after: Sequence[Binding]) -> None:
+        """Refuse to hold a registration we cannot supervise.
+
+        If our own binding is missing from the list we just fetched, the registrar is
+        not reporting bindings -- and then every eviction check is blind. Registering
+        anyway would mean gambling with the resident's doorbell.
+        """
+        if not any(self._is_ours(binding) for binding in after):
+            raise SipUnverifiableError(
+                "регистратор не сообщает привязки — проверить вытеснение невозможно"
+            )
+
+    async def _assert_no_eviction(
+        self, before: Sequence[Binding], after: Sequence[Binding], elapsed: float
+    ) -> None:
+        """Stop for good if registering displaced somebody."""
+        vanished = self._vanished(before, after, elapsed)
+        if not vanished:
+            return
+
+        # One observation is not enough to latch a permanent, user-visible failure: a
+        # binding can disappear because it expired on its own, or because the phone
+        # reconnected and minted a new source port. Confirm before acting.
+        await asyncio.sleep(EVICTION_CONFIRM_DELAY)
+        recheck, _response = await self._probe()
+        vanished = self._vanished(before, recheck, elapsed + EVICTION_CONFIRM_DELAY)
+        if not vanished:
+            _LOGGER.debug("Binding difference settled on the second observation")
+            return
+
+        await self._withdraw_own_contact()
+        raise SipEvictionError(
+            f"регистрация вытеснила чужих привязок: {len(vanished)}"
+        )
+
+    def _vanished(
+        self, before: Sequence[Binding], after: Sequence[Binding], elapsed: float
+    ) -> list[Binding]:
+        """Foreign bindings present before and absent afterwards."""
+        gone: list[Binding] = []
+        for binding in before:
+            if self._is_ours(binding):
+                continue
+            # Natural expiry is not eviction. The registrar reports each binding's
+            # remaining lifetime, so use it rather than blaming ourselves for a clock.
+            if (
+                binding.expires is not None
+                and binding.expires <= elapsed + EXPIRY_SLACK
+            ):
+                continue
+            # Match on instance id where there is one: a phone's Contact URI changes on
+            # every reconnect because the source port is part of it.
+            if binding.instance_id and any(
+                other.instance_id == binding.instance_id for other in after
+            ):
+                continue
+            if any(uri_equal(other.uri, binding.uri) for other in after):
+                continue
+            gone.append(binding)
+        return gone
+
+    async def _withdraw_own_contact(self) -> None:
+        """Take our binding back off the account, and nothing else."""
+        if not self._state.contact_uri:
+            return
+        with contextlib.suppress(SipError, OSError, TimeoutError):
+            await self._register_request(
+                contacts=[f"<{self._state.contact_uri}>;expires=0"], expires=0
+            )
+            _LOGGER.debug("Withdrew our own binding")
+
     def _gate(self, bindings: Sequence[Binding]) -> None:
         """Refuse to go further if the account is already in use by somebody else."""
+        bindings = self._foreign(bindings)
         if not bindings:
             return
 
@@ -398,6 +687,9 @@ class LokiSipClient:
         self._transport = _Transport(reader, writer)
         host, port = writer.get_extra_info("sockname")[:2]
         self._state.sent_by = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        # The socket's own address is only a first guess -- behind a container bridge
+        # the registrar sees a different one and tells us so via received/rport.
+        self._state.set_contact(self._state.make_contact_uri(host, port))
         # A fresh connection is a fresh registration identity as far as digest is
         # concerned; keeping stale nonces would produce a replay on the first request.
         self._challenges.clear()
