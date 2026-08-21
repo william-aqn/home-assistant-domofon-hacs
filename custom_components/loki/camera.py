@@ -35,6 +35,15 @@ _SNAPSHOT_TTL = 10.0
 # a VPN, a firewall -- and a capture that hangs would hold a dashboard button hostage.
 _CAPTURE_TIMEOUT = 20.0
 
+# How long a frame somebody asked for stays on screen.
+#
+# It gets its own lifetime rather than sharing the snapshot cache, and a much longer
+# one. Sharing was tried and was visibly wrong: the captured frame expired after ten
+# seconds, the next routine refresh pulled the backend's static picture back, and the
+# wall silently reverted to placeholders a few seconds after the user pressed the
+# button. A frame that was explicitly requested outranks one nobody asked for.
+_CAPTURE_TTL = 300.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -85,6 +94,8 @@ class LokiCamera(LokiEntity, Camera):
         self._attr_entity_registry_enabled_default = device.is_door
         self._cached_image: bytes | None = None
         self._cached_at = 0.0
+        self._captured_image: bytes | None = None
+        self._captured_at = 0.0
         # Advertised whenever the device has a stream URL at all, even while the media
         # host is unreachable. Withdrawing the feature when video is down was tried and
         # made things worse: Home Assistant's own camera dialog stops rendering the
@@ -172,8 +183,8 @@ class LokiCamera(LokiEntity, Camera):
 
         if not image:
             return False
-        self._cached_image = image
-        self._cached_at = time.monotonic()
+        self._captured_image = image
+        self._captured_at = time.monotonic()
         # Moves entity_picture on, so anything showing this camera re-fetches.
         self.async_write_ha_state()
         return True
@@ -183,11 +194,16 @@ class LokiCamera(LokiEntity, Camera):
     ) -> bytes | None:
         """Return the picture to show for this camera.
 
-        The backend's still by default: cheap, and it keeps working when the video host
-        does not. When somebody has asked for a live capture, that frame is served
-        instead until it ages out -- same cache, fresher contents.
+        A frame somebody asked for wins while it is fresh; otherwise the backend's own
+        still, which is cheap and keeps working when the video host does not.
         """
         now = time.monotonic()
+        if (
+            self._captured_image is not None
+            and now - self._captured_at < _CAPTURE_TTL
+        ):
+            return self._captured_image
+
         if self._cached_image is not None and now - self._cached_at < _SNAPSHOT_TTL:
             return self._cached_image
 

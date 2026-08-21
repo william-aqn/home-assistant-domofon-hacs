@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.1.0";
+const CARD_VERSION = "1.1.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -31,9 +31,13 @@ const CARD_VERSION = "1.1.0";
 // it for anyone who wants longer.
 const DEFAULT_LIVE_TIMEOUT = 30;
 
-// How often a still is re-fetched. The camera's own frame interval is 10 s, so asking
-// faster only costs requests the backend answers from its own cache.
-const STILL_REFRESH = 10;
+// How often a still is re-fetched.
+//
+// A minute, not ten seconds: the backend's picture is static -- measured, the same
+// bytes ninety seconds apart -- so polling it hard is twenty-one pointless requests
+// per tick, and it was actively harmful, overwriting a frame the user had just asked
+// for. Anything genuinely new arrives either from the capture button or from a ring.
+const STILL_REFRESH = 60;
 
 // How long to wait for a forced snapshot before counting it as failed.
 const SHOT_TIMEOUT = 15;
