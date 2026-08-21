@@ -32,6 +32,10 @@ class Recorder:
     states: list[tuple[SipState, str | None]] = field(default_factory=list)
     snapshots: list[SipSnapshot] = field(default_factory=list)
     terminal: tuple[SipState, str, str] | None = None
+    calls: list[tuple[str, str]] = field(default_factory=list)
+    ended: list[tuple[str, str]] = field(default_factory=list)
+    # What on_incoming answers: False means nothing in Home Assistant will pick up.
+    deliver: bool = True
 
     def on_state(self, state: SipState, detail: str | None) -> None:
         self.states.append((state, detail))
@@ -41,6 +45,13 @@ class Recorder:
 
     def on_terminal(self, state: SipState, kind: str, detail: str) -> None:
         self.terminal = (state, kind, detail)
+
+    async def on_incoming(self, call_id: str, remote_uri: str) -> bool:
+        self.calls.append((call_id, remote_uri))
+        return self.deliver
+
+    def on_call_end(self, call_id: str, reason: str) -> None:
+        self.ended.append((call_id, reason))
 
 
 class WireTap(FakeRegistrar):

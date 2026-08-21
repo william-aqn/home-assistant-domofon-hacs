@@ -19,11 +19,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import logging
 import random
-import secrets
 import time
 from typing import Protocol
 
-from .const import CRLF, MAX_HEADER_BYTES, TIMER_F
+from .const import ALLOW, CRLF, MAX_HEADER_BYTES, TIMER_F
 from .digest import DigestChallenge, challenges_from
 from .errors import (
     SipBlockedError,
@@ -36,6 +35,7 @@ from .errors import (
 )
 from .messages import MessageBuilder, Ping, Pong, SipMessage, StreamFramer
 from .registration import Binding, RegistrationState, parse_bindings, uri_equal
+from .transactions import InviteTransaction, TransactionTable, transaction_key
 from .uri import parse_params, split_semis
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,6 +60,11 @@ EXPIRY_SLACK = 90.0
 
 # A single observation is not enough to latch a permanent failure.
 EVICTION_CONFIRM_DELAY = 5.0
+
+# How long our branch may stay unresolved. Must be comfortably under a proxy's Timer C
+# (over 180 s): while our branch is open the proxy will not forward the other branches'
+# final responses, so the decline button on the resident's phone stops working.
+BRANCH_DEADLINE = 115.0
 
 
 class SipState(StrEnum):
@@ -120,6 +125,13 @@ class SipEvents(Protocol):
 
     def on_terminal(self, state: SipState, kind: str, detail: str) -> None:
         """The client stopped for good and a person has to act."""
+
+    async def on_incoming(self, call_id: str, remote_uri: str) -> bool:
+        """Ring in Home Assistant. False means nothing will answer -> decline now."""
+        raise NotImplementedError
+
+    def on_call_end(self, call_id: str, reason: str) -> None:
+        """A ringing call finished, one way or another."""
 
 
 @dataclass
@@ -184,6 +196,11 @@ class LokiSipClient:
         # Serialises request/response exchanges so one reply cannot be taken by the
         # wrong sender.
         self._request_lock = asyncio.Lock()
+        self._transactions = TransactionTable()
+        self._branch_deadlines: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+        # The INVITE a final response has to be built from, kept so Home Assistant can
+        # end a ringing call.
+        self._last_invite: SipMessage | None = None
         self._challenges: dict[str, DigestChallenge] = {}
         self._seen_nonces: set[str] = set()
         self._failures = 0
@@ -742,18 +759,153 @@ class LokiSipClient:
             return
 
     async def _on_request(self, request: SipMessage) -> None:
-        """Answer a request the registrar sent us.
+        """Answer a request the registrar sent us."""
+        self._transactions.prune()
+        if request.method == "INVITE":
+            await self._on_invite(request)
+        elif request.method == "CANCEL":
+            await self._on_cancel(request)
+        elif request.method in ("ACK",):
+            return  # nothing to answer
+        elif request.method == "OPTIONS":
+            await self._send(
+                MessageBuilder.response(
+                    request, 200, "OK", extra=[("Allow", ALLOW)]
+                )
+            )
+        else:
+            await self._send(
+                MessageBuilder.response(request, 405, "Method Not Allowed")
+            )
 
-        Handling an INVITE properly belongs to the next stage. Until then the branch is
-        declined at once rather than left hanging: while our branch is unresolved a
-        forking proxy will not deliver other branches' final responses, which is what
-        makes the decline button on the resident's phone stop working.
+    async def _on_invite(self, request: SipMessage) -> None:
+        """Ring in Home Assistant, without ever taking the call.
+
+        We answer 180 Ringing and stop there: sending a 2xx would take the call away
+        from the resident's phone. But we must not sit on 180 forever either -- while
+        our branch is unresolved a forking proxy will not forward the other branches'
+        final responses, so the decline button on their phone stops working. Hence the
+        deadline.
         """
+        key = transaction_key(request)
+
+        if (existing := self._transactions.get(key)) is not None:
+            # A retransmission. Once a final has been sent it must be repeated: a
+            # provisional here would put the branch back into Proceeding and reset the
+            # proxy's Timer C.
+            if existing.final_sent and existing.last_final:
+                await self._send(existing.last_final)
+            else:
+                await self._send(
+                    MessageBuilder.response(
+                        request, 180, "Ringing", to_tag=existing.to_tag
+                    )
+                )
+            return
+
+        from_header = request.first("from")
+        remote_uri = from_header.text() if from_header else ""
+        transaction = self._transactions.add(
+            key, InviteTransaction(call_id=request.call_id, remote_uri=remote_uri)
+        )
+        self._last_invite = request
+
+        await self._send(MessageBuilder.response(request, 100, "Trying"))
         await self._send(
             MessageBuilder.response(
-                request, 486, "Busy Here", to_tag=secrets.token_hex(4)
+                request, 180, "Ringing", to_tag=transaction.to_tag
             )
         )
+
+        delivered = False
+        try:
+            delivered = await self._events.on_incoming(
+                transaction.call_id, remote_uri
+            )
+        except Exception:
+            _LOGGER.exception("Failed to announce the incoming call")
+
+        if not delivered:
+            # Nothing in Home Assistant is going to answer, so release the branch now
+            # rather than let it time out.
+            await self._decline(request, transaction, "undelivered")
+            return
+
+        self._branch_deadlines[key] = asyncio.get_running_loop().create_task(
+            self._branch_deadline(request, transaction, key)
+        )
+
+    async def _branch_deadline(
+        self,
+        request: SipMessage,
+        transaction: InviteTransaction,
+        key: tuple[str, str, str],
+    ) -> None:
+        """Release the branch before the proxy's own timer would have to."""
+        try:
+            await asyncio.sleep(BRANCH_DEADLINE)
+            if not transaction.final_sent:
+                await self._decline(request, transaction, "timeout")
+        except asyncio.CancelledError:
+            raise
+        except (SipError, OSError):
+            return
+        finally:
+            self._branch_deadlines.pop(key, None)
+
+    async def _on_cancel(self, request: SipMessage) -> None:
+        """The caller gave up. Acknowledge, then close the INVITE it names."""
+        # A CANCEL shares the INVITE's branch, so the INVITE's key differs only in the
+        # method. The 200 carries the CANCEL's own CSeq, echoed verbatim.
+        await self._send(MessageBuilder.response(request, 200, "OK"))
+
+        branch, sent_by, _method = transaction_key(request)
+        transaction = self._transactions.get((branch, sent_by, "INVITE"))
+        if transaction is None or transaction.final_sent:
+            return
+        transaction.cancelled = True
+        await self._finalise(
+            request, transaction, 487, "Request Terminated", reason="cancelled"
+        )
+
+    async def _decline(
+        self, request: SipMessage, transaction: InviteTransaction, reason: str
+    ) -> None:
+        """Decline our branch only.
+
+        486 and not 603: a 6xx is a global decline that makes the proxy cancel every
+        other branch, the resident's phone included.
+        """
+        await self._finalise(request, transaction, 486, "Busy Here", reason=reason)
+
+    async def _finalise(
+        self,
+        request: SipMessage,
+        transaction: InviteTransaction,
+        code: int,
+        phrase: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Send a final response once, and remember it for retransmissions."""
+        if transaction.final_sent:
+            return
+        message = MessageBuilder.response(
+            request, code, phrase, to_tag=transaction.to_tag
+        )
+        transaction.final_sent = True
+        transaction.last_final = message
+        await self._send(message)
+        _LOGGER.debug("Call %s ended (%s)", transaction.call_id, reason)
+        self._events.on_call_end(transaction.call_id, reason)
+
+    async def async_end_call(self, call_id: str, reason: str = "ended") -> bool:
+        """End a ringing call from Home Assistant's side."""
+        transaction = self._transactions.by_call_id(call_id)
+        if transaction is None or transaction.final_sent or self._last_invite is None:
+            return False
+        await self._decline(self._last_invite, transaction, reason)
+        return True
 
     async def _send(self, data: bytes) -> None:
         """Write to the socket."""
@@ -775,6 +927,10 @@ class LokiSipClient:
 
     async def _close(self) -> None:
         """Close the socket and stop the reader, tolerating an already-gone one."""
+        for deadline in list(self._branch_deadlines.values()):
+            deadline.cancel()
+        self._branch_deadlines.clear()
+
         task, self._reader_task = self._reader_task, None
         if task is not None:
             task.cancel()

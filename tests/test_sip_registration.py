@@ -274,30 +274,61 @@ async def test_registration_is_refreshed_while_held() -> None:
     assert len(registrar.bindings) == 1, "refresh must not create a second binding"
 
 
-@pytest.mark.asyncio
-async def test_an_incoming_request_is_declined_while_registered() -> None:
-    """A branch left hanging stops a proxy delivering other branches' replies."""
+async def _invite_while_registered(
+    recorder: Recorder, **overrides: object
+) -> tuple[list[str], WireTap]:
+    """Register, then have the registrar push an INVITE down the same connection."""
     registrar = WireTap(password=PASSWORD)
-    recorder = Recorder()
     port = await registrar.start()
-    client = LokiSipClient(_config(port), recorder)
+    client = LokiSipClient(_config(port, **overrides), recorder)
 
     task = asyncio.create_task(client.async_run())
     try:
         async with asyncio.timeout(20):
             while not any(s is SipState.REGISTERED for s, _ in recorder.states):
                 await asyncio.sleep(0.02)
-            replies = await registrar.send_invite()
+            replies = await registrar.send_invite(timeout=2.0)
     finally:
         await client.async_stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await registrar.stop()
+    return replies, registrar
+
+
+@pytest.mark.asyncio
+async def test_an_incoming_call_rings_and_is_never_answered() -> None:
+    """180 Ringing, and nothing above it.
+
+    A 2xx would take the call away from the resident's phone; a 6xx would cancel
+    every other branch including theirs. Neither may ever leave this client.
+    """
+    recorder = Recorder()
+
+    replies, _registrar = await _invite_while_registered(recorder)
 
     assert replies, "the client sent nothing back"
-    assert replies[0].startswith("SIP/2.0 486"), replies
-    # A 6xx would cancel every other branch, the resident's phone included.
+    assert replies[0].startswith("SIP/2.0 100"), replies
+    assert replies[1].startswith("SIP/2.0 180"), replies
+    assert not any(reply.startswith("SIP/2.0 2") for reply in replies), replies
     assert not any(reply.startswith("SIP/2.0 6") for reply in replies), replies
+
+    # The call reached Home Assistant, with the caller's display name intact.
+    assert recorder.calls, "the ring was not announced"
+    _call_id, remote_uri = recorder.calls[0]
+    assert "Дверь" in remote_uri, remote_uri
+
+
+@pytest.mark.asyncio
+async def test_a_call_nothing_will_answer_is_released_at_once() -> None:
+    """Leaving the branch open would freeze the decline button on the phone."""
+    recorder = Recorder(deliver=False)
+
+    replies, _registrar = await _invite_while_registered(recorder)
+
+    assert any(reply.startswith("SIP/2.0 486") for reply in replies), replies
+    assert not any(reply.startswith("SIP/2.0 6") for reply in replies), replies
+    assert recorder.ended and recorder.ended[0][1] == "undelivered"
 
 
 # ----------------------------------------------------------------- ownership
