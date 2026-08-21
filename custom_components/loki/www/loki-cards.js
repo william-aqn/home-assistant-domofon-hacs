@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.3.0";
+const CARD_VERSION = "0.4.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -815,7 +815,15 @@ class LokiWallCard extends HTMLElement {
   }
 
   _teardown() {
-    for (const tile of this._tiles.values()) tile.media.destroy();
+    // The DOM nodes go too, not just the bookkeeping. Switching dashboard tabs
+    // disconnects the card and reconnects the same element without calling setConfig
+    // again -- so a teardown that forgot the tiles but left them on screen meant the
+    // next update built a second full set underneath the first. Twenty-one doors
+    // became forty-two.
+    for (const tile of this._tiles.values()) {
+      tile.media.destroy();
+      tile.root.remove();
+    }
     this._tiles.clear();
   }
 }
@@ -935,13 +943,25 @@ class LokiWallCardEditor extends LokiEditorBase {
 
 /* ------------------------------------------------------------- registration */
 
-customElements.define("loki-door-card", LokiDoorCard);
-customElements.define("loki-wall-card", LokiWallCard);
-customElements.define("loki-door-card-editor", LokiDoorCardEditor);
-customElements.define("loki-wall-card-editor", LokiWallCardEditor);
+// Idempotent on purpose. The module can legitimately be loaded twice -- once as a
+// Lovelace resource and once as an extra module URL -- and a bare define() throws on
+// the second, which aborts the rest of the module and takes the picker entries with
+// it. Registering twice must be a no-op, not a failure.
+const define = (name, cls) => {
+  if (!customElements.get(name)) customElements.define(name, cls);
+};
+
+define("loki-door-card", LokiDoorCard);
+define("loki-wall-card", LokiWallCard);
+define("loki-door-card-editor", LokiDoorCardEditor);
+define("loki-wall-card-editor", LokiWallCardEditor);
 
 window.customCards = window.customCards || [];
-window.customCards.push(
+const listed = new Set(window.customCards.map((card) => card.type));
+const offer = (entry) => {
+  if (!listed.has(entry.type)) window.customCards.push(entry);
+};
+[
   {
     type: "loki-door-card",
     name: "Loki — домофон",
@@ -957,8 +977,8 @@ window.customCards.push(
       "Плитки всех домофонов с кнопкой открытия на каждой, чтобы найти человека глазами.",
     preview: true,
     documentationURL: "https://github.com/william-aqn/home-assistant-domofon-hacs",
-  }
-);
+  },
+].forEach(offer);
 
 console.info(
   `%c LOKI CARDS %c ${CARD_VERSION} `,

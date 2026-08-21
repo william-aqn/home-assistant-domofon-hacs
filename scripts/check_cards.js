@@ -50,9 +50,12 @@ const stubElement = () => ({
 global.window = global;
 global.customElements = {
   define: (name, cls) => {
-    if (defined[name]) throw new Error(`${name} defined twice`);
+    // Throws exactly like a browser does, which is the point: the bundle may be
+    // loaded twice (Lovelace resource plus extra module URL) and must survive it.
+    if (defined[name]) throw new Error(`${name} already defined`);
     defined[name] = cls;
   },
+  get: (name) => defined[name],
 };
 global.document = { createElement: stubElement };
 global.CustomEvent = class {
@@ -79,8 +82,26 @@ function check(what, ok, detail) {
   }
 }
 
+const SOURCE = fs.readFileSync(BUNDLE, "utf8");
 // eslint-disable-next-line no-eval
-eval(fs.readFileSync(BUNDLE, "utf8"));
+eval(SOURCE);
+
+// Loading twice is a real scenario, not a hypothetical: the bundle is registered both
+// as a Lovelace resource and as an extra module URL, and on a bare define() the second
+// load throws and takes the picker entries down with it.
+let secondLoad = "ok";
+try {
+  // eslint-disable-next-line no-eval
+  eval(SOURCE);
+} catch (err) {
+  secondLoad = err.message;
+}
+check("bundle survives being loaded twice", secondLoad === "ok", secondLoad);
+check(
+  "a second load does not duplicate the picker entries",
+  (global.customCards || []).length === 2,
+  String((global.customCards || []).length)
+);
 
 const EXPECTED = [
   "loki-door-card",

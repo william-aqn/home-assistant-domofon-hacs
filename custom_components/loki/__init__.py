@@ -17,7 +17,7 @@ from .api import LokiApiError, LokiAuthError, LokiClient
 from .call import CallManager
 from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_SIP_ENABLED
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
-from .frontend import async_register_cards
+from .frontend import async_register_cards, async_remove_resource
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
 from .repairs import async_clear_reauth_unrecoverable, async_clear_sip_terminal
 from .services import async_setup_services
@@ -139,6 +139,12 @@ async def async_remove_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> Non
     """
     async_clear_sip_terminal(hass, entry.entry_id)
     await SipStore(hass, entry.entry_id).async_remove()
+
+    # The Lovelace resource is global, not per account, so it only goes when the last
+    # one does -- otherwise removing a second phone number would break the cards for
+    # the first.
+    if not [e for e in hass.config_entries.async_entries(DOMAIN) if e is not entry]:
+        await async_remove_resource(hass)
 
 
 async def async_remove_config_entry_device(
