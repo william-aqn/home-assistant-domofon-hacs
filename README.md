@@ -16,15 +16,29 @@
 - **Уведомление при звонке в дверь**: картинка с домофона и кнопка «Открыть» прямо в
   уведомлении на телефоне. Работает и когда вас нет дома.
 - **Живое видео** — по кнопке, когда действительно нужно.
-- **Распознавание лиц** — в планах.
+
+### Чего пока нет
+
+- **Разговора с гостем.** Home Assistant узнаёт, что в дверь позвонили, и показывает,
+  кто пришёл, — но говорить через него нельзя. Голосовая связь запланирована.
+- **Распознавания лиц.** Тоже в планах.
 
 ## Установка
 
-1. HACS → три точки в правом верхнем углу → **Пользовательские репозитории**.
-2. Вставьте `https://github.com/william-aqn/home-assistant-domofon-hacs`,
-   тип — **Integration**.
-3. Найдите **Loki** в списке, установите, перезапустите Home Assistant.
-4. **Настройки → Устройства и службы → Добавить интеграцию → Loki**.
+<a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=william-aqn&repository=home-assistant-domofon-hacs&category=integration" target="_blank"><img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Открыть репозиторий в HACS на своём Home Assistant" /></a>
+
+Кнопка откроет Loki прямо в вашем HACS — останется нажать «Скачать» и перезапустить
+Home Assistant.
+
+Если кнопка не сработала: HACS → три точки в правом верхнем углу → **Пользовательские
+репозитории** → вставьте `https://github.com/william-aqn/home-assistant-domofon-hacs`,
+тип **Integration**.
+
+### Затем добавьте интеграцию
+
+<a href="https://my.home-assistant.io/redirect/config_flow_start/?domain=loki" target="_blank"><img src="https://my.home-assistant.io/badges/config_flow_start.svg" alt="Добавить интеграцию Loki на своём Home Assistant" /></a>
+
+Или вручную: **Настройки → Устройства и службы → Добавить интеграцию → Loki**.
 
 Дальше — номер телефона и код из SMS. В конце Home Assistant предложит добавить
 готовую страницу «Домофоны» в боковое меню; согласитесь, если не хотите собирать
