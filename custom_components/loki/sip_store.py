@@ -29,6 +29,7 @@ Three separate reasons, all of which cost the resident their doorbell if forgott
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import time
 from typing import Any
@@ -49,7 +50,10 @@ MAX_RESOLVED = 64
 # longest expiry we ever ask for (300 s), and short enough that a NAT port handed to
 # another device in the meantime is never claimed as our own.
 CONTACT_TTL = 600.0
-MAX_CONTACTS = 4
+# Six, not four: one registration can leave more than one row on the account -- the
+# address we guessed and the corrected one the registrar answered with -- and all of
+# them have to be recognisable after a restart.
+MAX_CONTACTS = 6
 
 # Rewriting the store on every registration refresh would be wasteful, and never
 # rewriting it lets the stamp go stale under a long-held registration. Refresh
@@ -175,19 +179,39 @@ class SipStoredState:
         return [uri for uri, at in self.contacts if 0 <= now - at <= CONTACT_TTL]
 
     def record_contact(self, uri: str) -> bool:
-        """Remember a Contact URI we hold a binding at.
+        """Remember one Contact URI we hold a binding at."""
+        return self.record_contacts([uri])
 
-        Returns whether the change is worth a disk write: a new URI always is,
-        and a re-stamp of the current one is once its age approaches the TTL.
+    def record_contacts(self, uris: Sequence[str]) -> bool:
+        """Remember every Contact URI we hold a binding at.
+
+        More than one because a single registration can leave more than one row: the
+        address the socket reported, and the corrected one the registrar answered
+        with. Remembering only the second was enough to lock the client out of its
+        own account when the first outlived it.
+
+        Returns whether the change is worth a disk write: a URI we have not seen
+        always is, and a re-stamp of one we have is once its age approaches the TTL.
+        Matching anywhere in the list rather than only at the end, because two URIs
+        recorded together would otherwise take turns re-stamping each other.
         """
         now = time.time()
-        if self.contacts and self.contacts[-1][0] == uri:
-            if now - self.contacts[-1][1] < CONTACT_REFRESH_AFTER:
-                return False
-            self.contacts[-1] = (uri, now)
-            return True
-        self.contacts = [*self.contacts, (uri, now)][-MAX_CONTACTS:]
-        return True
+        changed = False
+        for uri in uris:
+            if not uri:
+                continue
+            for index, (known, at) in enumerate(self.contacts):
+                if known == uri:
+                    if now - at >= CONTACT_REFRESH_AFTER:
+                        self.contacts[index] = (uri, now)
+                        changed = True
+                    break
+            else:
+                self.contacts.append((uri, now))
+                changed = True
+        if len(self.contacts) > MAX_CONTACTS:
+            self.contacts = self.contacts[-MAX_CONTACTS:]
+        return changed
 
     def remember(self, remote_uri: str, device_id: int) -> bool:
         """Record which door a SIP URI belongs to. False if nothing needs saving.
@@ -236,9 +260,9 @@ class SipStore:
         self.state.terminal_detail = detail
         await self.async_save()
 
-    async def async_record_contact(self, uri: str) -> None:
-        """Remember the Contact URI our binding lives at, and persist it."""
-        if self.state.record_contact(uri):
+    async def async_record_contacts(self, uris: Sequence[str]) -> None:
+        """Remember the Contact URIs our bindings live at, and persist them."""
+        if self.state.record_contacts(uris):
             await self.async_save()
 
     async def async_clear_terminal(self) -> None:

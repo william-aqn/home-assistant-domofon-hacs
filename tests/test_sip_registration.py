@@ -40,6 +40,20 @@ def _config(port: int, **overrides: object) -> SipConfig:
     return SipConfig(**base)  # type: ignore[arg-type]
 
 
+async def _hard_stop(client: LokiSipClient, task: asyncio.Task[None]) -> None:
+    """Stop the way a killed process does, leaving the binding on the account.
+
+    ``async_stop`` hands the binding back, which is what should happen when Home
+    Assistant shuts down cleanly. These tests are about what the *account* looks like
+    while a client holds a registration, and about what the next process finds after
+    one died without saying goodbye -- so they must not go through that path.
+    """
+    client._stopping = True
+    await client._close()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def _run_until(
     registrar: WireTap,
     recorder: Recorder,
@@ -61,9 +75,7 @@ async def _run_until(
                     break
                 await asyncio.sleep(0.02)
     finally:
-        await client.async_stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _hard_stop(client, task)
         await registrar.stop()
     return client
 
@@ -263,9 +275,7 @@ async def test_registration_is_refreshed_while_held() -> None:
                     break
                 await asyncio.sleep(0.05)
     finally:
-        await client.async_stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _hard_stop(client, task)
         await registrar.stop()
 
     assert recorder.terminal is None, f"refresh failed: {recorder.terminal}"
@@ -441,11 +451,39 @@ async def _register_once(port: int, instance_id: str) -> str:
                 await asyncio.sleep(0.02)
         contact = client.contact_uri
     finally:
-        await client.async_stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _hard_stop(client, task)
     assert contact
     return contact
+
+
+@pytest.mark.asyncio
+async def test_a_clean_stop_hands_the_binding_back() -> None:
+    """The other half: a graceful stop must not leave a binding for the next process.
+
+    This is what turns a Home Assistant restart from "the doorbell is dead until the
+    old binding lapses" into "the doorbell keeps working". Measured on the live
+    registrar before it existed: two restarts, two five-minute outages.
+    """
+    registrar = WireTap(password=PASSWORD, echo_instance_id=False)
+    port = await registrar.start()
+    recorder = Recorder()
+    client = LokiSipClient(_config(port), recorder)
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(15):
+            while client.state is not SipState.REGISTERED:
+                await asyncio.sleep(0.02)
+        assert len(registrar.bindings) == 1
+        await client.async_stop()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert registrar.bindings == []
+    # Withdrawn one by one, never with a wildcard: that would wipe the resident's
+    # phone off the account along with us.
+    assert not registrar.wildcard_seen
 
 
 @pytest.mark.asyncio
@@ -512,9 +550,7 @@ async def test_a_restart_carrying_its_old_contact_reclaims_the_binding() -> None
                     assert recorder.terminal is None, recorder.terminal
                     await asyncio.sleep(0.02)
         finally:
-            await client.async_stop()
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await _hard_stop(client, task)
     finally:
         await registrar.stop()
 

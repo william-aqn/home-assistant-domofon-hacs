@@ -33,6 +33,9 @@ class Recorder:
     states: list[tuple[SipState, str | None]] = field(default_factory=list)
     snapshots: list[SipSnapshot] = field(default_factory=list)
     terminal: tuple[SipState, str, str] | None = None
+    # Counted, not just kept: a client that retries must raise the card once, not
+    # once per retry, and only a count can tell the difference.
+    terminal_count: int = 0
     calls: list[tuple[str, str]] = field(default_factory=list)
     ended: list[tuple[str, str]] = field(default_factory=list)
     # What on_incoming answers: False means nothing in Home Assistant will pick up.
@@ -46,6 +49,7 @@ class Recorder:
 
     def on_terminal(self, state: SipState, kind: str, detail: str) -> None:
         self.terminal = (state, kind, detail)
+        self.terminal_count += 1
 
     async def on_incoming(self, call_id: str, remote_uri: str) -> bool:
         self.calls.append((call_id, remote_uri))

@@ -24,6 +24,8 @@ import time
 
 CRLF = "\r\n"
 REALM = "fake.registrar"
+# The public address a client behind NAT appears to come from.
+NAT_ADDRESS = "203.0.113.9"
 
 
 @dataclass
@@ -95,6 +97,7 @@ class FakeRegistrar:
         require_auth: bool = True,
         report_bindings: bool = True,
         rewrite_contact: bool = False,
+        nat_port: int | None = 44444,
         echo_instance_id: bool = True,
     ) -> None:
         """Configure the policies that matter to the probe."""
@@ -105,6 +108,11 @@ class FakeRegistrar:
         # blind, so the probe has to detect it. This switch reproduces that.
         self.report_bindings = report_bindings
         self.rewrite_contact = rewrite_contact
+        # The port the client appears to come from. A fixed one keeps tests that pin
+        # the reported value readable; None models a real NAT, which hands out a
+        # fresh port per connection -- and that is what makes a restart unable to
+        # recognise its own binding by address alone.
+        self.nat_port = nat_port
         # The live registrar (Asterisk) does NOT echo +sip.instance or reg-id, which
         # makes URI comparison the primary way a client recognises its own binding
         # rather than the fallback. Switchable so both worlds can be tested.
@@ -118,6 +126,7 @@ class FakeRegistrar:
         self.server: asyncio.Server | None = None
         self.port = 0
         self._writer: asyncio.StreamWriter | None = None
+        self._rport = 44444
         self._replies: asyncio.Queue[str] = asyncio.Queue()
 
     def seed_foreign(self, count: int = 1) -> None:
@@ -243,6 +252,11 @@ class FakeRegistrar:
     ) -> None:
         buf = b""
         self._writer = writer
+        # The address the registrar sees. A NAT hands out a fresh port per connection,
+        # so this changes on every reconnect -- which is the whole reason a restart
+        # cannot recognise its own binding by address alone.
+        peer = writer.get_extra_info("peername")
+        self._rport = self.nat_port or (int(peer[1]) if peer else 44444)
         try:
             while True:
                 chunk = await reader.read(65536)
@@ -376,7 +390,7 @@ class FakeRegistrar:
 
         via = one("via")
         if self.rewrite_contact and ";received=" not in via:
-            via = f"{via};received=203.0.113.9;rport=44444"
+            via = f"{via};received={NAT_ADDRESS};rport={self._rport}"
 
         rows = [
             f"SIP/2.0 {status} {reason}",

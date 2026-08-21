@@ -21,7 +21,8 @@ from collections.abc import Mapping
 import logging
 from typing import Any
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
@@ -129,6 +130,7 @@ class SipBridge:
         self._client: LokiSipClient | None = None
         self._task: asyncio.Task[None] | None = None
         self._unsub_calls: Any = None
+        self._unsub_stop: Any = None
         # call_id -> Loki device id, for the calls we announced.
         self._active: dict[str, int] = {}
 
@@ -203,10 +205,30 @@ class SipBridge:
         self._task = self.entry.async_create_background_task(
             self.hass, self._run(), f"{DOMAIN}_sip_{self.entry.entry_id}"
         )
+        # Home Assistant does not unload config entries when it shuts down -- the core
+        # calls `async_shutdown` and `async_unload_entry` never runs -- so without this
+        # the process dies holding a live binding, and the next one reads that binding
+        # as another device and refuses to register on its own account. Measured: two
+        # restarts in a row, two five-minute outages.
+        if self._unsub_stop is None:
+            self._unsub_stop = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STOP, self._async_hass_stopping
+            )
+
+    async def _async_hass_stopping(self, _event: Event) -> None:
+        """Home Assistant is going down; give the account back while the network is up.
+
+        Fired before the core tears anything down, so the socket is still open and
+        there is still time for one REGISTER with ``Expires: 0``.
+        """
+        await self.async_stop()
 
     async def async_stop(self) -> None:
         """Stop the client and release everything it holds."""
         self._unsubscribe_calls()
+        if self._unsub_stop is not None:
+            self._unsub_stop()
+            self._unsub_stop = None
 
         client, self._client = self._client, None
         task, self._task = self._task, None
@@ -260,6 +282,9 @@ class SipBridge:
         """The client's state machine moved."""
         self._publish(state, detail)
         if state is SipState.REGISTERED:
+            # A block that has since cleared by itself must not leave its card behind:
+            # the client retries on its own now, so the card outlives the problem.
+            async_clear_sip_terminal(self.hass, self.entry.entry_id)
             self.entry.async_create_task(
                 self.hass, self._async_record_registration(), f"{DOMAIN}_sip_registered"
             )
@@ -276,9 +301,17 @@ class SipBridge:
         The contact is written before the baseline flag: the reverse order can
         persist "baseline already paid" without the URI that makes the next
         start safe, if the task is cancelled between the two.
+
+        Every row the registrar reports as ours is kept, not only the Contact we
+        believe we sent. The two are not always the same string, and remembering
+        the wrong one is indistinguishable from remembering nothing.
         """
-        if self._client is not None and (uri := self._client.contact_uri):
-            await self._store.async_record_contact(uri)
+        if self._client is not None:
+            uris = list(self._client.own_binding_uris)
+            if (uri := self._client.contact_uri) and uri not in uris:
+                uris.append(uri)
+            if uris:
+                await self._store.async_record_contacts(uris)
         await self._store.async_mark_registered()
 
     @callback

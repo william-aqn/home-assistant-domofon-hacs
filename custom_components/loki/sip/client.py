@@ -36,7 +36,7 @@ from .errors import (
 from .messages import MessageBuilder, Ping, Pong, SipMessage, StreamFramer
 from .registration import Binding, RegistrationState, parse_bindings, uri_equal
 from .transactions import InviteTransaction, TransactionTable, transaction_key
-from .uri import name_addr, parse_params, split_semis
+from .uri import name_addr, parse_params, parse_uri, split_semis
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +85,19 @@ class SipState(StrEnum):
     FAILED = "failed"
 
 
+# A few seconds to hand the binding back on the way out. Home Assistant does not wait
+# long at shutdown, and a de-registration that does not make it costs only what we had
+# before it was attempted.
+STOP_WITHDRAW_TIMEOUT = 3.0
+
+# Looking again at an account somebody else holds. Nearly always our own binding from
+# before a restart, so the first look lands just after the one we saw would lapse; the
+# rest is a doubling curve, because an account that is genuinely in use must not be
+# probed every minute for ever.
+BLOCKED_RETRY_MIN = 30.0
+BLOCKED_RETRY_BASE = 60.0
+BLOCKED_RETRY_MAX = 900.0
+
 # Which terminal state each permanent failure lands in. Anything not listed is a
 # plain failure; eviction and blocking are called out because they mean something
 # different happened to the resident's phone.
@@ -117,6 +130,33 @@ class SipSnapshot:
     def foreign_count(self) -> int:
         """How many bindings belong to somebody else."""
         return len(self.foreign)
+
+    @property
+    def foreign_at_our_address(self) -> bool:
+        """Whether a foreign binding sits at the address the registrar sees us at.
+
+        The one fact that separates "our own leftover from before a restart" from
+        "the resident's phone", and it names neither: a leftover of ours carries the
+        same public host with an older port. Reported, never acted on -- a phone on
+        the same home Wi-Fi shares that host, so it can only ever be a hint.
+        """
+        if not self.received:
+            return False
+        return any(
+            (parsed := parse_uri(binding.uri)) is not None
+            and parsed.host == self.received
+            for binding in self.foreign
+        )
+
+    @property
+    def foreign_expires_in(self) -> int | None:
+        """How long the longest-lived foreign binding has left, if it says."""
+        left = [
+            binding.expires
+            for binding in self.foreign
+            if binding.expires is not None and binding.expires > 0
+        ]
+        return max(left) if left else None
 
 
 class SipEvents(Protocol):
@@ -154,6 +194,11 @@ class SipConfig:
     require_baseline: bool = True
     baseline_samples: int = BASELINE_SAMPLES
     baseline_interval: float = BASELINE_INTERVAL
+    # How soon to look again at an account somebody else holds. Configurable for the
+    # same reason the baseline is: the real values are minutes long.
+    blocked_retry_min: float = BLOCKED_RETRY_MIN
+    blocked_retry_base: float = BLOCKED_RETRY_BASE
+    blocked_retry_max: float = BLOCKED_RETRY_MAX
     # False keeps the client in the probe-only mode: it looks and reports, and cannot
     # change anything on the account.
     register: bool = False
@@ -207,8 +252,14 @@ class LokiSipClient:
         self._challenges: dict[str, DigestChallenge] = {}
         self._seen_nonces: set[str] = set()
         self._failures = 0
+        self._blocks = 0
         self._stopping = False
         self._current = SipState.DISABLED
+        # What the registrar calls our binding, in its own words. Persisted by the
+        # bridge, because what we think our Contact is and what the registrar reports
+        # back are not always the same string.
+        self._own_bindings: tuple[str, ...] = ()
+        self._last_foreign: tuple[Binding, ...] = ()
 
     @property
     def state(self) -> SipState:
@@ -225,6 +276,18 @@ class LokiSipClient:
         """
         return self._state.contact_uri
 
+    @property
+    def own_binding_uris(self) -> tuple[str, ...]:
+        """Every binding the registrar reports that we recognised as ours.
+
+        Taken from the registrar's own answer rather than from what we sent. A
+        registrar may hold a Contact in a form of its choosing -- rewritten to the
+        address it sees, carrying parameters of its own -- and a restart comparing
+        its remembered string against that form has to be comparing the same thing,
+        or it reads its own binding as another device's and locks itself out.
+        """
+        return self._own_bindings
+
     # ------------------------------------------------------------- supervisor
 
     async def async_run(self) -> None:
@@ -235,6 +298,26 @@ class LokiSipClient:
                     await self._one_flow()
                 except asyncio.CancelledError:
                     raise
+                except SipBlockedError as err:
+                    # No longer the end of the road. Every block seen on the live
+                    # account was our own binding from before a restart, still there
+                    # until it lapsed -- and waiting that out costs nothing, while
+                    # waiting for somebody to notice a repair card costs the doorbell.
+                    # The gate itself is unchanged: an account genuinely in use is
+                    # still never registered on.
+                    if not self._blocks:
+                        self._events.on_terminal(
+                            SipState.BLOCKED, type(err).__name__, str(err)
+                        )
+                    delay = self._blocked_delay()
+                    self._blocks += 1
+                    self._set_state(
+                        SipState.BLOCKED, f"{err}; перепроверю через {delay:.0f} с"
+                    )
+                    if self._stopping:
+                        return
+                    await asyncio.sleep(delay)
+                    continue
                 except SipPermanentError as err:
                     kind = type(err).__name__
                     terminal = _TERMINAL_STATES.get(type(err), SipState.FAILED)
@@ -261,9 +344,58 @@ class LokiSipClient:
             await self._close()
 
     async def async_stop(self) -> None:
-        """Ask the client to stop and close its socket."""
+        """Ask the client to stop, handing the binding back on the way out."""
+        await self._withdraw_on_stop()
         self._stopping = True
         await self._close()
+
+    async def _withdraw_on_stop(self) -> None:
+        """Give the binding back before letting go of the connection.
+
+        Without this every restart leaves a live binding behind, and the next process
+        reads it as another device and refuses to register on its own account.
+        Measured on the live registrar: two consecutive Home Assistant restarts, and
+        both times the doorbell stayed dead for the whole five minutes the leftover
+        took to lapse.
+
+        Best effort and strictly bounded. Failing here leaves exactly the situation
+        that existed before the attempt, which the rest of the design already handles.
+        """
+        if self._stopping or self._current is not SipState.REGISTERED:
+            return
+        if not self._state.contact_uri:
+            return
+        try:
+            async with asyncio.timeout(STOP_WITHDRAW_TIMEOUT):
+                await self._withdraw_own_contact()
+        except (SipError, OSError, TimeoutError) as err:
+            _LOGGER.debug("Привязку при остановке снять не удалось: %s", err)
+
+    def _blocked_delay(self) -> float:
+        """When to look at a busy account again.
+
+        The binding we just refused to touch usually says when it lapses, and that is
+        the answer: one expiry from now it is gone. Without an expiry to go on, a
+        doubling curve.
+        """
+        config = self._config
+        if (left := self._blocking_expiry()) is not None:
+            return min(
+                config.blocked_retry_max, max(config.blocked_retry_min, left + 5.0)
+            )
+        return min(
+            config.blocked_retry_max,
+            config.blocked_retry_base * 2 ** min(self._blocks, 4),
+        )
+
+    def _blocking_expiry(self) -> float | None:
+        """The longest expiry among the bindings that blocked us, if any said."""
+        left = [
+            binding.expires
+            for binding in self._last_foreign
+            if binding.expires is not None and binding.expires > 0
+        ]
+        return float(max(left)) if left else None
 
     def _backoff(self) -> float:
         """RFC 5626 §4.5: base 30s, cap 1800s, 50-100% jitter.
@@ -334,16 +466,27 @@ class LokiSipClient:
             # table is precisely the harm this design exists to prevent.
             superseded = self._state.contact_uri
             self._state.set_contact(rewritten)
-            response = await self._register_once(
-                expires=expires,
-                reap=[*reap, superseded] if superseded else reap,
-            )
+            # Anything equal to the corrected Contact is dropped from the withdrawal
+            # list: a NAT that hands back a port we held before makes the binding we
+            # are reclaiming and the binding we are creating one and the same, and
+            # registering and withdrawing one URI in a single message is refused
+            # outright -- which left the client retrying for ever.
+            reap_next = [
+                uri
+                for uri in ([*reap, superseded] if superseded else reap)
+                if uri and not uri_equal(uri, rewritten)
+            ]
+            response = await self._register_once(expires=expires, reap=reap_next)
 
         self._resolve_granted(response, requested=expires)
 
         self._set_state(SipState.VERIFYING, None)
         after, verify_response = await self._probe()
         self._publish(SipState.VERIFYING, after, verify_response)
+        # In the registrar's words, not ours -- see `own_binding_uris`.
+        self._own_bindings = tuple(
+            binding.uri for binding in after if self._is_ours(binding)
+        )
         self._assert_bindings_visible(after)
         await self._assert_no_eviction(before, after, time.monotonic() - started)
 
@@ -582,6 +725,9 @@ class LokiSipClient:
     def _gate(self, bindings: Sequence[Binding]) -> None:
         """Refuse to go further if the account is already in use by somebody else."""
         bindings = self._foreign(bindings)
+        # Kept even when the account is clean: this is what tells the retry when the
+        # account is likely to be free again.
+        self._last_foreign = tuple(bindings)
         if not bindings:
             return
 
