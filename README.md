@@ -81,6 +81,16 @@ Loki сама уведомлений не шлёт: она сообщает Home
 
 HACS blueprint'ы не скачивает — только по кнопке выше.
 
+## Сказать вслух
+
+Если хочется, чтобы о звонке объявляли голосом — на колонку, на самодельную
+пищалку с синтезом речи, в мессенджер, — есть готовый blueprint. Заполняете любые
+каналы, хоть все сразу, и пишете текст: `{{ door_name }}` подставит имя двери.
+
+[![Импортировать blueprint в Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fwilliam-aqn%2Fhome-assistant-domofon-hacs%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Floki%2Fring_announce.yaml)
+
+Ночью можно молчать — отдельная галочка с интервалом.
+
 ## Планшет на стене
 
 Готовый blueprint — для планшета в прихожей с **Fully Kiosk Browser**. При звонке он

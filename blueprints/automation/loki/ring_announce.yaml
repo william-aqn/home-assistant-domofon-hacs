@@ -1,0 +1,173 @@
+blueprint:
+  name: Loki — озвучить звонок в дверь
+  description: >
+    При звонке произносит или отправляет текст: на колонку, на ESP32 с синтезом
+    речи, в мессенджер — куда угодно, что умеет принимать текст. Каналы можно
+    заполнить любые, хоть все сразу; пустые пропускаются.
+
+
+    В тексте доступно `{{ door_name }}` — имя двери, в которую звонят.
+
+
+    Для проверки без реального звонка вызовите действие **Loki: Сымитировать
+    звонок** (`loki.simulate_ring`) с id нужной двери.
+  domain: automation
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/ring_announce.yaml
+  author: william-aqn
+  input:
+    message:
+      name: Что сказать
+      description: >
+        Шаблон. `{{ door_name }}` подставит имя двери — например «Звонят в дверь:
+        Центральный вход».
+      default: "Звонят в дверь: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+
+    speakers:
+      name: Колонки для синтеза речи
+      description: >
+        Куда произносить. Работает вместе с движком ниже — нужны оба поля.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: media_player
+
+    tts_engine:
+      name: Движок синтеза речи
+      description: >
+        Чем произносить: Piper, облачный, любой установленный. Если движков
+        несколько, возьмётся первый.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: tts
+
+    notify_entities:
+      name: Оповещатели
+      description: >
+        Современные оповещатели — телефоны с приложением Home Assistant, боты
+        мессенджеров, всё, что заведено через интерфейс.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: notify
+
+    notify_services:
+      name: Оповещатели из configuration.yaml
+      description: >
+        Только для служб, объявленных в `configuration.yaml` в секции `notify:` —
+        в списке выше их нет, потому что это не сущности. Впишите имя целиком,
+        например `notify.alice_alert`, и нажмите «Добавить своё значение».
+
+
+        Если у оповещателя есть современная замена — берите её из поля выше:
+        старые платформы Home Assistant постепенно отключает.
+      default: []
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          mode: dropdown
+          options:
+            - notify.persistent_notification
+
+    quiet:
+      name: Молчать ночью
+      default: false
+      selector:
+        boolean:
+
+    quiet_from:
+      name: Тишина с
+      default: "23:00:00"
+      selector:
+        time:
+
+    quiet_to:
+      name: Тишина до
+      default: "07:00:00"
+      selector:
+        time:
+
+# Два звонка подряд должны прозвучать оба, но не одновременно: наложенные друг на
+# друга фразы не разберёт никто.
+mode: queued
+max: 5
+max_exceeded: silent
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: call_incoming
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: "{{ not quiet_in }}"
+      - condition: not
+        conditions:
+          - condition: time
+            after: !input quiet_from
+            before: !input quiet_to
+
+actions:
+  - alias: Подготовить текст
+    variables:
+      quiet_in: !input quiet
+      speakers_in: !input speakers
+      engine_in: !input tts_engine
+      entities_in: !input notify_entities
+      services_in: !input notify_services
+
+      door_name: "{{ trigger.event.data.device_name }}"
+      # Объявлено ПОСЛЕ door_name, и это обязательно: значения переменных
+      # рендерятся по порядку, и текст пользователя со ссылкой на door_name
+      # получит пустоту, если поменять их местами.
+      text: !input message
+
+  - alias: Произнести
+    if:
+      - condition: template
+        value_template: "{{ speakers_in | count > 0 and engine_in | count > 0 }}"
+    then:
+      # continue_on_error на каждом канале: молчащая колонка не повод не отправить
+      # сообщение в мессенджер.
+      - action: tts.speak
+        continue_on_error: true
+        target:
+          entity_id: "{{ engine_in | first }}"
+        data:
+          media_player_entity_id: "{{ speakers_in }}"
+          message: "{{ text }}"
+
+  - alias: Отправить оповещателям
+    if:
+      - condition: template
+        value_template: "{{ entities_in | count > 0 }}"
+    then:
+      - action: notify.send_message
+        continue_on_error: true
+        target:
+          entity_id: "{{ entities_in }}"
+        data:
+          message: "{{ text }}"
+
+  - alias: Отправить старым службам из configuration.yaml
+    # По одной: у каждой свой набор полей, и общий вызов на список невозможен.
+    repeat:
+      for_each: "{{ services_in }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          continue_on_error: true
+          data:
+            message: "{{ text }}"
