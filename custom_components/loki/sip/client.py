@@ -288,6 +288,10 @@ class LokiSipClient:
         # back are not always the same string.
         self._own_bindings: tuple[str, ...] = ()
         self._last_foreign: tuple[Binding, ...] = ()
+        # Whether the registrar is currently holding a binding for us. Not the same as
+        # being REGISTERED: it goes true the moment a REGISTER is answered, which is
+        # several seconds earlier, and those seconds are a real window.
+        self._binding_live = False
 
     @property
     def state(self) -> SipState:
@@ -373,8 +377,12 @@ class LokiSipClient:
 
     async def async_stop(self) -> None:
         """Ask the client to stop, handing the binding back on the way out."""
-        await self._withdraw_on_stop()
+        # Set before the withdrawal, not after. The refresh loop is still running at
+        # this point, and one that wakes while the withdrawal holds the request lock
+        # queues a full REGISTER behind it -- putting the binding straight back, and
+        # wearing the appearance of a clean stop while doing it.
         self._stopping = True
+        await self._withdraw_on_stop()
         await self._close()
 
     async def _withdraw_on_stop(self) -> None:
@@ -389,9 +397,12 @@ class LokiSipClient:
         Best effort and strictly bounded. Failing here leaves exactly the situation
         that existed before the attempt, which the rest of the design already handles.
         """
-        if self._stopping or self._current is not SipState.REGISTERED:
-            return
-        if not self._state.contact_uri:
+        # Whether a binding exists, not what state we are in. The binding is created
+        # the moment the REGISTER is answered, while REGISTERED is only reached after
+        # the verification probe and, when the lists disagree, five further seconds --
+        # so a switch flicked in that window used to leave the binding behind, which
+        # is the very thing this method exists to prevent.
+        if not self._binding_live or not self._state.contact_uri:
             return
         try:
             async with asyncio.timeout(STOP_WITHDRAW_TIMEOUT):
@@ -442,6 +453,12 @@ class LokiSipClient:
         self._set_state(SipState.CONNECTING, None)
         await self._connect()
 
+        # Prior Contact URIs age out here as well as in the refresh loop. The blocked
+        # retry never reaches that loop, so without this a rewritten public address
+        # stays claimable for as long as the retries go on -- and a NAT port handed to
+        # another device in the meantime would be withdrawn as though it were ours.
+        self._state.forget_stale_priors(self._config.expires * 2)
+
         self._set_state(SipState.PROBING, None)
         bindings, response = await self._probe()
         self._publish(SipState.PROBING, bindings, response)
@@ -457,11 +474,17 @@ class LokiSipClient:
             # connection open rather than reconnecting in a loop: an idle TCP session
             # costs the registrar nothing and keeps the reported snapshot fresh.
             self._failures = 0
+            self._blocks = 0
             await self._idle()
             return
 
         await self._register_and_verify(bindings)
         self._failures = 0
+        # Reset with the failure count, and for the same reason. Left to grow, it
+        # silences the repair card for every later block -- so a restart that blocked
+        # on its own leftover would go on to hide the day the resident's phone really
+        # does take the account, and the doorbell would just stop with no explanation.
+        self._blocks = 0
         self._set_state(
             SipState.REGISTERED,
             f"срок действия {self._state.granted_expires} с",
@@ -480,6 +503,9 @@ class LokiSipClient:
         started = time.monotonic()
 
         response = await self._register_once(expires=expires, reap=reap)
+        # From here on the account carries a binding of ours, whatever happens to the
+        # rest of this flow.
+        self._binding_live = True
 
         # The registrar tells us the address it actually sees. Behind a container
         # bridge the socket's own address is a private one the registrar can never
@@ -744,10 +770,16 @@ class LokiSipClient:
         """Take our binding back off the account, and nothing else."""
         if not self._state.contact_uri:
             return
+        # Through build_contacts rather than by hand: that is the one place the ban on
+        # a wildcard Contact is enforced, and a `*` with Expires: 0 would wipe every
+        # binding on the account -- the resident's phone along with ours.
+        contacts = self._state.build_contacts(live=None, reap=[self._state.contact_uri])
+        # Whatever happens next, we are no longer holding it on purpose. A failed
+        # withdrawal leaves the registrar to expire it, and a second attempt from the
+        # stop path would have nothing new to say.
+        self._binding_live = False
         with contextlib.suppress(SipError, OSError, TimeoutError):
-            await self._register_request(
-                contacts=[f"<{self._state.contact_uri}>;expires=0"], expires=0
-            )
+            await self._register_request(contacts=contacts, expires=0)
             _LOGGER.debug("Withdrew our own binding")
 
     def _gate(self, bindings: Sequence[Binding]) -> None:
@@ -819,6 +851,12 @@ class LokiSipClient:
         overlap.
         """
         async with self._request_lock:
+            # Checked after the lock, because that is where the wait happens: a refresh
+            # that queued behind a withdrawal must not go through once it gets its
+            # turn. Withdrawals themselves are exempt -- they are the one exchange a
+            # stopping client still has business making.
+            if self._stopping and expires != 0:
+                raise SipTransportError("клиент останавливается")
             return await self._register_exchange(contacts=contacts, expires=expires)
 
     async def _register_exchange(
@@ -922,6 +960,10 @@ class LokiSipClient:
         # The socket's own address is only a first guess -- behind a container bridge
         # the registrar sees a different one and tells us so via received/rport.
         self._state.set_contact(self._state.make_contact_uri(host, port))
+        # A new connection means a new Contact, and nothing registered at it yet. The
+        # binding the previous connection left is withdrawn by the next registration's
+        # reap list, not from here -- this one can only ever speak for its own address.
+        self._binding_live = False
         # A fresh connection is a fresh registration identity as far as digest is
         # concerned; keeping stale nonces would produce a replay on the first request.
         self._challenges.clear()

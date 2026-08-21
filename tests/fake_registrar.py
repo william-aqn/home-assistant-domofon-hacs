@@ -98,6 +98,7 @@ class FakeRegistrar:
         report_bindings: bool = True,
         rewrite_contact: bool = False,
         nat_port: int | None = 44444,
+        reply_delay: float = 0.0,
         echo_instance_id: bool = True,
     ) -> None:
         """Configure the policies that matter to the probe."""
@@ -108,6 +109,7 @@ class FakeRegistrar:
         # blind, so the probe has to detect it. This switch reproduces that.
         self.report_bindings = report_bindings
         self.rewrite_contact = rewrite_contact
+        self.reply_delay = reply_delay
         # The port the client appears to come from. A fixed one keeps tests that pin
         # the reported value readable; None models a real NAT, which hands out a
         # fresh port per connection -- and that is what makes a restart unable to
@@ -277,6 +279,11 @@ class FakeRegistrar:
                         # work on it, and the CSeq of a final response does not.
                         await self._replies.put(CRLF.join(rows))
                         continue
+                    # A registrar that does not answer instantly. Real ones do not,
+                    # and the gap between sending a REGISTER and hearing back is a
+                    # window a test otherwise cannot stand inside.
+                    if self.reply_delay:
+                        await asyncio.sleep(self.reply_delay)
                     writer.write(self._respond(rows).encode("latin-1"))
                     await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):

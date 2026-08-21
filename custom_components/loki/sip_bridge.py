@@ -322,8 +322,18 @@ class SipBridge:
 
     @callback
     def on_terminal(self, state: SipState, kind: str, detail: str) -> None:
-        """The client stopped for good; a person has to decide what happens next."""
-        _LOGGER.error("SIP остановлен окончательно (%s): %s", kind, detail)
+        """The client hit something a person may need to know about."""
+        if state is SipState.BLOCKED:
+            # Not "stopped for good" any more: the client goes on looking and takes
+            # the account up as soon as it is free. Saying otherwise in the log sends
+            # whoever reads it looking for a switch to flick.
+            _LOGGER.warning(
+                "SIP не регистрируется — аккаунт занят (%s): %s; проверю снова",
+                kind,
+                detail,
+            )
+        else:
+            _LOGGER.error("SIP остановлен окончательно (%s): %s", kind, detail)
         self._publish(state, detail)
         if state in LATCHED_ACROSS_RESTARTS:
             self.entry.async_create_task(

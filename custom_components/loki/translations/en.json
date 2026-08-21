@@ -181,7 +181,7 @@
     },
     "sip_terminal_blocked": {
       "title": "Loki: SIP not started — account “{title}” is in use",
-      "description": "Another device is already registered on the SIP account, almost certainly a phone running the operator's app. Loki did not register, because doing so could displace that binding and the intercom would stop ringing the phone with nothing to show for it.\n\nDetails: {detail}\n\n**What to do.** Get a separate phone number for Home Assistant and add it to the allowed numbers in the official app. Then switch “SIP” off and on again — that is the only way to clear this.\n\nIf you understand the risk and want to register anyway, turn off the strict check in the integration options."
+      "description": "Another device is already registered on the SIP account. Loki did not register, because doing so could displace that binding and the intercom would stop ringing the phone with nothing to show for it.\n\nDetails: {detail}\n\n**There is probably nothing to do.** Most often this is Loki's own binding from before a restart: it lives a few minutes and lapses by itself. Loki checks the account again and registers as soon as it is free — see `sensor.*_sip_status`, which also shows how long there is left to wait.\n\n**If this lasts more than ten minutes**, another device really is on the account, almost certainly a phone running the operator's app. Get a separate phone number for Home Assistant and add it to the allowed numbers in the official app.\n\nIf you understand the risk and want to register anyway, turn off the strict check in the integration options."
     },
     "sip_terminal_evicted": {
       "title": "Loki: SIP stopped — registering displaced another device",
