@@ -28,26 +28,47 @@ const BUNDLE = path.join(
 const defined = {};
 
 /** Enough of an element for the module to build its DOM without a browser. */
-const stubElement = () => ({
-  className: "",
-  style: {},
-  textContent: "",
-  hidden: false,
-  disabled: false,
-  classList: { add() {}, remove() {} },
-  append() {},
-  appendChild() {},
-  addEventListener() {},
-  setAttribute() {},
-  getAttribute() {
-    return null;
-  },
-  remove() {},
-  insertBefore() {},
-  children: [],
-});
+const stubElement = () => {
+  const attrs = {};
+  return {
+    className: "",
+    style: {},
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    classList: { add() {}, remove() {}, toggle() {} },
+    append() {},
+    appendChild() {},
+    addEventListener() {},
+    removeEventListener() {},
+    // Attributes are remembered rather than dropped: the picture's src is one, and
+    // whether it survives a state update is a thing worth checking.
+    setAttribute(name, value) {
+      attrs[name] = String(value);
+    },
+    getAttribute(name) {
+      return name in attrs ? attrs[name] : null;
+    },
+    removeAttribute(name) {
+      delete attrs[name];
+    },
+    remove() {},
+    insertBefore() {},
+    children: [],
+    // The icon inside a button; the cards swap its `icon` attribute.
+    firstChild: { setAttribute() {} },
+  };
+};
 
 global.window = global;
+// A refresh timer must not hold the process open once the checks are done. Node keeps
+// running while one is pending; a browser simply throws the page away.
+const realSetInterval = global.setInterval;
+global.setInterval = (fn, ms) => {
+  const handle = realSetInterval(fn, ms);
+  if (handle && handle.unref) handle.unref();
+  return handle;
+};
 global.customElements = {
   define: (name, cls) => {
     // Throws exactly like a browser does, which is the point: the bundle may be
@@ -190,6 +211,41 @@ check(
   "wall card offers a multi-entity list",
   Boolean(camerasField && camerasField.selector.entity.multiple === true)
 );
+
+// A frame somebody asked for has to survive the next state update. `setHass` runs an
+// unforced refresh and Home Assistant pushes state constantly, so a stamp recomputed
+// on every call put the pre-capture URL back within about a second -- and the browser
+// served that one from cache. The captured frame flashed up and vanished.
+{
+  const hass = {
+    states: {
+      "camera.x": {
+        state: "idle",
+        attributes: { friendly_name: "Дверь", entity_picture: "/api/camera_proxy/x?t=1" },
+      },
+    },
+    entities: {
+      "camera.x": { device_id: "dev", platform: "loki" },
+      "button.x": { device_id: "dev", platform: "loki" },
+    },
+    devices: { dev: { identifiers: [["loki", "1"]], name: "Дверь" } },
+    panels: {},
+  };
+  const card = new defined["loki-door-card"]();
+  card.setConfig({ camera: "camera.x" });
+  card.hass = hass;
+  const media = card._media;
+  const bucketed = media._img.getAttribute("src");
+  media.reload();
+  const forced = media._img.getAttribute("src");
+  // What Home Assistant does, over and over, for reasons that have nothing to do
+  // with this camera.
+  for (let i = 0; i < 5; i++) card.hass = hass;
+  const after = media._img.getAttribute("src");
+  check("the capture button changes the picture URL", Boolean(forced) && bucketed !== forced);
+  check("a captured frame survives the state updates that follow", forced === after);
+  media.destroy();
+}
 
 // Every class that lays itself out with flex or grid must also say what [hidden] means
 // for it. The cards live in the light DOM, where a blanket `[hidden] { display: none }`

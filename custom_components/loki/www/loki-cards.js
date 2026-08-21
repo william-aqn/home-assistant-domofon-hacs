@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.3.0";
+const CARD_VERSION = "1.3.2";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -282,6 +282,10 @@ class DoorMedia {
     this._camera = null;
     this._token = 0;
     this._timer = null;
+    // The cache-busting stamp currently on the picture's URL, and the refresh bucket
+    // it belongs to. Held rather than recomputed per call: see _refreshStill.
+    this._stamp = 0;
+    this._bucket = -1;
 
     this._img = document.createElement("img");
     this._img.className = "loki-still";
@@ -412,13 +416,22 @@ class DoorMedia {
     //
     // The unforced stamp is bucketed, so the periodic tick asks for the same URL until
     // the bucket rolls over and the browser can serve it from cache. A forced refresh
-    // is unique, so it always goes to Home Assistant. What comes back is at most ten
-    // seconds old: the camera entity caches that long on purpose, which is what keeps
-    // twenty-one tiles from hammering the operator's API.
-    const stamp = force
-      ? Date.now()
-      : Math.floor(Date.now() / (STILL_REFRESH * 1000));
-    const src = `${picture}${picture.includes("?") ? "&" : "?"}_=${stamp}`;
+    // is unique, so it always goes to Home Assistant.
+    //
+    // The stamp is then KEPT until the bucket rolls over, and this is the whole point:
+    // setHass runs an unforced refresh, Home Assistant pushes state constantly, and
+    // recomputing the bucketed stamp would put the pre-capture URL back within about a
+    // second -- straight out of the browser cache, and the frame somebody had just
+    // asked for would flash up and vanish. Which is exactly what it did.
+    const bucket = Math.floor(Date.now() / (STILL_REFRESH * 1000));
+    if (force) {
+      this._stamp = Date.now();
+      this._bucket = bucket;
+    } else if (bucket !== this._bucket) {
+      this._stamp = bucket;
+      this._bucket = bucket;
+    }
+    const src = `${picture}${picture.includes("?") ? "&" : "?"}_=${this._stamp}`;
     if (this._img.getAttribute("src") !== src) this._img.setAttribute("src", src);
   }
 
