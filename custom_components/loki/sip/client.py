@@ -167,14 +167,16 @@ class SipSnapshot:
         if not self.foreign:
             return None
         mine = {host for host in (self.received, _host_only(self.local)) if host}
-        if not mine:
-            return FOREIGN_UNKNOWN
         for binding in self.foreign:
             parsed = parse_uri(binding.uri)
             if parsed is None or parsed.host not in mine:
                 continue
             return FOREIGN_PUBLIC if parsed.host == self.received else FOREIGN_LOCAL
-        return FOREIGN_ELSEWHERE
+        # "Somewhere else" is only worth saying when we know where *we* are. Without
+        # `received` the registrar has not told us the address it sees us at, and a
+        # leftover of our own at that address would land here looking like a stranger
+        # -- which is the one mistake this property exists to prevent.
+        return FOREIGN_ELSEWHERE if self.received else FOREIGN_UNKNOWN
 
     @property
     def foreign_expires_in(self) -> int | None:
