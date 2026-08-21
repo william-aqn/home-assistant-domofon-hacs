@@ -391,7 +391,17 @@ class LokiClient:
         # Serialised here rather than handed to aiohttp's ``json=`` so the exact bytes
         # are known. An empty body is meaningful: it is how the device list endpoint is
         # asked for doors and cameras at once.
-        payload = b"" if body is None else json.dumps(body).encode()
+        #
+        # ensure_ascii=False matches the official client, which writes the body through
+        # a writer using the platform charset and so puts raw UTF-8 on the wire rather
+        # than \uXXXX escapes. It makes no difference to a phone number, but the device
+        # lookup by SIP name carries a Cyrillic display name, and that is the one call
+        # where being byte-identical to a client known to work is worth having.
+        payload = (
+            b""
+            if body is None
+            else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        )
 
         try:
             async with self._session.post(
@@ -399,9 +409,12 @@ class LokiClient:
                 headers=headers,
                 data=payload,
                 timeout=_TIMEOUT,
-                # The endpoint set is fixed and no legitimate redirect exists. A
-                # captive portal would otherwise turn every call into a bodyless GET
-                # answered with an opaque 200.
+                # A deliberate difference from the official client, which leaves
+                # redirects on. Java's HttpURLConnection does not re-POST on a 302
+                # anyway -- it follows with a bodyless GET -- so following buys no
+                # working behaviour, while it would send the bearer token to whatever
+                # host the redirect names. The endpoint set is fixed; there is no
+                # legitimate redirect to follow.
                 allow_redirects=False,
             ) as response:
                 text = await response.text()
