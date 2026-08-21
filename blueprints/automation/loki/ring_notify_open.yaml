@@ -75,6 +75,7 @@ actions:
 
       device_id: "{{ trigger.event.data.device_id }}"
       device_name: "{{ trigger.event.data.device_name }}"
+      call_id: "{{ trigger.event.data.call_id }}"
       # entity_id is null when the door has no camera, or its camera entity is
       # disabled. Normalise to '' so the checks below are simple.
       camera_entity: "{{ trigger.event.data.entity_id | default('', true) }}"
@@ -84,18 +85,23 @@ actions:
       # the door twice.
       action_open: "LOKI_OPEN_{{ context.id }}"
 
+      # The notification tag is per door. A second ring at the same door should
+      # replace the first notification, which is what one shared tag gives -- but a
+      # tag shared across *different* doors would make one door's ring wipe another's.
+      tag_door: "{{ tag_in }}_{{ device_id }}"
+
       # Built as a whole: an empty `image` breaks attachment loading on Android, so
       # the key is either present and valid or absent entirely.
       notify_data: >-
         {% set acts = [{'action': action_open, 'title': open_title}] %}
         {% if camera_entity %}
-        {{ {'tag': tag_in, 'channel': channel_in, 'importance': 'high',
+        {{ {'tag': tag_door, 'channel': channel_in, 'importance': 'high',
             'ttl': 0, 'priority': 'high', 'actions': acts,
             'push': {'interruption-level': 'time-sensitive'},
             'image': '/api/camera_proxy/' ~ camera_entity,
             'entity_id': camera_entity} }}
         {% else %}
-        {{ {'tag': tag_in, 'channel': channel_in, 'importance': 'high',
+        {{ {'tag': tag_door, 'channel': channel_in, 'importance': 'high',
             'ttl': 0, 'priority': 'high', 'actions': acts,
             'push': {'interruption-level': 'time-sensitive'}} }}
         {% endif %}
@@ -108,42 +114,70 @@ actions:
     message: "{{ device_name }}"
     data: "{{ notify_data }}"
 
-  - alias: Ждать нажатия кнопки «Открыть»
+  - alias: Ждать нажатия кнопки «Открыть» или конца этого вызова
     wait_for_trigger:
       # Templates in event_data are supported here since HA 2021.3 and are rendered
       # when the trigger is attached, against this run's variables.
       - trigger: event
+        id: open
         event_type: mobile_app_notification_action
         event_data:
           action: "{{ action_open }}"
+      # Watching for the end of *this* call, matched on call_id, is what lets the run
+      # finish the moment the caller gives up instead of idling for the whole timeout
+      # -- and, more importantly, what tells a superseded run to keep its hands off a
+      # notification that now belongs to a newer ring at the same door.
+      - trigger: event
+        id: ended
+        event_type: loki_event
+        event_data:
+          type: call_ended
+          call_id: "{{ call_id }}"
     timeout: !input wait_timeout
     continue_on_timeout: true
 
-  - alias: Открыть дверь, если нажали кнопку
-    if:
-      - condition: template
-        value_template: "{{ wait.completed }}"
-    then:
-      - action: loki.open_door
-        data:
-          device_id: "{{ device_id }}"
-      - alias: Завершить вызов — дверь открыта, держать его больше незачем
-        # Also releases the SIP branch. Sitting on 180 Ringing after the door has
-        # opened keeps a forking proxy from delivering the other branches' final
-        # responses, so the resident's phone would go on ringing for no reason.
-        action: loki.hangup
-        data:
-          device_id: "{{ device_id }}"
-      - alias: Убрать уведомление — кнопка уже нажата
+  - choose:
+      - alias: Нажали «Открыть»
+        conditions:
+          - condition: template
+            value_template: "{{ wait.trigger is defined and wait.trigger.id == 'open' }}"
+        sequence:
+          # continue_on_error on both: a refused open must not abandon the rest of the
+          # run. Without it the branch stays on 180 Ringing and the notification hangs
+          # on the phone -- the two things this sequence exists to prevent.
+          - action: loki.open_door
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Завершить вызов — дверь открыта, держать его больше незачем
+            # Also releases the SIP branch. Sitting on 180 Ringing after the door has
+            # opened keeps a forking proxy from delivering the other branches' final
+            # responses, so the resident's phone would go on ringing for no reason.
+            action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Убрать уведомление — кнопка уже нажата
+            domain: mobile_app
+            type: notify
+            device_id: !input notify_device
+            message: clear_notification
+            data: "{{ {'tag': tag_door} }}"
+
+      - alias: Звонок вытеснен новым звонком в ту же дверь
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is defined and wait.trigger.id == 'ended'
+                 and wait.trigger.event.data.reason == 'superseded' }}
+        # Nothing. The notification carrying this door's tag is the newer ring's now,
+        # and clearing it here would wipe a call still in progress.
+        sequence: []
+
+    default:
+      - alias: Убрать «висящее» уведомление — вызов окончен или истёк таймаут
         domain: mobile_app
         type: notify
         device_id: !input notify_device
         message: clear_notification
-        data: "{{ {'tag': tag_in} }}"
-    else:
-      - alias: Убрать «висящее» уведомление после таймаута
-        domain: mobile_app
-        type: notify
-        device_id: !input notify_device
-        message: clear_notification
-        data: "{{ {'tag': tag_in} }}"
+        data: "{{ {'tag': tag_door} }}"

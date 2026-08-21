@@ -274,7 +274,20 @@ class LokiClient:
         if not isinstance(response, dict):
             return None
         devices = parse_device_list(response)
-        return devices[0] if devices else None
+        if len(devices) == 1:
+            return devices[0]
+        if devices:
+            # More than one match is not a menu to pick from: the list comes back
+            # sorted by name, so taking the first would answer with whichever door
+            # sorts earliest rather than with the one that is calling. Nothing here
+            # can tell them apart, and the answer decides which door a notification
+            # opens -- so this refuses rather than guesses.
+            _LOGGER.warning(
+                "Резолв двери по SIP URI вернул несколько устройств (%d); "
+                "выбирать наугад нельзя",
+                len(devices),
+            )
+        return None
 
     # -- actions --------------------------------------------------------------
 

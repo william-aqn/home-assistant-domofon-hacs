@@ -88,12 +88,38 @@ def name_addr(raw: str) -> str:
 
     In the bracket-less form every parameter is a header parameter (RFC 3261 §20.10
     requires angle brackets to carry URI parameters), so the first one ends the value.
+
+    The closing bracket is found with the quote-aware scanner rather than with a
+    plain search: a display name is a quoted string and may contain anything,
+    including ">". Truncating there would hand the backend a mangled value and
+    that door would never resolve.
     """
     text = raw.strip()
-    if ">" in text:
-        return text[: text.index(">") + 1].strip()
+    end = _closing_bracket(text)
+    if end is not None:
+        return text[: end + 1].strip()
     pieces = split_semis(text)
     return pieces[0] if pieces else text
+
+
+def _closing_bracket(text: str) -> int | None:
+    """Index of the name-addr's closing ``>``, ignoring quoted ones."""
+    in_quotes = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_quotes:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_quotes = False
+            continue
+        if char == '"':
+            in_quotes = True
+        elif char == ">":
+            return index
+    return None
 
 
 @dataclass(frozen=True, slots=True)

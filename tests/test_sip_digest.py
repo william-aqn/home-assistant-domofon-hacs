@@ -254,3 +254,14 @@ def test_name_addr_keeps_a_semicolon_inside_the_display_name() -> None:
 def test_name_addr_on_a_bracketless_uri_strips_header_parameters() -> None:
     """Without angle brackets every parameter is a header one (RFC 3261 §20.10)."""
     assert name_addr("sip:1001@example;tag=abc") == "sip:1001@example"
+
+
+def test_name_addr_ignores_an_angle_bracket_inside_the_display_name() -> None:
+    """A quoted display name may contain anything, and truncating there is fatal.
+
+    The value goes straight to the backend door lookup, so a door whose name carries
+    a ">" would be handed a mangled string and could never resolve -- meaning that
+    door would never ring in Home Assistant.
+    """
+    raw = '"Вход -> двор" <sip:1001@example>;tag=zz'
+    assert name_addr(raw) == '"Вход -> двор" <sip:1001@example>'

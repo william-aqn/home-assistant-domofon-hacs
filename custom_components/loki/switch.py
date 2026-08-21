@@ -51,8 +51,14 @@ class LokiSipSwitch(LokiAccountEntity, SwitchEntity):
 
     @property
     def available(self) -> bool:
-        """False for an account the operator never issued SIP credentials for."""
-        return super().available and self._bridge.available
+        """False only for an account with no SIP credentials at all.
+
+        Deliberately not `super().available`, which follows the device-list
+        poller. SIP runs on its own connection to a different host, so a cloud
+        API blip says nothing about it -- and greying out the one-tap rollback
+        exactly when things are going wrong is the opposite of what it is for.
+        """
+        return self._bridge.available
 
     @property
     def is_on(self) -> bool:

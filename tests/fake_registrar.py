@@ -145,35 +145,73 @@ class FakeRegistrar:
             self.server.close()
             await self.server.wait_closed()
 
-    async def send_invite(self, *, timeout: float = 5.0) -> list[str]:
+    async def send_invite(
+        self,
+        *,
+        timeout: float = 5.0,
+        call_id: str = "invite-call-1",
+        branch: str = "z9hG4bKinvite1",
+        from_tag: str = "callertag",
+        display: str = "Дверь",
+        cseq: int = 1,
+        reset: bool = True,
+    ) -> list[str]:
         """Push an INVITE down a live connection and collect what comes back.
 
         Real registrars deliver an inbound call over the same connection the client
         registered on, which is what makes this integration work without a port
         forward. Reproducing that is the only way to test the client's answer.
-        """
-        if self._writer is None:
-            raise RuntimeError("no client connected")
 
-        self._replies = asyncio.Queue()
-        invite = CRLF.join(
+        The call is parametrised because one door ringing is not the interesting
+        case: two branches in flight at once is where a final response can go out on
+        the wrong one.
+        """
+        await self._deliver(
             [
                 "INVITE sip:1009999@fake SIP/2.0",
-                "Via: SIP/2.0/TCP fake:5060;branch=z9hG4bKinvite1",
+                f"Via: SIP/2.0/TCP fake:5060;branch={branch}",
                 "Max-Forwards: 70",
-                'From: "Дверь" <sip:1001@fake>;tag=callertag',
+                f'From: "{display}" <sip:1001@fake>;tag={from_tag}',
                 "To: <sip:1009999@fake>",
-                "Call-ID: invite-call-1",
-                "CSeq: 1 INVITE",
+                f"Call-ID: {call_id}",
+                f"CSeq: {cseq} INVITE",
                 "Contact: <sip:1001@fake:5060>",
-                "Content-Length: 0",
-                "",
-                "",
-            ]
+            ],
+            reset=reset,
         )
-        self._writer.write(invite.encode("utf-8"))
-        await self._writer.drain()
+        return await self.collect(timeout)
 
+    async def send_cancel(
+        self,
+        *,
+        timeout: float = 5.0,
+        call_id: str = "invite-call-1",
+        branch: str = "z9hG4bKinvite1",
+        from_tag: str = "callertag",
+        cseq: int = 1,
+        reset: bool = True,
+    ) -> list[str]:
+        """Cancel an INVITE, the way a caller who gave up does.
+
+        The CANCEL deliberately reuses the INVITE's branch (RFC 3261 §9.1) -- that is
+        how it names the transaction it ends.
+        """
+        await self._deliver(
+            [
+                "CANCEL sip:1009999@fake SIP/2.0",
+                f"Via: SIP/2.0/TCP fake:5060;branch={branch}",
+                "Max-Forwards: 70",
+                f'From: "Дверь" <sip:1001@fake>;tag={from_tag}',
+                "To: <sip:1009999@fake>",
+                f"Call-ID: {call_id}",
+                f"CSeq: {cseq} CANCEL",
+            ],
+            reset=reset,
+        )
+        return await self.collect(timeout)
+
+    async def collect(self, timeout: float = 5.0) -> list[str]:
+        """Everything the client sent back, until it goes quiet."""
         replies: list[str] = []
         try:
             async with asyncio.timeout(timeout):
@@ -182,6 +220,17 @@ class FakeRegistrar:
         except TimeoutError:
             pass
         return replies
+
+    async def _deliver(self, rows: list[str], *, reset: bool) -> None:
+        """Write one request down the client's own connection."""
+        if self._writer is None:
+            raise RuntimeError("no client connected")
+        if reset:
+            self._replies = asyncio.Queue()
+        self._writer.write(
+            CRLF.join([*rows, "Content-Length: 0", "", ""]).encode("utf-8")
+        )
+        await self._writer.drain()
 
     def drop_connection(self) -> None:
         """Close the client's connection, as a registrar reclaiming an idle one does."""
@@ -209,8 +258,10 @@ class FakeRegistrar:
                         self.pings += 1
                         continue
                     if rows[0].startswith("SIP/2.0"):
-                        # A reply to something we sent, not a request to serve.
-                        await self._replies.put(rows[0])
+                        # A reply to something we sent, not a request to serve. The
+                        # whole message is kept: assertions on the status line still
+                        # work on it, and the CSeq of a final response does not.
+                        await self._replies.put(CRLF.join(rows))
                         continue
                     writer.write(self._respond(rows).encode("latin-1"))
                     await writer.drain()

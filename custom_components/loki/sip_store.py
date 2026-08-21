@@ -51,6 +51,38 @@ MAX_RESOLVED = 64
 CONTACT_TTL = 600.0
 MAX_CONTACTS = 4
 
+# Rewriting the store on every registration refresh would be wasteful, and never
+# rewriting it lets the stamp go stale under a long-held registration. Refresh
+# when a third of the lifetime has gone.
+CONTACT_REFRESH_AFTER = CONTACT_TTL / 3
+
+
+def _parse_contacts(raw: Any, legacy_at: Any) -> list[tuple[str, float]]:
+    """Parse stored Contact URIs, tolerating every shape this file has held.
+
+    The current shape is ``[{"uri": ..., "at": ...}]``. An earlier one was a bare list
+    of strings with a single ``contacts_at`` for all of them, and a store written by
+    that version must still be readable -- otherwise the upgrade silently drops the
+    URIs, the client stops recognising its own leftover binding, and it blocks itself
+    out of its own account. That is not hypothetical: it is what this parser was
+    changed for, and it happened on the first restart after the change.
+    """
+    if not isinstance(raw, list):
+        return []
+    inherited = float(legacy_at) if isinstance(legacy_at, (int, float)) else 0.0
+    out: list[tuple[str, float]] = []
+    for item in raw:
+        if isinstance(item, str):
+            if item:
+                out.append((item, inherited))
+            continue
+        if not isinstance(item, dict):
+            continue
+        uri, at = item.get("uri"), item.get("at")
+        if isinstance(uri, str) and uri and isinstance(at, (int, float)):
+            out.append((uri, float(at)))
+    return out[-MAX_CONTACTS:]
+
 
 @dataclass
 class SipStoredState:
@@ -65,12 +97,16 @@ class SipStoredState:
     terminal_detail: str | None = None
     # SIP remote URI -> Loki device id, as answered by the backend.
     resolved: dict[str, int] = field(default_factory=dict)
-    # Contact URIs a previous process registered with, and when they were written.
-    # Without these a restart cannot recognise its own leftover binding -- the source
-    # port changes with the connection and this registrar does not echo
+    # Contact URIs a previous process registered with, each with its own wall-clock
+    # stamp. Without these a restart cannot recognise its own leftover binding --
+    # the source port changes with the connection and this registrar does not echo
     # ``+sip.instance`` -- so the client blocks itself out of its own account.
-    contacts: list[str] = field(default_factory=list)
-    contacts_at: float = 0.0
+    #
+    # Per entry and not one stamp for the list: a shared stamp makes recording a
+    # new URI vouch for three older ones, and a NAT port that has since been handed
+    # to the resident's phone would then be withdrawn as though it were ours --
+    # the precise harm this whole design exists to prevent.
+    contacts: list[tuple[str, float]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise for the store."""
@@ -80,8 +116,7 @@ class SipStoredState:
             "terminal": self.terminal,
             "terminal_detail": self.terminal_detail,
             "resolved": self.resolved,
-            "contacts": self.contacts,
-            "contacts_at": self.contacts_at,
+            "contacts": [{"uri": uri, "at": at} for uri, at in self.contacts],
         }
 
     @classmethod
@@ -100,7 +135,13 @@ class SipStoredState:
         resolved: dict[str, int] = {}
         if isinstance(resolved_raw, dict):
             for key, value in resolved_raw.items():
-                if isinstance(key, str) and isinstance(value, int):
+                # `isinstance(True, int)` is True in Python, and a door id of
+                # True would resolve a ring to whatever device 1 happens to be.
+                if (
+                    isinstance(key, str)
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                ):
                     resolved[key] = value
 
         return cls(
@@ -119,43 +160,50 @@ class SipStoredState:
                 else None
             ),
             resolved=resolved,
-            contacts=[
-                item for item in (raw.get("contacts") or []) if isinstance(item, str)
-            ],
-            contacts_at=(
-                float(raw["contacts_at"])
-                if isinstance(raw.get("contacts_at"), (int, float))
-                else 0.0
-            ),
+            contacts=_parse_contacts(raw.get("contacts"), raw.get("contacts_at")),
         )
 
     def fresh_contacts(self) -> list[str]:
-        """Remembered Contact URIs, unless they are too old to still be ours."""
-        if not self.contacts or time.time() - self.contacts_at > CONTACT_TTL:
-            return []
-        return list(self.contacts)
+        """Remembered Contact URIs still young enough to be ours.
+
+        Both ends of the interval are checked. A stamp in the future -- a clock
+        correction, a restore from a backup taken on another machine -- would
+        otherwise be trusted forever, and the whole point of the TTL is that a
+        NAT port handed to another device is never claimed as our own.
+        """
+        now = time.time()
+        return [uri for uri, at in self.contacts if 0 <= now - at <= CONTACT_TTL]
 
     def record_contact(self, uri: str) -> bool:
-        """Remember a Contact URI we hold a binding at. False if nothing changed."""
-        stamped = time.time()
-        if self.contacts and self.contacts[-1] == uri:
-            # Same URI, but the clock moved: the refresh keeps it trustworthy.
-            self.contacts_at = stamped
-            return False
-        self.contacts = [*self.contacts, uri][-MAX_CONTACTS:]
-        self.contacts_at = stamped
+        """Remember a Contact URI we hold a binding at.
+
+        Returns whether the change is worth a disk write: a new URI always is,
+        and a re-stamp of the current one is once its age approaches the TTL.
+        """
+        now = time.time()
+        if self.contacts and self.contacts[-1][0] == uri:
+            if now - self.contacts[-1][1] < CONTACT_REFRESH_AFTER:
+                return False
+            self.contacts[-1] = (uri, now)
+            return True
+        self.contacts = [*self.contacts, (uri, now)][-MAX_CONTACTS:]
         return True
 
     def remember(self, remote_uri: str, device_id: int) -> bool:
-        """Record which door a SIP URI belongs to. False if nothing changed."""
-        if self.resolved.get(remote_uri) == device_id:
-            return False
+        """Record which door a SIP URI belongs to. False if nothing needs saving.
+
+        The entry is re-inserted at the end even when the mapping is unchanged, so
+        eviction is by least recent use rather than by first sighting -- the door that
+        rings every day is precisely the one that must not be dropped in favour of one
+        seen once. That reordering alone is not worth a disk write; the next real
+        change serialises the whole dict in its current order anyway.
+        """
+        unchanged = self.resolved.get(remote_uri) == device_id
+        self.resolved.pop(remote_uri, None)
         self.resolved[remote_uri] = device_id
-        # Oldest first: dicts keep insertion order, so this drops the URIs that have
-        # gone longest without being re-resolved.
         while len(self.resolved) > MAX_RESOLVED:
             self.resolved.pop(next(iter(self.resolved)))
-        return True
+        return not unchanged
 
 
 class SipStore:

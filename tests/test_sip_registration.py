@@ -523,3 +523,104 @@ async def test_a_restart_carrying_its_old_contact_reclaims_the_binding() -> None
     # created the new one, so our own restarts cannot fill the account's table.
     assert len(registrar.bindings) == 1
     assert registrar.bindings[0].uri != previous
+
+
+# ----------------------------------------------- final responses on the right branch
+
+
+def _cseq_of(message: str) -> str:
+    """The CSeq value of a rendered SIP message."""
+    for row in message.split("\r\n"):
+        if row.lower().startswith("cseq:"):
+            return row.split(":", 1)[1].strip()
+    return ""
+
+
+def _header_of(message: str, name: str) -> str:
+    """One header value of a rendered SIP message."""
+    for row in message.split("\r\n"):
+        if row.lower().startswith(f"{name}:"):
+            return row.split(":", 1)[1].strip()
+    return ""
+
+
+async def _registered(registrar: WireTap, recorder: Recorder):
+    """Start a registered client and hand it back, still running."""
+    port = await registrar.start()
+    client = LokiSipClient(_config(port), recorder)
+    task = asyncio.create_task(client.async_run())
+    async with asyncio.timeout(20):
+        while client.state is not SipState.REGISTERED:
+            await asyncio.sleep(0.02)
+    return client, task
+
+
+@pytest.mark.asyncio
+async def test_the_487_answering_a_cancel_carries_the_invites_cseq() -> None:
+    """RFC 3261 §9.2. Built from the CANCEL it would say "1 CANCEL" and match nothing.
+
+    A proxy matches a response to a transaction by CSeq method as well as by branch,
+    so a 487 carrying the CANCEL's method leaves our branch looking unanswered -- and
+    an unanswered branch is what stops the resident's phone from being able to
+    decline.
+    """
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    client, task = await _registered(registrar, recorder)
+    try:
+        await registrar.send_invite(timeout=1.0, cseq=7)
+        replies = await registrar.send_cancel(timeout=1.5, cseq=8)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    ok = [r for r in replies if r.startswith("SIP/2.0 200")]
+    terminated = [r for r in replies if r.startswith("SIP/2.0 487")]
+    assert ok, replies
+    assert terminated, replies
+    # The 200 acknowledges the CANCEL and echoes its own CSeq...
+    assert _cseq_of(ok[0]) == "8 CANCEL", ok[0]
+    # ...while the 487 ends the INVITE and must echo the INVITE's.
+    assert _cseq_of(terminated[0]) == "7 INVITE", terminated[0]
+
+
+@pytest.mark.asyncio
+async def test_ending_one_call_declines_that_call_and_not_the_other() -> None:
+    """Two doors ringing at once: a final response must not land on the wrong branch.
+
+    The final used to be built from whichever INVITE arrived most recently, so ending
+    the first call sent a 486 down the second branch -- killing a call Home Assistant
+    still showed as ringing, and leaving the first branch unresolved forever.
+    """
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    client, task = await _registered(registrar, recorder)
+    try:
+        await registrar.send_invite(
+            timeout=1.0, call_id="call-A", branch="z9hG4bKaaa", from_tag="tagA", cseq=11
+        )
+        await registrar.send_invite(
+            timeout=1.0, call_id="call-B", branch="z9hG4bKbbb", from_tag="tagB", cseq=22
+        )
+        assert [c[0] for c in recorder.calls] == ["call-A", "call-B"]
+
+        ended = await client.async_end_call("call-A", "hangup")
+        assert ended is True
+        replies = await registrar.collect(timeout=1.5)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    finals = [r for r in replies if r.startswith("SIP/2.0 486")]
+    assert len(finals) == 1, replies
+    final = finals[0]
+    assert _header_of(final, "call-id") == "call-A", final
+    assert _cseq_of(final) == "11 INVITE", final
+    assert "z9hG4bKaaa" in _header_of(final, "via"), final
+    assert "z9hG4bKbbb" not in final, final
+    # Home Assistant heard about exactly the call it ended.
+    assert [e[0] for e in recorder.ended] == ["call-A"], recorder.ended

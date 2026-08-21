@@ -23,6 +23,13 @@ from .messages import SipMessage
 # (RFC 3261 Timer H is 64*T1 = 32 s), short enough not to grow without bound.
 COMPLETED_TTL = 40.0
 
+# A transaction that never got a final response looks impossible -- the branch
+# deadline guarantees one inside 115 s. It becomes possible when that deadline task
+# is cancelled without firing, which is exactly what a reconnect does. Without this
+# the table would hold such a transaction, and its Call-ID, for the life of the
+# process.
+UNANSWERED_TTL = 300.0
+
 
 def transaction_key(message: SipMessage) -> tuple[str, str, str]:
     """Identify the transaction a request belongs to (RFC 3261 §17.2.3).
@@ -50,6 +57,11 @@ class InviteTransaction:
 
     call_id: str
     remote_uri: str
+    # The INVITE this transaction answers. Every final response must be built from
+    # it and from nothing else: a 487 built from the CANCEL carries "CSeq: n
+    # CANCEL" instead of "n INVITE" (RFC 3261 §9.2), and a 486 built from "the
+    # last INVITE seen" goes out on whichever branch arrived most recently.
+    request: SipMessage
     to_tag: str = field(default_factory=lambda: secrets.token_hex(4))
     created: float = field(default_factory=time.monotonic)
     final_sent: bool = False
@@ -92,11 +104,17 @@ class TransactionTable:
         return [item for item in self._live.values() if not item.final_sent]
 
     def prune(self) -> None:
-        """Forget completed transactions once retransmissions can no longer arrive."""
+        """Forget transactions that can no longer matter.
+
+        Completed ones once retransmissions can no longer arrive, and
+        unanswered ones once they have outlived any plausible call -- a
+        reconnect cancels branch deadlines without firing them, so
+        "unanswered" is not the impossible state it looks like.
+        """
         stale = [
             key
             for key, item in self._live.items()
-            if item.final_sent and item.age > COMPLETED_TTL
+            if item.age > (COMPLETED_TTL if item.final_sent else UNANSWERED_TTL)
         ]
         for key in stale:
             transaction = self._live.pop(key)

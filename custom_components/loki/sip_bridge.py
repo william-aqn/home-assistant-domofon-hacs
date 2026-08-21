@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-import contextlib
 import logging
 from typing import Any
 
@@ -194,7 +193,10 @@ class SipBridge:
         # attempt would otherwise sit there contradicting the sensor.
         async_clear_sip_terminal(self.hass, self.entry.entry_id)
         # Subscribed only while the client runs: this is the path by which a hangup or
-        # an opened door releases our SIP branch.
+        # an opened door releases our SIP branch. Released first because a client
+        # that ended on its own leaves `running` False with the previous
+        # subscription still live, and a second one would decline every branch twice.
+        self._unsubscribe_calls()
         self._unsub_calls = async_dispatcher_connect(
             self.hass, signal_call_update(self.entry.entry_id), self._on_call_update
         )
@@ -204,25 +206,41 @@ class SipBridge:
 
     async def async_stop(self) -> None:
         """Stop the client and release everything it holds."""
-        if self._unsub_calls is not None:
-            self._unsub_calls()
-            self._unsub_calls = None
+        self._unsubscribe_calls()
 
         client, self._client = self._client, None
         task, self._task = self._task, None
 
-        if client is not None:
-            await client.async_stop()
-        if task is not None:
-            task.cancel()
-            # Cancelled is the normal path here; anything else already reached the log
-            # from _run, and neither may stop an unload.
-            with contextlib.suppress(Exception):
-                await task
+        try:
+            if client is not None:
+                await client.async_stop()
+            if task is not None:
+                task.cancel()
+                # gather(return_exceptions=True) and not contextlib.suppress:
+                # _run re-raises CancelledError, which derives from
+                # BaseException, so suppress(Exception) would let it escape and
+                # abandon everything below -- including the platform unload of
+                # the caller. gather absorbs the task's cancellation while still
+                # propagating our own if somebody cancels us.
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            # A call we announced is over as far as Home Assistant is concerned:
+            # the socket carrying it is gone. Leaving it would pin the door's
+            # sensor on until CALL_TIMEOUT with nothing behind it.
+            for call_id, device_id in list(self._active.items()):
+                self._calls.async_end_call(
+                    device_id, reason="sip_stopped", call_id=call_id
+                )
+            self._active.clear()
+            if self.state is not SipState.DISABLED and not self._store.state.terminal:
+                self._publish(SipState.DISABLED, None)
 
-        self._active.clear()
-        if self.state is not SipState.DISABLED and not self._store.state.terminal:
-            self._publish(SipState.DISABLED, None)
+    @callback
+    def _unsubscribe_calls(self) -> None:
+        """Drop the dispatcher subscription, if we hold one."""
+        if self._unsub_calls is not None:
+            self._unsub_calls()
+            self._unsub_calls = None
 
     async def _run(self) -> None:
         """Run the client, surviving anything it throws."""
@@ -247,10 +265,21 @@ class SipBridge:
             )
 
     async def _async_record_registration(self) -> None:
-        """Persist what a restart will need to recognise this registration."""
-        await self._store.async_mark_registered()
+        """Persist what a restart will need to recognise this registration.
+
+        Runs on every renewal, not only on the first REGISTERED, because the
+        stored contact carries a timestamp and a stale one is discarded. With a
+        single write at start-up, any restart after CONTACT_TTL of uptime threw
+        the URI away and the client blocked itself out of its own account --
+        which is every real restart, and no test session short enough to notice.
+
+        The contact is written before the baseline flag: the reverse order can
+        persist "baseline already paid" without the URI that makes the next
+        start safe, if the task is cancelled between the two.
+        """
         if self._client is not None and (uri := self._client.contact_uri):
             await self._store.async_record_contact(uri)
+        await self._store.async_mark_registered()
 
     @callback
     def on_snapshot(self, snapshot: SipSnapshot) -> None:

@@ -47,6 +47,17 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
         self._bridge = bridge
         self._attr_unique_id = f"{self._entry_id}_sip_status"
 
+    @property
+    def available(self) -> bool:
+        """Always: this reports the SIP client, not the device-list poller.
+
+        The two run against different hosts on different connections, so a failed
+        cloud poll says nothing about SIP. Inheriting the coordinator's availability
+        would blank this sensor exactly when somebody is trying to work out what is
+        wrong.
+        """
+        return True
+
     async def async_added_to_hass(self) -> None:
         """Follow the bridge as well as the coordinator."""
         await super().async_added_to_hass()

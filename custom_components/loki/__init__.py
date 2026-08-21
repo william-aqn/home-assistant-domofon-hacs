@@ -17,7 +17,7 @@ from .call import CallManager
 from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_SIP_ENABLED
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
-from .repairs import async_clear_reauth_unrecoverable
+from .repairs import async_clear_reauth_unrecoverable, async_clear_sip_terminal
 from .services import async_setup_services
 from .sip_bridge import SipBridge, sip_credentials
 from .sip_store import SipStore
@@ -121,7 +121,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> boo
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> None:
-    """Delete the entry's SIP state file when the account is removed."""
+    """Clean up what outlives the account: the SIP state file and its card.
+
+    The SIP repair issue is persistent and not fixable, so nothing else ever
+    clears it -- an account deleted while blocked would leave a card pointing at
+    an entry that no longer exists.
+    """
+    async_clear_sip_terminal(hass, entry.entry_id)
     await SipStore(hass, entry.entry_id).async_remove()
 
 
