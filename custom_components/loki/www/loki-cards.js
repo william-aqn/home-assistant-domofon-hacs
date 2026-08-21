@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -434,9 +434,13 @@ class LokiDoorCard extends HTMLElement {
     return 4;
   }
 
-  /** Sizing for sections views, which is what new dashboards use. */
+  /** Sizing for sections views, which is what new dashboards use.
+
+   * ``rows: "auto"`` rather than a number: the picture is 16:9 and the card knows its
+   * own height far better than a guess does. Core's own cards use the same value.
+   */
   getGridOptions() {
-    return { columns: 12, rows: 4, min_columns: 6, min_rows: 3 };
+    return { columns: 12, rows: "auto", min_columns: 6, min_rows: 3 };
   }
 
   disconnectedCallback() {
@@ -592,10 +596,14 @@ class LokiWallCard extends HTMLElement {
     return 2 + Math.ceil(this._cameras().length / 3) * 3;
   }
 
-  /** Sizing for sections views. A wall of doors wants the full width. */
+  /** Sizing for sections views. A wall of doors wants the full width.
+
+   * 12 is the whole grid, which is the widest a card can ask for. ``columns: "full"``
+   * exists in some versions but is not something this one's own cards use, and a value
+   * the layout does not recognise is a broken card rather than a wide one.
+   */
   getGridOptions() {
-    const rows = Math.ceil(this._cameras().length / 3);
-    return { columns: "full", rows: Math.max(4, rows * 3 + 1), min_columns: 6 };
+    return { columns: 12, rows: "auto", min_columns: 6, min_rows: 4 };
   }
 
   disconnectedCallback() {
