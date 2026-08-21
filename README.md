@@ -81,6 +81,19 @@ Loki сама уведомлений не шлёт: она сообщает Home
 
 HACS blueprint'ы не скачивает — только по кнопке выше.
 
+## В Telegram — с кнопкой «Открыть»
+
+Фото с домофона, подпись с именем двери и кнопка прямо под снимком. Нажали —
+дверь открылась, подпись сменилась на «Открыто», кнопка исчезла. Когда звонок
+закончился, кнопка снимается сама: рабочая кнопка от подъездной двери, навсегда
+оставшаяся в переписке, — это не то, чего хочется.
+
+[![Импортировать blueprint в Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fwilliam-aqn%2Fhome-assistant-domofon-hacs%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Floki%2Fring_telegram_open.yaml)
+
+Нужен **Telegram bot**, подключённый через интерфейс Home Assistant. Старая секция
+`notify:` из `configuration.yaml` не подойдёт — она не умеет ни кнопок, ни ответа
+на нажатие.
+
 ## Сказать вслух
 
 Если хочется, чтобы о звонке объявляли голосом — на колонку, на самодельную

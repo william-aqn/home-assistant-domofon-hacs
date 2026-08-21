@@ -1,0 +1,227 @@
+blueprint:
+  name: Loki — звонок в дверь в Telegram с кнопкой «Открыть»
+  description: >
+    При звонке присылает в Telegram фото с домофона, подпись с именем двери и
+    кнопку «Открыть» прямо под снимком. Нажатие открывает дверь и завершает вызов,
+    подпись меняется на «Открыто», кнопка исчезает.
+
+
+    Кнопка живёт только пока идёт этот вызов. Когда звонок закончился или истекло
+    ожидание, она снимается с сообщения — иначе в переписке навсегда осталась бы
+    рабочая кнопка от двери.
+
+
+    Нужен **Telegram bot**, настроенный через интерфейс (Настройки → Устройства и
+    службы). Устаревшая секция `notify:` из `configuration.yaml` не подойдёт: она
+    не умеет ни кнопок, ни ответа на нажатие, и Home Assistant её отключает.
+
+
+    Для проверки без реального звонка вызовите действие **Loki: Сымитировать
+    звонок** (`loki.simulate_ring`) с id нужной двери.
+  domain: automation
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/ring_telegram_open.yaml
+  author: william-aqn
+  input:
+    telegram_target:
+      name: Куда слать
+      description: Чат Telegram — сущность из интеграции Telegram bot.
+      selector:
+        entity:
+          filter:
+            - domain: notify
+              integration: telegram_bot
+    caption:
+      name: Подпись под фото
+      description: "Шаблон. `{{ door_name }}` подставит имя двери."
+      default: "🔔 Звонят в дверь: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    open_title:
+      name: Текст кнопки
+      default: Открыть
+      selector:
+        text:
+    opened_caption:
+      name: Подпись после открытия
+      default: "✅ Открыто: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    missed_caption:
+      name: Подпись, если не открыли
+      description: Оставьте пустым, чтобы просто снять кнопку, не трогая подпись.
+      default: "🔕 Звонок окончен: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    base_url:
+      name: Адрес Home Assistant для самого себя
+      description: >
+        Снимок Home Assistant скачивает сам у себя и уже готовым файлом отдаёт в
+        Telegram, поэтому подходит локальный адрес. Менять стоит, только если
+        Home Assistant слушает не на 8123.
+      default: http://127.0.0.1:8123
+      selector:
+        text:
+    wait_timeout:
+      name: Сколько ждать нажатия
+      description: >
+        Должно совпадать с CALL_TIMEOUT интеграции (по умолчанию 120 с), иначе
+        кнопка переживёт вызов, который уже снят по таймауту.
+      default:
+        minutes: 2
+      selector:
+        duration:
+
+mode: parallel
+max: 10
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: call_incoming
+
+conditions: []
+
+actions:
+  - alias: Подготовить переменные
+    variables:
+      target_in: !input telegram_target
+      base_in: !input base_url
+      open_in: !input open_title
+
+      device_id: "{{ trigger.event.data.device_id }}"
+      door_name: "{{ trigger.event.data.device_name }}"
+      call_id: "{{ trigger.event.data.call_id }}"
+      camera: "{{ trigger.event.data.entity_id | default('', true) }}"
+
+      # Ключ этого прогона. Кнопка от прошлого звонка не должна открывать дверь
+      # сегодня вечером: полезная нагрузка привязана к запуску, и ждёт её только
+      # он. Telegram ограничивает её 64 байтами — сюда влезает с запасом.
+      callback: "loki_open_{{ context.id }}"
+
+      # Объявлены ПОСЛЕ door_name: значения переменных рендерятся по порядку, и
+      # шаблон пользователя, поставленный раньше, получил бы пустоту.
+      caption_text: !input caption
+      opened_text: !input opened_caption
+      missed_text: !input missed_caption
+
+      picture: >-
+        {{ state_attr(camera, 'entity_picture') if camera else '' }}
+
+  - alias: Отправить снимок с кнопкой
+    choose:
+      - alias: У двери есть камера
+        conditions:
+          - condition: template
+            value_template: "{{ picture != '' }}"
+        sequence:
+          - action: telegram_bot.send_photo
+            continue_on_error: true
+            data:
+              entity_id: "{{ target_in }}"
+              url: "{{ base_in | trim | regex_replace('/+$', '') }}{{ picture }}"
+              caption: "{{ caption_text }}"
+              inline_keyboard: "{{ [[[open_in, callback]]] }}"
+            response_variable: sent
+    default:
+      - alias: Камеры нет — только текст
+        action: telegram_bot.send_message
+        continue_on_error: true
+        data:
+          entity_id: "{{ target_in }}"
+          message: "{{ caption_text }}"
+          inline_keyboard: "{{ [[[open_in, callback]]] }}"
+        response_variable: sent
+
+  - alias: Ждать нажатия или конца этого вызова
+    wait_for_trigger:
+      # Шаблон в event_data рендерится при подписке, против переменных этого
+      # запуска — так же, как в блупринте уведомления на телефон.
+      - trigger: event
+        id: open
+        event_type: telegram_callback
+        event_data:
+          data: "{{ callback }}"
+      - trigger: event
+        id: ended
+        event_type: loki_event
+        event_data:
+          type: call_ended
+          call_id: "{{ call_id }}"
+    timeout: !input wait_timeout
+    continue_on_timeout: true
+
+  - choose:
+      - alias: Нажали «Открыть»
+        conditions:
+          - condition: template
+            value_template: "{{ wait.trigger is defined and wait.trigger.id == 'open' }}"
+        sequence:
+          # Первым делом ответить Telegram: без этого кнопка на телефоне
+          # крутится, пока не отвалится по своему таймауту.
+          - action: telegram_bot.answer_callback_query
+            continue_on_error: true
+            data:
+              callback_query_id: "{{ wait.trigger.event.data.id }}"
+              message: Открываю…
+              show_alert: false
+          - action: loki.open_door
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Завершить вызов — дверь открыта
+            # Освобождает и нашу SIP-ветку: сидеть на 180 Ringing после открытия
+            # значит мешать forking-прокси доставить финальные ответы, и телефон
+            # жильца будет звонить впустую.
+            action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Переписать сообщение и убрать кнопку
+            action: telegram_bot.edit_caption
+            continue_on_error: true
+            data:
+              entity_id: "{{ target_in }}"
+              message_id: "{{ wait.trigger.event.data.message.message_id }}"
+              caption: "{{ opened_text }}"
+              inline_keyboard: "{{ [] }}"
+
+      - alias: Звонок вытеснен новым звонком в ту же дверь
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is defined and wait.trigger.id == 'ended'
+                 and wait.trigger.event.data.reason == 'superseded' }}
+        # Ничего. Сообщение принадлежит более новому звонку в ту же дверь, и
+        # снимать с него кнопку значило бы обезоружить живой вызов.
+        sequence: []
+
+    default:
+      - alias: Снять кнопку — открывать уже нечего
+        # Единственная причина, по которой это обязательно: сообщение остаётся в
+        # переписке навсегда, и живая кнопка от подъездной двери в истории чата —
+        # это то, чего не должно быть.
+        choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ sent is defined and missed_text | trim != '' }}"
+            sequence:
+              - action: telegram_bot.edit_caption
+                continue_on_error: true
+                data:
+                  entity_id: "{{ target_in }}"
+                  message_id: "{{ sent.chats[0].message_id }}"
+                  caption: "{{ missed_text }}"
+                  inline_keyboard: "{{ [] }}"
+        default:
+          - condition: template
+            value_template: "{{ sent is defined }}"
+          - action: telegram_bot.edit_replymarkup
+            continue_on_error: true
+            data:
+              entity_id: "{{ target_in }}"
+              message_id: "{{ sent.chats[0].message_id }}"
+              inline_keyboard: "{{ [] }}"
