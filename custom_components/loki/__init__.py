@@ -15,9 +15,14 @@ from homeassistant.loader import async_get_integration
 
 from .api import LokiApiError, LokiAuthError, LokiClient
 from .call import CallManager
-from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_SIP_ENABLED
+from .const import CONF_REFRESH_TOKEN, DOMAIN, OPT_PANEL, OPT_SIP_ENABLED
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
-from .frontend import async_register_cards, async_remove_resource
+from .frontend import (
+    async_register_cards,
+    async_register_panel,
+    async_remove_panel,
+    async_remove_resource,
+)
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
 from .repairs import async_clear_reauth_unrecoverable, async_clear_sip_terminal
 from .services import async_setup_services
@@ -104,6 +109,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # The sidebar page is per installation, not per account: one page shows every
+    # door from every account, so it goes up if any entry asked for it.
+    await _async_sync_panel(hass)
+
     # SIP starts last, and only after the platforms exist. An INVITE arriving in the
     # window before then would reach a CallManager with no subscribers: the event
     # entity and the call sensor would both miss it, and the ring would be lost with
@@ -112,6 +121,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
         await bridge.async_start()
 
     return True
+
+
+async def _async_sync_panel(hass: HomeAssistant) -> None:
+    """Add or remove the sidebar page to match what the accounts ask for."""
+    wanted = any(
+        e.options.get(OPT_PANEL, False)
+        for e in hass.config_entries.async_entries(DOMAIN)
+    )
+    if wanted:
+        integration = await async_get_integration(hass, DOMAIN)
+        await async_register_panel(hass, str(integration.version or "0"))
+    else:
+        async_remove_panel(hass)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool:
@@ -145,6 +167,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> Non
     # the first.
     if not [e for e in hass.config_entries.async_entries(DOMAIN) if e is not entry]:
         await async_remove_resource(hass)
+        async_remove_panel(hass)
 
 
 async def async_remove_config_entry_device(

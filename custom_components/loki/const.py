@@ -71,6 +71,9 @@ EVENT_TYPE_FACE_RECOGNIZED: Final = "face_recognized"
 # --- options keys ------------------------------------------------------------
 
 OPT_SCAN_INTERVAL: Final = "scan_interval"
+# Whether to put a "Домофоны" page in the sidebar. Asked once at setup, changeable in
+# the options afterwards.
+OPT_PANEL: Final = "sidebar_panel"
 
 # --- events ------------------------------------------------------------------
 

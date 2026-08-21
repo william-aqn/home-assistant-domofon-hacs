@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.8.0";
+const CARD_VERSION = "0.9.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -67,6 +67,7 @@ const t = {
   confirmLive: "Включить живое видео со всех камер? Это заметная нагрузка.",
   yes: "Да",
   no: "Нет",
+  panelTitle: "Домофоны",
   ringing: "Вызов",
   unavailable:
     "Видеопоток недоступен. На плитках — статичная картинка с сервера, "
@@ -1296,6 +1297,75 @@ class LokiWallCardEditor extends LokiEditorBase {
   }
 }
 
+/* -------------------------------------------------------------- the panel */
+
+/**
+ * A whole sidebar page showing the wall of doors.
+ *
+ * Registered by the integration through ``panel_custom`` rather than by writing a
+ * Lovelace dashboard: an integration has no supported way to create one, and reaching
+ * into Lovelace's storage behind its back risks losing the user's own dashboards the
+ * next time it saves.
+ *
+ * The panel is a thin frame around the same card the dashboard uses, so there is one
+ * implementation of the wall and not two.
+ */
+class LokiPanel extends HTMLElement {
+  constructor() {
+    super();
+    this._card = null;
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._card) this._build();
+    this._card.hass = hass;
+  }
+
+  /** panel_custom hands the panel its config here; we have nothing to read from it. */
+  set panel(_panel) {}
+
+  set narrow(narrow) {
+    if (this._narrow === narrow) return;
+    this._narrow = narrow;
+    // setConfig tears the card down and it only rebuilds when hass is set again, so
+    // reconfiguring without re-feeding hass leaves an empty page. panel_custom sets
+    // narrow after hass, which is exactly when that happens.
+    if (this._card && this._hass) {
+      this._card.setConfig(this._config());
+      this._card.hass = this._hass;
+    }
+  }
+
+  _config() {
+    return {
+      title: t.panelTitle,
+      // A phone gets small tiles so a useful number fit; a desktop gets the default.
+      tile_size: this._narrow ? "compact" : DEFAULT_TILE_SIZE,
+    };
+  }
+
+  _build() {
+    const style = el("style");
+    style.textContent = `
+      .loki-panel { padding: 8px; box-sizing: border-box; }
+      .loki-panel loki-wall-card { display: block; }
+    `;
+    const wrap = el("div", "loki-panel");
+    this._card = document.createElement("loki-wall-card");
+    this._card.setConfig(this._config());
+    wrap.appendChild(this._card);
+    this.append(style, wrap);
+  }
+
+  disconnectedCallback() {
+    // The card stops its own streams and timers; nothing else to unwind.
+    if (this._card && this._card.disconnectedCallback) {
+      this._card.disconnectedCallback();
+    }
+  }
+}
+
 /* ------------------------------------------------------------- registration */
 
 // Idempotent on purpose. The module can legitimately be loaded twice -- once as a
@@ -1306,6 +1376,7 @@ const define = (name, cls) => {
   if (!customElements.get(name)) customElements.define(name, cls);
 };
 
+define("loki-panel", LokiPanel);
 define("loki-door-card", LokiDoorCard);
 define("loki-wall-card", LokiWallCard);
 define("loki-door-card-editor", LokiDoorCardEditor);

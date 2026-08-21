@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlowWithReload,
@@ -39,6 +40,7 @@ from .const import (
     CONF_SIP,
     DISCLAIMER_URL,
     DOMAIN,
+    OPT_PANEL,
     OPT_SCAN_INTERVAL,
     OPT_SIP_STRICT_GUARD,
 )
@@ -46,12 +48,14 @@ from .coordinator import LokiConfigEntry
 from .protocol import normalize_phone
 from .reauth import async_record_auth_time
 from .repairs import async_create_reauth_unrecoverable
+from .sip_store import SipStore
 
 _LOGGER = logging.getLogger(__name__)
 
 CONF_SMS_CODE = "sms_code"
 CONF_RESEND = "resend"
 CONF_ACCEPT = "accept"
+CONF_PANEL = "panel"
 
 STEP_DISCLAIMER_SCHEMA = vol.Schema({vol.Required(CONF_ACCEPT, default=False): bool})
 
@@ -86,6 +90,7 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialise flow state."""
         self._phone: str | None = None
         self._provisional_token: str | None = None
+        self._entry_data: dict[str, Any] | None = None
 
     # -- initial setup --------------------------------------------------------
 
@@ -152,6 +157,9 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_SMS_CODE] = "invalid_code"
             else:
                 result = await self._async_confirm(code)
+                if result is None:
+                    # Credentials are good; one question left before the entry exists.
+                    return await self.async_step_panel()
                 if isinstance(result, str):
                     errors["base"] = result
                 else:
@@ -162,6 +170,44 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=STEP_SMS_SCHEMA,
             errors=errors,
             description_placeholders={"phone": self._phone},
+        )
+
+    # -- changing the phone number --------------------------------------------
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Point this account at a different phone number.
+
+        The number is the account: the refresh token, the SIP credentials and the list
+        of doors all hang off it. Reauthentication deliberately refuses to change it --
+        it exists to renew a session, not to swap accounts -- so this is the way.
+
+        Everything keyed on the Loki device id survives, because that is global: the
+        device cards, their names and their areas stay as they are.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            phone = normalize_phone(user_input[CONF_PHONE])
+            if phone is None:
+                errors[CONF_PHONE] = "invalid_phone"
+            else:
+                await self.async_set_unique_id(phone)
+                # A second entry already using that number would collide on unique_id.
+                self._abort_if_unique_id_mismatch(reason="already_configured")
+                if error := await self._async_send_sms(phone):
+                    errors["base"] = error
+                else:
+                    self._phone = phone
+                    return await self.async_step_sms()
+
+        entry = self._get_reconfigure_entry()
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=STEP_USER_SCHEMA,
+            errors=errors,
+            description_placeholders={"phone": str(entry.data.get(CONF_PHONE, ""))},
         )
 
     # -- reauth ---------------------------------------------------------------
@@ -233,7 +279,7 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
             return "unknown"
         return None
 
-    async def _async_confirm(self, sms_code: str) -> ConfigFlowResult | str:
+    async def _async_confirm(self, sms_code: str) -> ConfigFlowResult | str | None:
         """Confirm the code and create or update the entry.
 
         Returns an error key on failure rather than raising, so the caller can render
@@ -274,6 +320,18 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
             }
         )
 
+        self._entry_data = data
+        if self.source == SOURCE_RECONFIGURE:
+            entry = self._get_reconfigure_entry()
+            # The SIP state belongs to the old account: its instance id, its remembered
+            # Contact URIs, its resolved doors. Carrying them over would let the client
+            # claim a binding on the NEW account that was never ours -- the one harm
+            # the whole SIP design exists to prevent -- so it goes.
+            await SipStore(self.hass, entry.entry_id).async_remove()
+            await self.async_set_unique_id(self._phone)
+            self._abort_if_unique_id_mismatch(reason="already_configured")
+            return self.async_update_reload_and_abort(entry, data=data)
+
         if self.source == SOURCE_REAUTH:
             # Re-assert the account identity: the entry is keyed on the phone number,
             # and a reauth must not quietly rebind it to a different account.
@@ -283,7 +341,30 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._get_reauth_entry(), data=data
             )
 
-        return self.async_create_entry(title=self._phone, data=data)
+        # The entry is created by async_step_panel, after the last question.
+        return None
+
+    async def async_step_panel(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Offer a ready-made page before finishing.
+
+        Asked here rather than left for later because the alternative is a dashboard
+        the user has to build: the default "Обзор" panel is auto-generated and cannot
+        be edited at all until they take it over, which is not obvious and is the first
+        thing people get stuck on.
+        """
+        if user_input is not None:
+            return self.async_create_entry(
+                title=self._phone or "",
+                data=self._entry_data or {},
+                options={OPT_PANEL: bool(user_input.get(CONF_PANEL, True))},
+            )
+
+        return self.async_show_form(
+            step_id="panel",
+            data_schema=vol.Schema({vol.Required(CONF_PANEL, default=True): bool}),
+        )
 
     @staticmethod
     @callback
@@ -323,6 +404,7 @@ class LokiOptionsFlow(OptionsFlowWithReload):
                     OPT_SIP_STRICT_GUARD,
                     default=options.get(OPT_SIP_STRICT_GUARD, True),
                 ): bool,
+                vol.Optional(OPT_PANEL, default=options.get(OPT_PANEL, False)): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

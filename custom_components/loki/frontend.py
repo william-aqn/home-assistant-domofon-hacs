@@ -34,7 +34,7 @@ from typing import Any, Final
 
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.setup import async_when_setup
 
 from .const import DOMAIN
@@ -44,6 +44,17 @@ _LOGGER = logging.getLogger(__name__)
 URL_BASE: Final = f"/{DOMAIN}_cards"
 CARDS_FILE: Final = "loki-cards.js"
 CARDS_URL: Final = f"{URL_BASE}/{CARDS_FILE}"
+
+# The sidebar page. Registered through panel_custom rather than by creating a Lovelace
+# dashboard: an integration has no supported way to create one, and writing into
+# Lovelace's own storage behind its back would risk losing the user's dashboards the
+# next time it saves its in-memory copy.
+# Short and unlikely to be taken: a dashboard the user made themselves owns its own
+# url_path, and panel_custom refuses to overwrite one. Losing that race means no page,
+# so the path should not be a name somebody would plausibly pick for a dashboard.
+PANEL_URL_PATH: Final = "loki"
+PANEL_COMPONENT: Final = "loki-panel"
+DATA_PANEL: Final = f"{DOMAIN}_panel_registered"
 
 # Set once the module has been registered, so a second call is a no-op rather than a
 # duplicate route.
@@ -160,3 +171,42 @@ async def async_remove_resource(hass: HomeAssistant) -> None:
                 await resources.async_delete_item(item["id"])
     except Exception:
         _LOGGER.exception("Не удалось убрать ресурс Lovelace")
+
+
+async def async_register_panel(hass: HomeAssistant, version: str) -> None:
+    """Add the Loki page to the sidebar, once."""
+    if hass.data.get(DATA_PANEL):
+        return
+    try:
+        from homeassistant.components import panel_custom
+    except ImportError:
+        return
+
+    try:
+        await panel_custom.async_register_panel(
+            hass,
+            frontend_url_path=PANEL_URL_PATH,
+            webcomponent_name=PANEL_COMPONENT,
+            sidebar_title="Домофоны",
+            sidebar_icon="mdi:door-closed-lock",
+            module_url=f"{CARDS_URL}?v={version}",
+            embed_iframe=False,
+            require_admin=False,
+        )
+    except ValueError as err:
+        # Raised when the url path is already taken -- by a dashboard the user made
+        # with the same name, most likely. Theirs wins.
+        _LOGGER.warning("Не удалось добавить страницу «Домофоны»: %s", err)
+        return
+    hass.data[DATA_PANEL] = True
+    _LOGGER.debug("Страница Loki добавлена в боковую панель")
+
+
+@callback
+def async_remove_panel(hass: HomeAssistant) -> None:
+    """Take the page back out of the sidebar."""
+    if not hass.data.pop(DATA_PANEL, None):
+        return
+    from homeassistant.components import frontend
+
+    frontend.async_remove_panel(hass, PANEL_URL_PATH)

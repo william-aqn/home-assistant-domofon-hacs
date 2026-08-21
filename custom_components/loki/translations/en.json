@@ -29,6 +29,23 @@
       "reauth_confirm": {
         "title": "Sign in again",
         "description": "The session for {phone} has ended.\n\nThere are two possible reasons: the token expired (this happens routinely and is expected), or **someone signed in elsewhere with this same number** — the service allows only one active session per number.\n\n⚠️ If another device took the session, signing in here will **sign that device out**. If this keeps happening, get a separate number for Home Assistant and add it through the official app.\n\nSubmit to receive a new code by SMS."
+      },
+      "panel": {
+        "title": "Ready-made page",
+        "description": "Add a **Домофоны** page to the sidebar — every door as a tile with an open button under it?\n\nIt is a sidebar entry of its own and does not touch your dashboards. You can turn it off later in the integration options.\n\nThe cards appear in the card picker either way.",
+        "data": {
+          "panel": "Add the intercom page"
+        }
+      },
+      "reconfigure": {
+        "title": "A different phone number",
+        "description": "Currently using **{phone}**.\n\nEnter the new number — an SMS code will be sent to it. Doors and cameras are kept: their device cards are keyed on the intercom system's own ids, not on the phone number.\n\n⚠️ SIP credentials are issued per number, so the SIP state is reset and registration has to be switched on again.",
+        "data": {
+          "phone": "New phone number"
+        },
+        "data_description": {
+          "phone": "Any format: +7 999 123-45-67, 8 999 1234567, 9991234567"
+        }
       }
     },
     "error": {
@@ -54,11 +71,13 @@
         "title": "Settings",
         "data": {
           "scan_interval": "Device list refresh interval, seconds",
-          "sip_strict_guard": "Strict check before registering SIP"
+          "sip_strict_guard": "Strict check before registering SIP",
+          "sidebar_panel": "Intercom page in the sidebar"
         },
         "data_description": {
           "scan_interval": "Doors and cameras change rarely, so polling often gains nothing.",
-          "sip_strict_guard": "Do not register while somebody else holds a binding on the SIP account. Turning this off removes the only check that prevents rather than detects: the intercom may stop ringing the resident's phone."
+          "sip_strict_guard": "Do not register while somebody else holds a binding on the SIP account. Turning this off removes the only check that prevents rather than detects: the intercom may stop ringing the resident's phone.",
+          "sidebar_panel": "A sidebar entry showing every intercom. Your dashboards are left alone."
         }
       }
     }
