@@ -1,0 +1,299 @@
+blueprint:
+  name: Loki — звонок в дверь во ВКонтакте с кнопкой «Открыть»
+  description: >
+    При звонке присылает во ВКонтакте фото с домофона, подпись с именем двери и
+    кнопки «Открыть» и «Завершить». Нажатие открывает дверь и завершает вызов,
+    подпись меняется, кнопки исчезают.
+
+
+    Кнопки живут только пока идёт этот вызов: когда звонок закончился или истекло
+    ожидание, они снимаются с сообщения — иначе в переписке навсегда осталась бы
+    рабочая кнопка от подъездной двери.
+
+
+    Нужна отдельная интеграция [ha_vk_notify](https://github.com/udocs-ru/ha_vk_notify)
+    — ставится через HACS как пользовательский репозиторий, затем настраивается
+    токеном сообщества и выбором чата.
+
+
+    Если кнопки не нужны, а нужен просто текст — этот blueprint не требуется вовсе:
+    впишите `vk_notify.send_message` в блупринт **«Озвучить звонок»**, он умеет
+    вызывать любую службу, принимающую `message`.
+  domain: automation
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/ring_vk_open.yaml
+  author: william-aqn
+  input:
+    vk_target:
+      name: Куда слать
+      description: Чат ВКонтакте — сущность из интеграции VK Notify.
+      selector:
+        entity:
+          filter:
+            - integration: vk_notify
+    caption:
+      name: Подпись под фото
+      description: "Шаблон. `{{ door_name }}` подставит имя двери."
+      default: "🔔 Звонят в дверь: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    open_title:
+      name: Текст кнопки открытия
+      default: Открыть
+      selector:
+        text:
+    hangup_title:
+      name: Текст кнопки отказа
+      description: >
+        Убирает звонок из Home Assistant, не открывая дверь. Домофон продолжает
+        звонить на телефон жильца.
+
+
+        Пустое поле — кнопки не будет.
+      default: Завершить
+      selector:
+        text:
+    opened_caption:
+      name: Подпись после открытия
+      default: "✅ Открыто: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    dropped_caption:
+      name: Подпись после отказа
+      default: "🔕 Сброшено: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    missed_caption:
+      name: Подпись, если не ответили
+      default: "🔕 Звонок окончен: {{ door_name }}"
+      selector:
+        text:
+          multiline: true
+    base_url:
+      name: Адрес Home Assistant для самого себя
+      description: >
+        Снимок ВКонтакте забирает по ссылке, поэтому адрес должен быть доступен
+        серверам VK — снаружи. Локальный `127.0.0.1` здесь **не подойдёт**, в отличие
+        от блупринта для Telegram, где картинку скачивает сам Home Assistant.
+
+
+        Если наружу ничего не открыто, оставьте поле пустым: тогда уйдёт сообщение
+        без фото, но с кнопками.
+      default: ""
+      selector:
+        text:
+    wait_timeout:
+      name: Сколько ждать нажатия
+      default:
+        minutes: 2
+      selector:
+        duration:
+
+mode: parallel
+max: 10
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: call_incoming
+
+conditions: []
+
+actions:
+  - alias: Подготовить переменные
+    variables:
+      target_in: !input vk_target
+      base_in: !input base_url
+      open_in: !input open_title
+      hangup_in: !input hangup_title
+
+      device_id: "{{ trigger.event.data.device_id }}"
+      door_name: "{{ trigger.event.data.device_name }}"
+      call_id: "{{ trigger.event.data.call_id }}"
+      camera: "{{ trigger.event.data.entity_id | default('', true) }}"
+
+      # Ключ этого запуска. Кнопка от вчерашнего звонка не должна открывать дверь
+      # сегодня: ждёт эту метку только тот прогон, который её и поставил.
+      key: "{{ context.id }}"
+
+      caption_text: !input caption
+      opened_text: !input opened_caption
+      dropped_text: !input dropped_caption
+      missed_text: !input missed_caption
+
+      picture: >-
+        {{ state_attr(camera, 'entity_picture') if camera else '' }}
+      photo_url: >-
+        {{ (base_in | trim | regex_replace('/+$', '')) ~ picture
+           if base_in | trim and picture else '' }}
+
+      # Клавиатура ВКонтакте — словарь, а не строка: интеграция сериализует его
+      # сама. `payload` наоборот обязан быть строкой с JSON-объектом, иначе в
+      # событии он придёт не разобранным и сопоставить его будет нечем.
+      keys: >-
+        {% set row = [{'action': {'type': 'callback', 'label': open_in,
+                                  'payload': {'loki': key, 'do': 'open'} | to_json},
+                       'color': 'positive'}] %}
+        {% if hangup_in | trim %}
+        {% set row = row + [{'action': {'type': 'callback', 'label': hangup_in,
+                                        'payload': {'loki': key, 'do': 'drop'} | to_json},
+                             'color': 'negative'}] %}
+        {% endif %}
+        {{ {'inline': true, 'buttons': [row]} }}
+
+  - alias: Отправить снимок с кнопками
+    choose:
+      - alias: Есть камера и адрес наружу
+        conditions:
+          - condition: template
+            value_template: "{{ photo_url != '' }}"
+        sequence:
+          - action: vk_notify.send_photo
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              url: "{{ photo_url }}"
+              message: "{{ caption_text }}"
+              parse_mode: plain
+              keyboard: "{{ keys }}"
+            response_variable: sent
+    default:
+      - alias: Без фото — только текст и кнопки
+        action: vk_notify.send_message
+        continue_on_error: true
+        target:
+          entity_id: "{{ target_in }}"
+        data:
+          message: "{{ caption_text }}"
+          parse_mode: plain
+          keyboard: "{{ keys }}"
+        response_variable: sent
+
+  - alias: Ждать нажатия или конца этого вызова
+    wait_for_trigger:
+      # Шаблон здесь рендерится при подписке, против переменных этого запуска.
+      # В триггере самой автоматизации так нельзя -- там event_data вычисляется
+      # один раз при загрузке, -- и это единственная причина, по которой ожидание
+      # живёт в действиях, а не наверху.
+      - trigger: event
+        id: open
+        event_type: vk_notify_callback
+        event_data:
+          payload:
+            loki: "{{ key }}"
+            do: open
+      - trigger: event
+        id: hangup
+        event_type: vk_notify_callback
+        event_data:
+          payload:
+            loki: "{{ key }}"
+            do: drop
+      - trigger: event
+        id: ended
+        event_type: loki_event
+        event_data:
+          type: call_ended
+          call_id: "{{ call_id }}"
+    timeout: !input wait_timeout
+    continue_on_timeout: true
+
+  - choose:
+      - alias: Нажали «Открыть»
+        conditions:
+          - condition: template
+            value_template: "{{ wait.trigger is defined and wait.trigger.id == 'open' }}"
+        sequence:
+          # Первым делом: кружок на кнопке крутится, пока на нажатие не ответили,
+          # а открытие двери -- сетевой вызов и бывает небыстрым.
+          - action: vk_notify.answer_callback
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              event_id: "{{ wait.trigger.event.data.event_id }}"
+              user_id: "{{ wait.trigger.event.data.user_id }}"
+              message: Открываю…
+          - action: loki.open_door
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - alias: Завершить вызов — дверь открыта
+            action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - action: vk_notify.edit_message
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              conversation_message_id: >-
+                {{ wait.trigger.event.data.conversation_message_id }}
+              message: "{{ opened_text }}"
+              parse_mode: plain
+              # Пустой список рядов, а не пустой словарь: правка сериализует
+              # клавиатуру как есть и `inline` сама не подставляет.
+              keyboard: "{{ {'inline': true, 'buttons': []} }}"
+
+      - alias: Нажали «Завершить»
+        conditions:
+          - condition: template
+            value_template: "{{ wait.trigger is defined and wait.trigger.id == 'hangup' }}"
+        sequence:
+          - action: vk_notify.answer_callback
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              event_id: "{{ wait.trigger.event.data.event_id }}"
+              user_id: "{{ wait.trigger.event.data.user_id }}"
+              message: Завершаю…
+          - action: loki.hangup
+            continue_on_error: true
+            data:
+              device_id: "{{ device_id }}"
+          - action: vk_notify.edit_message
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              conversation_message_id: >-
+                {{ wait.trigger.event.data.conversation_message_id }}
+              message: "{{ dropped_text }}"
+              parse_mode: plain
+              keyboard: "{{ {'inline': true, 'buttons': []} }}"
+
+      - alias: Звонок вытеснен новым звонком в ту же дверь
+        conditions:
+          - condition: template
+            value_template: >-
+              {{ wait.trigger is defined and wait.trigger.id == 'ended'
+                 and wait.trigger.event.data.reason == 'superseded' }}
+        # Ничего: сообщение принадлежит более новому звонку в ту же дверь.
+        sequence: []
+
+    default:
+      - alias: Снять кнопки — открывать уже нечего
+        # Идентификатор берётся из ответа службы отправки, а не из нажатия:
+        # нажатия-то и не было. Без него кнопки остались бы в переписке живыми.
+        if:
+          - condition: template
+            value_template: >-
+              {{ sent is defined and sent.get(target_in, {}).conversation_message_id
+                 is defined }}
+        then:
+          - action: vk_notify.edit_message
+            continue_on_error: true
+            target:
+              entity_id: "{{ target_in }}"
+            data:
+              conversation_message_id: >-
+                {{ sent[target_in].conversation_message_id }}
+              message: "{{ missed_text }}"
+              parse_mode: plain
+              keyboard: "{{ {'inline': true, 'buttons': []} }}"

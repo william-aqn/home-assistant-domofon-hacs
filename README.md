@@ -94,6 +94,17 @@ HACS blueprint'ы не скачивает — только по кнопке в�
 `notify:` из `configuration.yaml` не подойдёт — она не умеет ни кнопок, ни ответа
 на нажатие.
 
+## Во ВКонтакте — тоже с кнопками
+
+То же, что и в Telegram, но во ВКонтакте. Нужна отдельная интеграция
+[ha_vk_notify](https://github.com/udocs-ru/ha_vk_notify) — она ставится через HACS
+как пользовательский репозиторий.
+
+[![Импортировать blueprint в Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fwilliam-aqn%2Fhome-assistant-domofon-hacs%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Floki%2Fring_vk_open.yaml)
+
+Если кнопки не нужны, а нужен просто текст, отдельный blueprint не требуется:
+впишите `vk_notify.send_message` в «Озвучить звонок» ниже.
+
 ## Сказать вслух
 
 Если хочется, чтобы о звонке объявляли голосом — на колонку, на самодельную
