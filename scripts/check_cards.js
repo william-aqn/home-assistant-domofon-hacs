@@ -103,14 +103,16 @@ check(
   (global.customCards || []).every((card) => card.name && card.description)
 );
 
-// A card that renders nothing must say why, or Lovelace shows an empty box.
-let rejected = false;
+// A card with no door must still construct: the picker renders a live preview
+// from getStubConfig, and a throw there shows a red error tile instead of the
+// card the user came to add. It says what to do in its header instead.
+let survived = true;
 try {
   new defined["loki-door-card"]().setConfig({});
 } catch (err) {
-  rejected = Boolean(err.message);
+  survived = false;
 }
-check("door card refuses a config with no door", rejected);
+check("door card survives a config with no door", survived);
 
 // The wall card has a sensible default -- every door -- so an empty config is fine.
 let accepted = true;
@@ -153,6 +155,16 @@ check(
 
 const wallSchema = new defined["loki-wall-card-editor"]().schema();
 const camerasField = wallSchema.find((row) => row.name === "cameras");
+for (const card of ['loki-door-card', 'loki-wall-card']) {
+  const instance = new defined[card]();
+  instance.setConfig({});
+  const grid = instance.getGridOptions();
+  check(
+    `${card} reports grid options for sections views`,
+    Boolean(grid && grid.columns && grid.rows)
+  );
+}
+
 check(
   "wall card offers a multi-entity list",
   Boolean(camerasField && camerasField.selector.entity.multiple === true)

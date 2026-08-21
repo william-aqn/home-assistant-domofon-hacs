@@ -15,7 +15,7 @@
  * means an upgrade that changes how streaming works changes nothing here.
  */
 
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.1.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -190,7 +190,11 @@ class DoorMedia {
         type: "picture-entity",
         entity: camera,
         camera_image: camera,
-        camera_view: live ? "live" : "image",
+        // "auto" and "live" are the only values picture-entity defines.
+        // "image" happens to work because everything that is not "live" is
+        // treated as a still, but that is an accident to lean on, not a
+        // contract.
+        camera_view: live ? "live" : "auto",
         show_name: false,
         show_state: false,
         // The card's own tap opens more-info, which fights with our buttons.
@@ -367,9 +371,9 @@ class LokiDoorCard extends HTMLElement {
   }
 
   setConfig(config) {
-    if (!config || !config.camera) {
-      throw new Error(t.pickDoor);
-    }
+    // Deliberately not a throw. The card picker renders a live preview from
+    // getStubConfig, and on an install with no doors yet that would put a red
+    // error tile in the picker instead of the card the user is looking for.
     this._config = { live_timeout: DEFAULT_LIVE_TIMEOUT, ...config };
     if (this._built) {
       this._media.destroy();
@@ -387,6 +391,11 @@ class LokiDoorCard extends HTMLElement {
 
   getCardSize() {
     return 4;
+  }
+
+  /** Sizing for sections views, which is what new dashboards use. */
+  getGridOptions() {
+    return { columns: 12, rows: 4, min_columns: 6, min_rows: 3 };
   }
 
   disconnectedCallback() {
@@ -439,6 +448,12 @@ class LokiDoorCard extends HTMLElement {
 
   _update() {
     const hass = this._hass;
+    if (!this._config.camera) {
+      this._header.textContent = t.pickDoor;
+      this._media.el.hidden = true;
+      return;
+    }
+    this._media.el.hidden = false;
     const door = resolveDoor(hass, this._config.camera);
     this._door = door;
 
@@ -531,6 +546,19 @@ class LokiWallCard extends HTMLElement {
   getCardSize() {
     const count = this._cameras().length;
     return 2 + Math.ceil(count / (Number(this._config.columns) || 2)) * 4;
+  }
+
+  /** Sizing for sections views. A wall of doors wants the full width. */
+  getGridOptions() {
+    const rows = Math.ceil(
+      this._cameras().length / (Number(this._config.columns) || 2)
+    );
+    return {
+      columns: 'full',
+      rows: Math.max(4, rows * 4 + 1),
+      min_columns: 6,
+      min_rows: 4,
+    };
   }
 
   disconnectedCallback() {
