@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.4.0";
+const CARD_VERSION = "1.4.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -45,6 +45,11 @@ const PANEL_PATH = "loki";
 
 // How long to wait for a forced snapshot before counting it as failed.
 const SHOT_TIMEOUT = 15;
+
+// How long the spinner stays up while a stream is being negotiated. Past this the
+// card's own "video unavailable" banner is the honest answer, and a spinner that
+// never stops is a lie told slowly.
+const LIVE_WAIT = 20;
 
 // Minimum tile width per size. The grid fills the card with as many columns of at
 // least this width as fit, so the setting reads as "how big", not "how many" -- which
@@ -98,6 +103,7 @@ const t = {
   hangingUp: "Завершаю…",
   hungUp: "Завершён",
   onCall: "Входящий вызов",
+  connecting: "Подключаюсь…",
   layout: "Раскладка",
   layoutFull: "Обычная — большая картинка",
   layoutCompact: "Компактная — одна строка",
@@ -306,6 +312,10 @@ class DoorMedia {
     this._img.className = "loki-still";
     this._img.alt = "";
     this.el.appendChild(this._img);
+
+    this._loader = el("div", "loki-loader", t.connecting);
+    this._loader.hidden = true;
+    this.el.appendChild(this._loader);
   }
 
   setHass(hass) {
@@ -408,13 +418,44 @@ class DoorMedia {
       this.el.insertBefore(child, this.el.firstChild);
       this._child = child;
       this._img.hidden = true;
+      this._waitForFrame(token);
     } catch (err) {
       this._live = false;
       this._showStill();
     }
   }
 
+  /** Hold the spinner until the stream actually paints something.
+   *
+   * There is no event to listen for: media events do not bubble, and the video lives
+   * inside somebody else's shadow root. So the video element is looked for by hand,
+   * and the spinner comes down when it reports a frame -- or when the wait runs out,
+   * because a spinner that never stops says less than an empty box.
+   */
+  _waitForFrame(token) {
+    this._loader.hidden = false;
+    const started = Date.now();
+    const tick = () => {
+      if (token !== this._token || !this._live) {
+        this._loader.hidden = true;
+        return;
+      }
+      const video = findVideo(this._child, 6);
+      if (video && video.videoWidth > 0) {
+        this._loader.hidden = true;
+        return;
+      }
+      if (Date.now() - started > LIVE_WAIT * 1000) {
+        this._loader.hidden = true;
+        return;
+      }
+      window.setTimeout(tick, 250);
+    };
+    tick();
+  }
+
   _showStill() {
+    this._loader.hidden = true;
     this._img.hidden = false;
     this._refreshStill();
     this._startTimer();
@@ -466,6 +507,7 @@ class DoorMedia {
 
   destroy() {
     this._token++;
+    this._loader.hidden = true;
     this._stopTimer();
     if (this._child) {
       this._child.remove();
@@ -522,6 +564,36 @@ const STYLE = `
     border-radius: 10px;
   }
   .loki-still, .loki-live { display: block; width: 100%; height: 100%; }
+
+  /* Between pressing "live" and the first frame there are a few seconds of nothing,
+     and the composed card paints them white. On a wall of tiles that reads as a
+     broken camera rather than as one that is still connecting. */
+  .loki-loader {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    background: var(--secondary-background-color, #2a2a2a);
+    color: var(--secondary-text-color, #9e9e9e);
+    font-size: 13px;
+  }
+  .loki-loader[hidden] { display: none; }
+  .loki-loader::before {
+    content: "";
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid currentColor;
+    border-top-color: transparent;
+    animation: loki-spin 0.9s linear infinite;
+  }
+  @keyframes loki-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .loki-loader::before { animation-duration: 3s; }
+  }
   .loki-still { object-fit: cover; }
   .loki-live ha-card {
     box-shadow: none; border: none; background: none; border-radius: 0;
@@ -1646,6 +1718,21 @@ async function pressOpen(hass, door, button, label) {
       label.textContent = original;
     }, 2000);
   }
+}
+
+/** The <video> inside a composed card, wherever its shadow roots have put it. */
+function findVideo(root, depth) {
+  if (!root || depth < 0) return null;
+  if (root.tagName === "VIDEO") return root;
+  const kids = [
+    ...(root.shadowRoot ? root.shadowRoot.children : []),
+    ...(root.children || []),
+  ];
+  for (const kid of kids) {
+    const found = findVideo(kid, depth - 1);
+    if (found) return found;
+  }
+  return null;
 }
 
 /** Seconds since an ISO timestamp, never negative. */
