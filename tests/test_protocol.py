@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.loki.protocol import auth_hash, normalize_phone
+from custom_components.loki.protocol import (
+    auth_hash,
+    build_user_agent,
+    normalize_phone,
+)
 
 
 def test_auth_hash_is_md5_of_token_then_code() -> None:
@@ -22,6 +26,27 @@ def test_auth_hash_is_md5_of_token_then_code() -> None:
 def test_auth_hash_is_plain_concatenation() -> None:
     """No separator, no salt -- the code is appended directly to the token."""
     assert auth_hash("abc", "123") == auth_hash("abc1", "23")
+
+
+def test_user_agent_matches_the_observed_android_header() -> None:
+    """The composed default must be byte-identical to what the client really sent."""
+    assert build_user_agent() == (
+        "Dalvik/2.1.0 (Linux; U; Android 11; sdk_gphone_x86 Build/RSR1.201013.001)"
+    )
+
+
+def test_user_agent_is_composed_from_device_properties() -> None:
+    """Each field is a real Android build property, not part of a fixed string."""
+    agent = build_user_agent(
+        dalvik_version="2.1.0",
+        android_release="14",
+        device_model="Pixel 8",
+        build_id="UQ1A.240205.004",
+    )
+
+    assert agent == (
+        "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Build/UQ1A.240205.004)"
+    )
 
 
 @pytest.mark.parametrize(

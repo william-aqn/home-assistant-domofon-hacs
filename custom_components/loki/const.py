@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Final
 
+from .protocol import build_user_agent
+
 DOMAIN: Final = "loki"
 
 # Shown in the config flow so the full terms are one click away from the checkbox.
@@ -16,11 +18,11 @@ DISCLAIMER_URL: Final = (
 # match the operator's real host or nothing works.
 DEFAULT_API_HOST: Final = "https://app.risan-service.ru"
 
-# The official Android client identifies itself this way. The backend does not appear
-# to enforce it, but sending something familiar keeps us from standing out.
-DEFAULT_USER_AGENT: Final = (
-    "Dalvik/2.1.0 (Linux; U; Android 11; sdk_gphone_x86 Build/RSR1.201013.001)"
-)
+# Composed the way Android composes it rather than pasted from a capture -- see
+# protocol.build_user_agent. The official client never sets this header itself; the
+# platform supplies it, so sending the platform's own shape is what "looking like the
+# app" actually means.
+DEFAULT_USER_AGENT: Final = build_user_agent()
 
 DEFAULT_SCAN_INTERVAL: Final = timedelta(minutes=5)
 
