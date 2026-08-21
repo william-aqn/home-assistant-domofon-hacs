@@ -9,37 +9,45 @@
  * that needs bundling is a card that stops working the day its toolchain does, and
  * everything here is either standard DOM or an element Home Assistant already ships.
  *
- * The camera picture itself is not reimplemented: both cards compose Home Assistant's
- * own `picture-entity` through `loadCardHelpers`. That is what makes the live view
- * work at all -- HLS, WebRTC and go2rtc negotiation live behind that card -- and it
- * means an upgrade that changes how streaming works changes nothing here.
+ * **Stills are ours, live video is Home Assistant's.** A still is one `<img>` pointed
+ * at the snapshot endpoint: cheap, reliable, and it gives us the layout we want.
+ * Composing `picture-entity` for the still was tried and was worse on both counts --
+ * it drew an empty box, and because the camera advertises a stream it dragged the
+ * streaming machinery in behind it, which on an account whose video host is
+ * unreachable means twenty doomed RTSP attempts and a wall of red in the log. Live
+ * view still composes `picture-entity`, because HLS and WebRTC are genuinely hard and
+ * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.1.1";
+const CARD_VERSION = "0.2.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
 // everything live" has to be a deliberate act with an end to it.
 const DEFAULT_LIVE_TIMEOUT = 180;
 
-// How often the fallback snapshot is re-fetched. Matches the camera's own frame
-// interval: asking faster only costs the backend requests it will answer from cache.
-const FALLBACK_REFRESH = 10;
+// How often a still is re-fetched. The camera's own frame interval is 10 s, so asking
+// faster only costs requests the backend answers from its own cache.
+const STILL_REFRESH = 10;
+
+const ICON_OPEN = "mdi:lock-open-variant-outline";
+const ICON_LIVE = "mdi:video-outline";
+const ICON_STOP = "mdi:video-off-outline";
 
 const t = {
   open: "Открыть",
-  live: "Смотреть вживую",
-  stop: "Остановить видео",
-  liveAll: "Показать все вживую",
-  stopAll: "Остановить все",
+  live: "Вживую",
+  stop: "Стоп",
+  liveAll: "Все вживую",
+  stopAll: "Остановить",
   ringing: "Вызов",
-  unavailable: "Живое видео недоступно — показан снимок",
-  noCamera: "У этой двери нет камеры",
+  unavailable: "Видео недоступно, показаны снимки",
   pickDoor: "Выберите домофон в настройках карточки",
   noDoors: "Домофоны не найдены. Проверьте, что интеграция Loki настроена.",
+  liveBlocked: "Видеохост недоступен — живое видео не откроется",
   opening: "Открываю…",
   opened: "Открыто",
-  failed: "Не удалось",
+  failed: "Ошибка",
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -53,17 +61,14 @@ const t = {
  */
 function resolveDoor(hass, cameraId) {
   const out = { camera: cameraId, button: null, call: null, name: cameraId };
+  if (!hass || !cameraId) return out;
 
   const state = hass.states[cameraId];
-  if (state) {
-    out.name = state.attributes.friendly_name || cameraId;
-  }
+  if (state) out.name = state.attributes.friendly_name || cameraId;
 
   const registry = hass.entities || {};
   const deviceId = registry[cameraId] ? registry[cameraId].device_id : null;
-  if (!deviceId) {
-    return out;
-  }
+  if (!deviceId) return out;
   out.device = deviceId;
 
   for (const [entityId, entry] of Object.entries(registry)) {
@@ -72,8 +77,8 @@ function resolveDoor(hass, cameraId) {
     if (entityId.startsWith("binary_sensor.")) out.call = entityId;
   }
 
-  // The door's own name is nicer than the camera entity's, and it is what the person
-  // looking at a wall of tiles is trying to read.
+  // The door's own name is nicer than the camera entity's, and it is what somebody
+  // scanning a wall of tiles is actually trying to read.
   const device = hass.devices ? hass.devices[deviceId] : null;
   if (device && (device.name_by_user || device.name)) {
     out.name = device.name_by_user || device.name;
@@ -85,12 +90,12 @@ function resolveDoor(hass, cameraId) {
  * The account-level "can the video host be reached at all" sensor.
  *
  * It hangs off the account device rather than any door, so it is found by looking for
- * the service device rather than by matching an entity id -- ids are derived from
- * names here, and names change.
+ * the service device rather than by matching an entity id -- ids here are derived from
+ * names, and names change.
  */
 function findStreamSensor(hass) {
-  const registry = hass.entities || {};
-  const devices = hass.devices || {};
+  const registry = (hass && hass.entities) || {};
+  const devices = (hass && hass.devices) || {};
   for (const [entityId, entry] of Object.entries(registry)) {
     if (entry.platform !== "loki" || !entityId.startsWith("binary_sensor.")) continue;
     const device = devices[entry.device_id];
@@ -99,9 +104,16 @@ function findStreamSensor(hass) {
   return null;
 }
 
+/** False only when the integration positively reports the video host as down. */
+function streamReachable(hass, configured) {
+  const id = configured || findStreamSensor(hass);
+  const state = id && hass ? hass.states[id] : null;
+  return !(state && state.state === "off");
+}
+
 /** Every Loki camera that also has an open button, i.e. every door with a picture. */
 function findDoorCameras(hass) {
-  const registry = hass.entities || {};
+  const registry = (hass && hass.entities) || {};
   const byDevice = {};
   for (const [entityId, entry] of Object.entries(registry)) {
     if (entry.platform !== "loki" || !entry.device_id) continue;
@@ -116,56 +128,89 @@ function findDoorCameras(hass) {
 }
 
 function fire(node, type, detail) {
-  node.dispatchEvent(
-    new CustomEvent(type, { detail, bubbles: true, composed: true })
-  );
+  node.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function icon(name) {
+  const glyph = document.createElement("ha-icon");
+  glyph.setAttribute("icon", name);
+  return glyph;
+}
+
+/** A round icon button in the corner of a picture. */
+function iconButton(name, label) {
+  const button = el("button", "loki-icon-btn");
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.appendChild(icon(name));
+  return button;
+}
+
+/** The gradient bar along the bottom of a picture: name on the left, open on the right. */
+function pictureBar() {
+  const bar = el("div", "loki-bar");
+  const label = el("div", "loki-label");
+  const open = el("button", "loki-open");
+  const openLabel = el("span", null, t.open);
+  open.append(icon(ICON_OPEN), openLabel);
+  bar.append(label, open);
+  return { bar, label, open, openLabel };
 }
 
 /* --------------------------------------------------------------- the picture */
 
-/**
- * One camera picture, still or live, with an overlay we own.
- *
- * The picture is a composed `picture-entity`; the overlay is ours. Composing rather
- * than embedding an <img> is deliberate: the live path is where all the difficulty
- * is, and Home Assistant already solves it.
- */
+/** One door's picture: our own snapshot by default, Home Assistant's live view on ask. */
 class DoorMedia {
   constructor() {
-    this.el = document.createElement("div");
-    this.el.className = "loki-media";
+    this.el = el("div", "loki-media");
     this._child = null;
     this._live = null;
     this._hass = null;
     this._camera = null;
     this._token = 0;
-    this._fallbackTimer = null;
+    this._timer = null;
 
-    this._fallback = document.createElement("img");
-    this._fallback.className = "loki-fallback";
-    this._fallback.alt = "";
-    this._fallback.hidden = true;
-    this.el.appendChild(this._fallback);
+    this._img = document.createElement("img");
+    this._img.className = "loki-still";
+    this._img.alt = "";
+    this.el.appendChild(this._img);
   }
 
   setHass(hass) {
     this._hass = hass;
     if (this._child) this._child.hass = hass;
-    this._refreshFallback();
+    if (!this._live) this._refreshStill();
   }
 
-  /** Render this camera, live or not. Rebuilds only when something actually changes. */
   async render(camera, live) {
     if (this._camera === camera && this._live === live) {
-      this._refreshFallback();
+      if (!live) this._refreshStill();
       return;
     }
     this._camera = camera;
     this._live = live;
-
-    // Guards against an out-of-order await: two quick toggles must not leave the
-    // slower one's element on screen.
+    // Guards an out-of-order await: two quick toggles must not leave the slower one's
+    // element on screen.
     const token = ++this._token;
+
+    if (this._child) {
+      this._child.remove();
+      this._child = null;
+    }
+
+    if (!live) {
+      this._showStill();
+      return;
+    }
+
+    this._stopTimer();
 
     let helpers = null;
     try {
@@ -175,13 +220,9 @@ class DoorMedia {
     }
     if (token !== this._token) return;
 
-    if (this._child) {
-      this._child.remove();
-      this._child = null;
-    }
-
     if (!helpers || !camera) {
-      this._useFallback();
+      this._live = false;
+      this._showStill();
       return;
     }
 
@@ -190,75 +231,59 @@ class DoorMedia {
         type: "picture-entity",
         entity: camera,
         camera_image: camera,
-        // "auto" and "live" are the only values picture-entity defines.
-        // "image" happens to work because everything that is not "live" is
-        // treated as a still, but that is an accident to lean on, not a
-        // contract.
-        camera_view: live ? "live" : "auto",
+        // "live" and "auto" are the only values picture-entity defines, and only
+        // "live" reaches the streaming path -- which is the entire reason to compose
+        // this card rather than draw the picture ourselves.
+        camera_view: "live",
         show_name: false,
         show_state: false,
-        // The card's own tap opens more-info, which fights with our buttons.
         tap_action: { action: "none" },
         hold_action: { action: "none" },
       });
-      child.classList.add("loki-picture");
+      child.classList.add("loki-live");
       if (this._hass) child.hass = this._hass;
       this.el.insertBefore(child, this.el.firstChild);
       this._child = child;
-      this._fallback.hidden = true;
-      if (this._fallbackTimer) {
-        window.clearInterval(this._fallbackTimer);
-        this._fallbackTimer = null;
-      }
+      this._img.hidden = true;
     } catch (err) {
-      this._useFallback();
+      this._live = false;
+      this._showStill();
     }
   }
 
-  /**
-   * Last resort: the plain snapshot endpoint.
-   *
-   * Reached only if card helpers are unavailable or picture-entity refuses the
-   * config. A door that shows a still picture is far better than a card that shows
-   * an error, because the snapshot keeps working even when the video host does not.
-   */
-  _useFallback() {
-    this._fallback.hidden = false;
-    this._refreshFallback();
-    this._startFallbackTimer();
+  _showStill() {
+    this._img.hidden = false;
+    this._refreshStill();
+    this._startTimer();
   }
 
-  _refreshFallback() {
-    if (this._fallback.hidden || !this._hass || !this._camera) return;
+  _refreshStill() {
+    if (this._img.hidden || !this._hass || !this._camera) return;
     const state = this._hass.states[this._camera];
     const picture = state && state.attributes.entity_picture;
     if (!picture) return;
-    // A camera's entity_picture only changes when its access token rotates, which is
-    // a matter of minutes -- so the URL alone would leave a frozen frame on screen.
-    // The cache buster is what makes this a live-ish snapshot rather than a photo of
-    // whenever the card happened to load.
-    const stamp = Math.floor(Date.now() / (FALLBACK_REFRESH * 1000));
+    // entity_picture only changes when the access token rotates, a matter of minutes,
+    // so the URL on its own would leave one frozen frame on screen. Only this URL is
+    // safe to append to -- a signed path would fail its signature check.
+    const stamp = Math.floor(Date.now() / (STILL_REFRESH * 1000));
     const src = `${picture}${picture.includes("?") ? "&" : "?"}_=${stamp}`;
-    if (this._fallback.getAttribute("src") !== src) {
-      this._fallback.setAttribute("src", src);
-    }
+    if (this._img.getAttribute("src") !== src) this._img.setAttribute("src", src);
   }
 
-  /** Keep the snapshot moving while the composed card is unavailable. */
-  _startFallbackTimer() {
-    if (this._fallbackTimer) return;
-    this._fallbackTimer = window.setInterval(
-      () => this._refreshFallback(),
-      FALLBACK_REFRESH * 1000
-    );
+  _startTimer() {
+    if (this._timer) return;
+    this._timer = window.setInterval(() => this._refreshStill(), STILL_REFRESH * 1000);
+  }
+
+  _stopTimer() {
+    if (!this._timer) return;
+    window.clearInterval(this._timer);
+    this._timer = null;
   }
 
   destroy() {
     this._token++;
-    if (this._fallbackTimer) {
-      window.clearInterval(this._fallbackTimer);
-      this._fallbackTimer = null;
-    }
+    this._stopTimer();
     if (this._child) {
       this._child.remove();
       this._child = null;
@@ -274,79 +299,95 @@ const STYLE = `
   .loki-media {
     position: relative;
     overflow: hidden;
-    background: var(--secondary-background-color, #222);
-    border-radius: var(--ha-card-border-radius, 12px);
-    min-height: 90px;
+    aspect-ratio: 16 / 9;
+    background: var(--secondary-background-color, #2a2a2a);
+    border-radius: 10px;
   }
-  .loki-picture, .loki-fallback { display: block; width: 100%; }
-  .loki-picture { --ha-card-border-radius: 0; }
-  .loki-picture ha-card {
-    box-shadow: none;
-    border: none;
-    background: none;
-    border-radius: 0;
+  .loki-still, .loki-live { display: block; width: 100%; height: 100%; }
+  .loki-still { object-fit: cover; }
+  .loki-live ha-card {
+    box-shadow: none; border: none; background: none; border-radius: 0;
   }
-  .loki-fallback { object-fit: cover; }
 
-  .loki-overlay {
+  .loki-bar {
     position: absolute;
     left: 0; right: 0; bottom: 0;
     display: flex;
-    gap: 8px;
     align-items: center;
-    justify-content: flex-end;
-    padding: 8px;
-    background: linear-gradient(transparent, rgba(0, 0, 0, 0.55));
-    pointer-events: none;
+    gap: 8px;
+    padding: 6px 8px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
   }
-  .loki-overlay > * { pointer-events: auto; }
+  .loki-label {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    line-height: 1.25;
+    color: #fff;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
-  .loki-btn {
+  .loki-open {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
     font: inherit;
-    font-size: 14px;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.55);
-    border: 1px solid rgba(255, 255, 255, 0.25);
-    border-radius: 8px;
-    padding: 6px 14px;
-    cursor: pointer;
-    backdrop-filter: blur(2px);
-  }
-  .loki-btn:hover { background: rgba(0, 0, 0, 0.72); }
-  .loki-btn[disabled] { opacity: 0.6; cursor: default; }
-  .loki-btn.primary {
-    background: var(--primary-color, #03a9f4);
-    border-color: transparent;
-  }
-  .loki-btn.busy { opacity: 0.7; }
-
-  .loki-ribbon {
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    padding: 4px 10px;
     font-size: 12px;
-    color: #fff;
-    background: rgba(180, 30, 30, 0.85);
-    text-align: center;
+    color: var(--text-primary-color, #fff);
+    background: var(--primary-color, #03a9f4);
+    border: none;
+    border-radius: 999px;
+    padding: 4px 10px 4px 7px;
+    cursor: pointer;
+    white-space: nowrap;
   }
+  .loki-open ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .loki-open[disabled] { opacity: 0.65; cursor: default; }
+
+  .loki-icon-btn {
+    position: absolute;
+    top: 6px; right: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px; height: 30px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.45);
+    border: none;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .loki-icon-btn ha-icon { --mdc-icon-size: 18px; width: 18px; height: 18px; }
+  .loki-icon-btn:hover { background: rgba(0, 0, 0, 0.7); }
+  .loki-icon-btn[disabled] { opacity: 0.3; cursor: default; }
+  .loki-icon-btn.on { background: var(--primary-color, #03a9f4); }
+
   .loki-ringing {
     position: absolute;
-    top: 8px; left: 8px;
-    padding: 3px 10px;
-    font-size: 12px;
+    top: 6px; left: 6px;
+    padding: 2px 9px;
+    font-size: 11px;
     font-weight: 600;
     color: #fff;
     border-radius: 999px;
     background: var(--error-color, #db4437);
     animation: loki-pulse 1.2s ease-in-out infinite;
   }
-  @keyframes loki-pulse { 50% { opacity: 0.45; } }
+  @keyframes loki-pulse { 50% { opacity: 0.4; } }
 
-  .loki-title { font-weight: 500; }
-  .loki-empty {
-    padding: 16px;
+  .loki-note {
+    margin: 0 12px 10px;
+    padding: 5px 10px;
+    font-size: 12px;
     color: var(--secondary-text-color);
+    background: var(--secondary-background-color, rgba(127, 127, 127, 0.14));
+    border-radius: 8px;
   }
+  .loki-empty { padding: 16px; color: var(--secondary-text-color); }
 `;
 
 /* ------------------------------------------------------------ the door card */
@@ -358,12 +399,12 @@ class LokiDoorCard extends HTMLElement {
 
   static getStubConfig(hass) {
     const doors = findDoorCameras(hass);
-    return { camera: doors[0] || "" };
+    return doors.length ? { camera: doors[0] } : {};
   }
 
   constructor() {
     super();
-    this._config = null;
+    this._config = {};
     this._hass = null;
     this._live = false;
     this._built = false;
@@ -371,14 +412,14 @@ class LokiDoorCard extends HTMLElement {
   }
 
   setConfig(config) {
-    // Deliberately not a throw. The card picker renders a live preview from
-    // getStubConfig, and on an install with no doors yet that would put a red
-    // error tile in the picker instead of the card the user is looking for.
-    this._config = { live_timeout: DEFAULT_LIVE_TIMEOUT, ...config };
+    // Deliberately not a throw. The picker renders a live preview from getStubConfig,
+    // and on an install with no doors that would put a red error tile where the card
+    // somebody came to add should be.
+    this._config = { live_timeout: DEFAULT_LIVE_TIMEOUT, ...(config || {}) };
     if (this._built) {
       this._media.destroy();
-      this._built = false;
       this.innerHTML = "";
+      this._built = false;
     }
   }
 
@@ -399,78 +440,83 @@ class LokiDoorCard extends HTMLElement {
   }
 
   disconnectedCallback() {
-    // Leaving a live stream running behind a dashboard nobody is looking at is the
-    // one thing a card like this must not do.
+    // A live stream left running behind a dashboard nobody is looking at is the one
+    // thing a card like this must not do.
     this._stopLive();
     if (this._media) this._media.destroy();
   }
 
   _build() {
-    const style = document.createElement("style");
-    style.textContent = STYLE;
+    const style = el("style");
+    style.textContent = `${STYLE}
+      .loki-body { padding: 0 12px 12px; }
+      .card-header { padding-bottom: 8px; }
+    `;
 
     const card = document.createElement("ha-card");
+    this._header = el("div", "card-header");
     this._media = new DoorMedia();
 
-    this._ribbon = document.createElement("div");
-    this._ribbon.className = "loki-ribbon";
-    this._ribbon.textContent = t.unavailable;
-    this._ribbon.hidden = true;
-
-    this._ringing = document.createElement("div");
-    this._ringing.className = "loki-ringing";
-    this._ringing.textContent = t.ringing;
+    this._ringing = el("div", "loki-ringing", t.ringing);
     this._ringing.hidden = true;
 
-    const overlay = document.createElement("div");
-    overlay.className = "loki-overlay";
-
-    this._liveBtn = document.createElement("button");
-    this._liveBtn.className = "loki-btn";
+    this._liveBtn = iconButton(ICON_LIVE, t.live);
     this._liveBtn.addEventListener("click", () => this._toggleLive());
 
-    this._openBtn = document.createElement("button");
-    this._openBtn.className = "loki-btn primary";
-    this._openBtn.textContent = t.open;
+    const parts = pictureBar();
+    this._label = parts.label;
+    this._openBtn = parts.open;
+    this._openLabel = parts.openLabel;
     this._openBtn.addEventListener("click", () => this._open());
 
-    overlay.append(this._liveBtn, this._openBtn);
-    this._media.el.append(this._ribbon, this._ringing, overlay);
+    this._media.el.append(this._ringing, this._liveBtn, parts.bar);
 
-    const header = document.createElement("div");
-    header.className = "card-header loki-title";
-    this._header = header;
+    this._note = el("div", "loki-note", t.unavailable);
+    this._note.hidden = true;
 
-    card.append(header, this._media.el);
+    const body = el("div", "loki-body");
+    body.appendChild(this._media.el);
+
+    card.append(this._header, body, this._note);
     this.append(style, card);
     this._built = true;
   }
 
   _update() {
     const hass = this._hass;
-    if (!this._config.camera) {
+    const camera = this._config.camera;
+    if (!camera) {
       this._header.textContent = t.pickDoor;
       this._media.el.hidden = true;
+      this._note.hidden = true;
       return;
     }
     this._media.el.hidden = false;
-    const door = resolveDoor(hass, this._config.camera);
-    this._door = door;
 
+    const door = resolveDoor(hass, camera);
+    this._door = door;
     this._header.textContent = this._config.name || door.name;
+    // The name is already in the header; repeating it on the picture is noise.
+    this._label.textContent = "";
     this._openBtn.hidden = !door.button;
-    this._liveBtn.textContent = this._live ? t.stop : t.live;
 
     const call = door.call ? hass.states[door.call] : null;
     this._ringing.hidden = !(call && call.state === "on");
 
-    const sensorId = this._config.stream_sensor || findStreamSensor(hass);
-    const sensor = sensorId ? hass.states[sensorId] : null;
-    // Only ever a claim that video is DOWN. An unknown sensor says nothing, and a
-    // red banner over a working picture is worse than no banner at all.
-    this._ribbon.hidden = !(sensor && sensor.state === "off");
+    const reachable = streamReachable(hass, this._config.stream_sensor);
+    this._note.hidden = reachable;
+    // Disabled rather than hidden: the button is the answer to "why can I not see
+    // live video", and its tooltip says so. Letting it through would open an RTSP
+    // connection already known to time out.
+    this._liveBtn.disabled = !reachable;
+    this._liveBtn.title = reachable ? (this._live ? t.stop : t.live) : t.liveBlocked;
+    this._liveBtn.classList.toggle("on", this._live && reachable);
+    this._liveBtn.firstChild.setAttribute(
+      "icon",
+      this._live && reachable ? ICON_STOP : ICON_LIVE
+    );
 
-    this._media.render(this._config.camera, this._live);
+    this._media.render(camera, this._live && reachable);
   }
 
   _toggleLive() {
@@ -480,10 +526,10 @@ class LokiDoorCard extends HTMLElement {
       if (seconds > 0) {
         this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
       }
+      if (this._hass) this._update();
     } else {
       this._stopLive();
     }
-    if (this._hass) this._update();
   }
 
   _stopLive() {
@@ -497,7 +543,7 @@ class LokiDoorCard extends HTMLElement {
   }
 
   async _open() {
-    await pressOpen(this._hass, this._door, this._openBtn);
+    await pressOpen(this._hass, this._door, this._openBtn, this._openLabel);
   }
 }
 
@@ -509,12 +555,12 @@ class LokiWallCard extends HTMLElement {
   }
 
   static getStubConfig(hass) {
-    return { cameras: findDoorCameras(hass), columns: 2 };
+    return { cameras: findDoorCameras(hass) };
   }
 
   constructor() {
     super();
-    this._config = null;
+    this._config = {};
     this._hass = null;
     this._live = false;
     this._tiles = new Map();
@@ -525,10 +571,9 @@ class LokiWallCard extends HTMLElement {
   setConfig(config) {
     this._config = {
       title: "Домофоны",
-      columns: 2,
       live_timeout: DEFAULT_LIVE_TIMEOUT,
       cameras: [],
-      ...config,
+      ...(config || {}),
     };
     if (this._built) {
       this._teardown();
@@ -544,21 +589,13 @@ class LokiWallCard extends HTMLElement {
   }
 
   getCardSize() {
-    const count = this._cameras().length;
-    return 2 + Math.ceil(count / (Number(this._config.columns) || 2)) * 4;
+    return 2 + Math.ceil(this._cameras().length / 3) * 3;
   }
 
   /** Sizing for sections views. A wall of doors wants the full width. */
   getGridOptions() {
-    const rows = Math.ceil(
-      this._cameras().length / (Number(this._config.columns) || 2)
-    );
-    return {
-      columns: 'full',
-      rows: Math.max(4, rows * 4 + 1),
-      min_columns: 6,
-      min_rows: 4,
-    };
+    const rows = Math.ceil(this._cameras().length / 3);
+    return { columns: "full", rows: Math.max(4, rows * 3 + 1), min_columns: 6 };
   }
 
   disconnectedCallback() {
@@ -574,69 +611,63 @@ class LokiWallCard extends HTMLElement {
   }
 
   _build() {
-    const style = document.createElement("style");
+    const style = el("style");
     style.textContent = `${STYLE}
       .loki-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        padding: 12px 16px;
+        padding: 12px 16px 8px;
       }
-      .loki-header .loki-title { font-size: 18px; }
-      .loki-grid {
-        display: grid;
-        gap: 10px;
-        padding: 0 12px 12px;
+      .loki-header .loki-title {
+        font-size: 18px;
+        font-weight: 500;
+        color: var(--ha-card-header-color, var(--primary-text-color));
       }
-      .loki-tile { display: flex; flex-direction: column; gap: 6px; }
-      .loki-tile .loki-name {
-        font-size: 14px;
-        color: var(--primary-text-color);
+      .loki-live-all {
+        font: inherit;
+        font-size: 13px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--primary-color, #03a9f4);
+        background: none;
+        border: 1px solid currentColor;
+        border-radius: 999px;
+        padding: 4px 12px;
+        cursor: pointer;
         white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
       }
-      .loki-tile .loki-btn {
+      .loki-live-all ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+      .loki-live-all[disabled] { opacity: 0.4; cursor: default; }
+      .loki-live-all.on {
         color: var(--text-primary-color, #fff);
         background: var(--primary-color, #03a9f4);
         border-color: transparent;
-        width: 100%;
       }
-      .loki-solo {
-        font-size: 14px;
-        background: rgba(0, 0, 0, 0.55);
-        border: 1px solid rgba(255, 255, 255, 0.25);
-        color: #fff;
-      }
+      .loki-grid { display: grid; gap: 10px; padding: 0 12px 12px; }
     `;
 
     const card = document.createElement("ha-card");
 
-    const header = document.createElement("div");
-    header.className = "loki-header";
-    this._titleEl = document.createElement("div");
-    this._titleEl.className = "loki-title";
-    this._liveBtn = document.createElement("button");
-    this._liveBtn.className = "loki-btn primary";
+    const header = el("div", "loki-header");
+    this._titleEl = el("div", "loki-title");
+    this._liveBtn = el("button", "loki-live-all");
+    this._liveIcon = icon(ICON_LIVE);
+    this._liveLabel = el("span", null, t.liveAll);
+    this._liveBtn.append(this._liveIcon, this._liveLabel);
     this._liveBtn.addEventListener("click", () => this._toggleLive());
     header.append(this._titleEl, this._liveBtn);
 
-    this._ribbon = document.createElement("div");
-    this._ribbon.className = "loki-ribbon";
-    this._ribbon.style.position = "static";
-    this._ribbon.textContent = t.unavailable;
-    this._ribbon.hidden = true;
+    this._note = el("div", "loki-note", t.unavailable);
+    this._note.hidden = true;
 
-    this._grid = document.createElement("div");
-    this._grid.className = "loki-grid";
-
-    this._empty = document.createElement("div");
-    this._empty.className = "loki-empty";
-    this._empty.textContent = t.noDoors;
+    this._grid = el("div", "loki-grid");
+    this._empty = el("div", "loki-empty", t.noDoors);
     this._empty.hidden = true;
 
-    card.append(header, this._ribbon, this._empty, this._grid);
+    card.append(header, this._note, this._empty, this._grid);
     this.append(style, card);
     this._built = true;
   }
@@ -644,20 +675,29 @@ class LokiWallCard extends HTMLElement {
   _update() {
     const hass = this._hass;
     const cameras = this._cameras();
+    const reachable = streamReachable(hass, this._config.stream_sensor);
 
     this._titleEl.textContent = this._config.title;
-    this._liveBtn.textContent = this._live ? t.stopAll : t.liveAll;
-    this._liveBtn.hidden = cameras.length === 0;
     this._empty.hidden = cameras.length > 0;
+    this._note.hidden = reachable;
 
-    const columns = Math.max(1, Number(this._config.columns) || 2);
-    this._grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    this._liveBtn.hidden = cameras.length === 0;
+    this._liveBtn.disabled = !reachable;
+    this._liveBtn.title = reachable ? "" : t.liveBlocked;
+    this._liveBtn.classList.toggle("on", this._live && reachable);
+    this._liveLabel.textContent = this._live && reachable ? t.stopAll : t.liveAll;
+    this._liveIcon.setAttribute(
+      "icon",
+      this._live && reachable ? ICON_STOP : ICON_LIVE
+    );
 
-    const sensorId = this._config.stream_sensor || findStreamSensor(hass);
-    const sensor = sensorId ? hass.states[sensorId] : null;
-    this._ribbon.hidden = !(sensor && sensor.state === "off");
+    // Width-driven by default: a fixed column count is either cramped on a phone or
+    // absurdly stretched on a monitor. `columns` remains as an explicit override.
+    const columns = Number(this._config.columns);
+    this._grid.style.gridTemplateColumns = columns
+      ? `repeat(${Math.max(1, columns)}, minmax(0, 1fr))`
+      : "repeat(auto-fill, minmax(180px, 1fr))";
 
-    // Drop tiles for cameras that are no longer configured, so their streams stop.
     for (const [camera, tile] of this._tiles) {
       if (!cameras.includes(camera)) {
         tile.media.destroy();
@@ -680,55 +720,54 @@ class LokiWallCard extends HTMLElement {
 
       const door = resolveDoor(hass, camera);
       tile.door = door;
-      tile.name.textContent = door.name;
+      tile.label.textContent = door.name;
       tile.open.hidden = !door.button;
 
       const call = door.call ? hass.states[door.call] : null;
       tile.ringing.hidden = !(call && call.state === "on");
 
+      const live = (this._live || tile.solo) && reachable;
+      tile.liveBtn.disabled = !reachable;
+      tile.liveBtn.title = reachable ? (live ? t.stop : t.live) : t.liveBlocked;
+      tile.liveBtn.classList.toggle("on", live);
+      tile.liveBtn.firstChild.setAttribute("icon", live ? ICON_STOP : ICON_LIVE);
+
       tile.media.setHass(hass);
-      tile.media.render(camera, this._live);
+      tile.media.render(camera, live);
     });
   }
 
   _buildTile(camera) {
-    const root = document.createElement("div");
-    root.className = "loki-tile";
-
     const media = new DoorMedia();
-
-    const ringing = document.createElement("div");
-    ringing.className = "loki-ringing";
-    ringing.textContent = t.ringing;
+    const ringing = el("div", "loki-ringing", t.ringing);
     ringing.hidden = true;
 
-    const overlay = document.createElement("div");
-    overlay.className = "loki-overlay";
-    const solo = document.createElement("button");
-    solo.className = "loki-btn loki-solo";
-    solo.textContent = t.live;
-    overlay.appendChild(solo);
-    media.el.append(ringing, overlay);
+    const liveBtn = iconButton(ICON_LIVE, t.live);
+    const parts = pictureBar();
+    media.el.append(ringing, liveBtn, parts.bar);
 
-    const name = document.createElement("div");
-    name.className = "loki-name";
+    const tile = {
+      root: media.el,
+      media,
+      label: parts.label,
+      open: parts.open,
+      openLabel: parts.openLabel,
+      ringing,
+      liveBtn,
+      solo: false,
+      door: null,
+    };
 
-    const open = document.createElement("button");
-    open.className = "loki-btn";
-    open.textContent = t.open;
-
-    const tile = { root, media, name, open, ringing, solo, door: null };
-
-    solo.addEventListener("click", () => {
-      // One tile live on its own: the usual case is "I can see somebody on this
-      // thumbnail, show me that one properly" without paying for twenty streams.
-      tile.solo.textContent = tile.soloLive ? t.live : t.stop;
-      tile.soloLive = !tile.soloLive;
-      media.render(camera, this._live || tile.soloLive);
+    liveBtn.addEventListener("click", () => {
+      // One tile on its own: usually "I can see somebody on this thumbnail, show me
+      // that one properly" -- without paying for twenty streams.
+      tile.solo = !tile.solo;
+      if (this._hass) this._update();
     });
-    open.addEventListener("click", () => pressOpen(this._hass, tile.door, open));
+    parts.open.addEventListener("click", () =>
+      pressOpen(this._hass, tile.door, parts.open, parts.openLabel)
+    );
 
-    root.append(media.el, name, open);
     return tile;
   }
 
@@ -739,10 +778,10 @@ class LokiWallCard extends HTMLElement {
       if (seconds > 0) {
         this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
       }
+      if (this._hass) this._update();
     } else {
       this._stopLive();
     }
-    if (this._hass) this._update();
   }
 
   _stopLive() {
@@ -752,6 +791,7 @@ class LokiWallCard extends HTMLElement {
     }
     if (!this._live) return;
     this._live = false;
+    for (const tile of this._tiles.values()) tile.solo = false;
     if (this._hass && this._built) this._update();
   }
 
@@ -767,38 +807,33 @@ class LokiWallCard extends HTMLElement {
  * Press a door's open button and say what happened, on the button itself.
  *
  * A door opens out of sight of whoever pressed it, so silence is indistinguishable
- * from failure. The integration raises a real error when the service refuses, and
- * that has to reach the person standing at the dashboard.
+ * from failure. The integration raises a real error when the service refuses, and that
+ * has to reach the person standing at the dashboard.
  */
-async function pressOpen(hass, door, button) {
+async function pressOpen(hass, door, button, label) {
   if (!hass || !door || !door.button || button.disabled) return;
-  const label = button.textContent;
+  const original = label.textContent;
   button.disabled = true;
-  button.classList.add("busy");
-  button.textContent = t.opening;
+  label.textContent = t.opening;
   try {
     await hass.callService("button", "press", { entity_id: door.button });
-    button.textContent = t.opened;
+    label.textContent = t.opened;
   } catch (err) {
-    button.textContent = t.failed;
+    label.textContent = t.failed;
     fire(button, "hass-notification", {
       message: `${door.name}: ${(err && err.message) || t.failed}`,
     });
   } finally {
     window.setTimeout(() => {
       button.disabled = false;
-      button.classList.remove("busy");
-      button.textContent = label;
+      label.textContent = original;
     }, 2000);
   }
 }
 
 /* ------------------------------------------------------------------ editors */
 
-/**
- * Base editor: an ha-form driven by a schema, so the door is a dropdown and the
- * entity list is the same picker Home Assistant uses everywhere else.
- */
+/** Base editor: an ha-form driven by a schema, so nobody has to write YAML. */
 class LokiEditorBase extends HTMLElement {
   setConfig(config) {
     this._config = config || {};
@@ -833,7 +868,7 @@ class LokiEditorBase extends HTMLElement {
         cameras: "Какие домофоны показывать",
         name: "Заголовок (необязательно)",
         title: "Заголовок",
-        columns: "Плиток в ряд",
+        columns: "Плиток в ряд (пусто — по ширине)",
         live_timeout: "Сам выключить видео через, с",
       }[name] || name
     );
@@ -864,15 +899,12 @@ class LokiWallCardEditor extends LokiEditorBase {
       {
         name: "cameras",
         selector: {
-          entity: {
-            multiple: true,
-            filter: { integration: "loki", domain: "camera" },
-          },
+          entity: { multiple: true, filter: { integration: "loki", domain: "camera" } },
         },
       },
       {
         name: "columns",
-        selector: { number: { min: 1, max: 6, step: 1, mode: "box" } },
+        selector: { number: { min: 1, max: 8, step: 1, mode: "box" } },
       },
       {
         name: "live_timeout",
@@ -895,19 +927,17 @@ window.customCards.push(
     type: "loki-door-card",
     name: "Loki — домофон",
     description:
-      "Картинка с домофона, кнопка «Открыть» и предупреждение, когда живое видео недоступно.",
+      "Картинка с домофона, кнопка «Открыть» и отметка звонка. Живое видео — по кнопке.",
     preview: true,
-    documentationURL:
-      "https://github.com/william-aqn/home-assistant-domofon-hacs",
+    documentationURL: "https://github.com/william-aqn/home-assistant-domofon-hacs",
   },
   {
     type: "loki-wall-card",
     name: "Loki — все домофоны",
     description:
-      "Плитки всех домофонов с кнопкой открытия под каждой. По кнопке — живое видео сразу со всех.",
+      "Плитки всех домофонов с кнопкой открытия на каждой, чтобы найти человека глазами.",
     preview: true,
-    documentationURL:
-      "https://github.com/william-aqn/home-assistant-domofon-hacs",
+    documentationURL: "https://github.com/william-aqn/home-assistant-domofon-hacs",
   }
 );
 
