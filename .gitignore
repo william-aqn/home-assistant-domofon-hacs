@@ -27,3 +27,4 @@ secrets.yaml
 .env
 *.local.json
 tests/fixtures/raw/
+_apk
