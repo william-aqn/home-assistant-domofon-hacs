@@ -1,0 +1,32 @@
+open_door:
+  fields:
+    device_id:
+      required: true
+      example: 695
+      selector:
+        number:
+          min: 1
+          max: 999999
+          mode: box
+
+simulate_ring:
+  fields:
+    device_id:
+      required: true
+      example: 695
+      selector:
+        number:
+          min: 1
+          max: 999999
+          mode: box
+
+hangup:
+  fields:
+    device_id:
+      required: true
+      example: 695
+      selector:
+        number:
+          min: 1
+          max: 999999
+          mode: box

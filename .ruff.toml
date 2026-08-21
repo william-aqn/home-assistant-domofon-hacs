@@ -1,0 +1,26 @@
+target-version = "py313"
+line-length = 88
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "SIM", "RUF", "BLE"]
+ignore = [
+  # Asserts guard invariants inside config-flow steps and are used freely in tests.
+  "S101",
+  # This project is Russian-language: user-facing strings are Cyrillic by design, so the
+  # confusable-character check fires on essentially every message.
+  "RUF001",
+  "RUF002",
+  "RUF003",
+  # Home Assistant's own exception hierarchy does not use the Error suffix
+  # (ConfigEntryNotReady, ConfigEntryAuthFailed), and ours mirrors it.
+  "N818",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S", "N"]
+# These are configuration *key names*, not credentials.
+"custom_components/loki/const.py" = ["S105"]
+
+[lint.isort]
+force-sort-within-sections = true
+known-first-party = ["custom_components.loki"]

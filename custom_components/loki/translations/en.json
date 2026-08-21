@@ -1,0 +1,130 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Loki — terms of use",
+        "description": "**Read this before setting up.**\n\n**1. You need a separate phone number.** The service allows only one active session per number. Entering a number that is already in use by the operator's mobile app **will sign that app out**. Get a separate number for Home Assistant and add it to the allowed-numbers list through the official app.\n\n**2. Independent project.** Loki is free, open-source software under the MIT licence. It is not an official product of any intercom operator, is not affiliated with, endorsed by, or supported by one. All trademarks belong to their respective owners.\n\n**3. No warranty.** The software is provided \"AS IS\", without warranty of any kind. **It is not a security device** and is not a replacement for the standard means of access. The author is not liable for any damages arising from use of, or inability to use, the software.\n\n**4. Your responsibility.** You must have lawful access to the intercom system and to the account used. You are responsible for assessing whether your use complies with your agreement with the operator, and for complying with data-protection law when using video and face recognition.\n\n**5. Data.** Loki runs locally. The author receives and stores nothing: not your number, confirmation codes, tokens, or video.\n\nFull text: [DISCLAIMER.md]({disclaimer_url})",
+        "data": {
+          "accept": "I have read and accept the terms"
+        }
+      },
+      "phone": {
+        "title": "Phone number",
+        "description": "Enter the phone number registered to the flat.\n\n⚠️ Reminder: if this number is in use by the operator's mobile app, that app will be signed out.",
+        "data": {
+          "phone": "Phone number"
+        },
+        "data_description": {
+          "phone": "Any format: +7 999 123-45-67, 8 999 1234567, 9991234567"
+        }
+      },
+      "sms": {
+        "title": "Confirmation",
+        "description": "Enter the code sent by SMS to {phone}.\n\nThe code is valid for about 20 minutes. If no SMS arrived, tick \"Resend the code\" and submit.",
+        "data": {
+          "sms_code": "SMS code",
+          "resend": "Resend the code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate",
+        "description": "The session for {phone} has expired. This is expected: the server never renews the refresh token, so signing in again is required roughly every 90 days.\n\nSubmit to receive a new code by SMS."
+      }
+    },
+    "error": {
+      "disclaimer_not_accepted": "You must accept the terms of use to continue",
+      "invalid_phone": "That phone number could not be parsed",
+      "phone_not_registered": "This number is not registered with the service",
+      "cannot_connect": "Could not reach the server",
+      "invalid_code": "Wrong code, or it has expired",
+      "expired_token": "The request has expired — resend the code",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This number is already set up",
+      "already_in_progress": "Setup for this number is already in progress",
+      "reauth_successful": "Re-authentication complete",
+      "reauth_failed": "Could not determine which phone number to re-authenticate",
+      "unique_id_mismatch": "That is a different phone number — re-authentication only works for the same account"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Settings",
+        "data": {
+          "scan_interval": "Device list refresh interval, seconds"
+        },
+        "data_description": {
+          "scan_interval": "Doors and cameras change rarely, so polling often gains nothing."
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "call_active": {
+        "name": "Call in progress"
+      }
+    },
+    "button": {
+      "open": {
+        "name": "Open"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "name": "Doorbell"
+      }
+    }
+  },
+  "services": {
+    "open_door": {
+      "name": "Open door",
+      "description": "Opens a door by its device id. Needed for automations where the id arrives in a call event.",
+      "fields": {
+        "device_id": {
+          "name": "Device id",
+          "description": "Numeric door id."
+        }
+      }
+    },
+    "simulate_ring": {
+      "name": "Simulate a ring",
+      "description": "Fires an incoming-call event for a door, to test notifications and automations without a real intercom call.",
+      "fields": {
+        "device_id": {
+          "name": "Device id",
+          "description": "Numeric door id."
+        }
+      }
+    },
+    "hangup": {
+      "name": "End call",
+      "description": "Ends the active call for a door.",
+      "fields": {
+        "device_id": {
+          "name": "Device id",
+          "description": "Numeric door id."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "device_not_found": {
+      "message": "Device {device_id} was not found in any account"
+    },
+    "not_a_door": {
+      "message": "Device {device_id} ({device_name}) is a camera, not a door: it has no lock and no doorbell"
+    },
+    "no_loaded_entry": {
+      "message": "No account is loaded — check the integration's status"
+    },
+    "open_forbidden": {
+      "message": "The service refused to open the door: {error}"
+    },
+    "open_failed": {
+      "message": "Could not open the door: {error}"
+    }
+  }
+}

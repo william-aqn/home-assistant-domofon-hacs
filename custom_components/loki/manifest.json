@@ -1,0 +1,12 @@
+{
+  "domain": "loki",
+  "name": "Loki",
+  "codeowners": ["@william-aqn"],
+  "config_flow": true,
+  "documentation": "https://github.com/william-aqn/home-assistant-domofon-hacs",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/william-aqn/home-assistant-domofon-hacs/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

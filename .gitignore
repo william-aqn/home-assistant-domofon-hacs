@@ -1,0 +1,26 @@
+# Локальные рабочие заметки — не коммитить
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Home Assistant dev instance
+config/
+!config/.gitkeep
+
+# Секреты и записанные фикстуры до редакции
+secrets.yaml
+.env
+*.local.json
+tests/fixtures/raw/

@@ -1,0 +1,136 @@
+blueprint:
+  name: Loki — звонок в дверь с видео и кнопкой «Открыть»
+  description: >
+    При входящем звонке с домофона отправляет actionable-уведомление на телефон:
+    снимок с камеры двери и кнопка «Открыть» прямо в уведомлении. Работает и когда
+    вас нет дома, и когда дашборд закрыт.
+
+
+    Для проверки без реального звонка вызовите действие **Loki: Сымитировать звонок**
+    (`loki.simulate_ring`) с id нужной двери.
+  domain: automation
+  # Without source_url the blueprint cannot be updated from the UI.
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/ring_notify_open.yaml
+  author: william-aqn
+  input:
+    notify_device:
+      name: Телефон для уведомления
+      description: >
+        Устройство с установленным приложением Home Assistant. Используется действие
+        устройства `mobile_app`, поэтому имя службы уведомления подставлять не нужно.
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+    open_action_title:
+      name: Текст кнопки открытия
+      default: Открыть
+      selector:
+        text:
+    notification_tag:
+      name: Тег уведомления
+      description: >
+        Уведомления с одинаковым тегом заменяют друг друга, поэтому старый звонок
+        не копится на экране.
+      default: loki_ring
+      selector:
+        text:
+    notification_channel:
+      name: Канал уведомлений (только Android)
+      description: >
+        Канал создаётся один раз и потом неизменяем, а важность можно только понижать.
+        Латиница безопаснее.
+      default: Loki Domofon
+      selector:
+        text:
+    wait_timeout:
+      name: Сколько ждать нажатия
+      description: >
+        Должно совпадать с CALL_TIMEOUT интеграции (по умолчанию 120 с), иначе
+        автоматизация будет ждать вызов, который уже снят по таймауту.
+      default:
+        minutes: 2
+      selector:
+        duration:
+
+mode: parallel
+max: 10
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: call_incoming
+
+conditions: []
+
+actions:
+  - alias: Подготовить переменные
+    variables:
+      # A blueprint input is a YAML tag, not a template variable: using
+      # {{ notification_tag }} without binding it here renders as undefined.
+      tag_in: !input notification_tag
+      channel_in: !input notification_channel
+      open_title: !input open_action_title
+
+      device_id: "{{ trigger.event.data.device_id }}"
+      device_name: "{{ trigger.event.data.device_name }}"
+      # entity_id is null when the door has no camera, or its camera entity is
+      # disabled. Normalise to '' so the checks below are simple.
+      camera_entity: "{{ trigger.event.data.entity_id | default('', true) }}"
+
+      # Keyed on the run, not on the door: two rings at the same door inside the
+      # timeout would otherwise share one action name, and a single tap would open
+      # the door twice.
+      action_open: "LOKI_OPEN_{{ context.id }}"
+
+      # Built as a whole: an empty `image` breaks attachment loading on Android, so
+      # the key is either present and valid or absent entirely.
+      notify_data: >-
+        {% set acts = [{'action': action_open, 'title': open_title}] %}
+        {% if camera_entity %}
+        {{ {'tag': tag_in, 'channel': channel_in, 'importance': 'high',
+            'ttl': 0, 'priority': 'high', 'actions': acts,
+            'push': {'interruption-level': 'time-sensitive'},
+            'image': '/api/camera_proxy/' ~ camera_entity,
+            'entity_id': camera_entity} }}
+        {% else %}
+        {{ {'tag': tag_in, 'channel': channel_in, 'importance': 'high',
+            'ttl': 0, 'priority': 'high', 'actions': acts,
+            'push': {'interruption-level': 'time-sensitive'}} }}
+        {% endif %}
+
+  - alias: Отправить уведомление со снимком и кнопкой
+    domain: mobile_app
+    type: notify
+    device_id: !input notify_device
+    title: Звонок в дверь
+    message: "{{ device_name }}"
+    data: "{{ notify_data }}"
+
+  - alias: Ждать нажатия кнопки «Открыть»
+    wait_for_trigger:
+      # Templates in event_data are supported here since HA 2021.3 and are rendered
+      # when the trigger is attached, against this run's variables.
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "{{ action_open }}"
+    timeout: !input wait_timeout
+    continue_on_timeout: true
+
+  - alias: Открыть дверь, если нажали кнопку
+    if:
+      - condition: template
+        value_template: "{{ wait.completed }}"
+    then:
+      - action: loki.open_door
+        data:
+          device_id: "{{ device_id }}"
+    else:
+      - alias: Убрать «висящее» уведомление после таймаута
+        domain: mobile_app
+        type: notify
+        device_id: !input notify_device
+        message: clear_notification
+        data: "{{ {'tag': tag_in} }}"
