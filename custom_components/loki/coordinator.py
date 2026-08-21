@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import LokiApiError, LokiAuthError, LokiClient
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, OPT_SCAN_INTERVAL
 from .models import LokiDevice
+from .reauth import async_clear_auth_failed, async_fire_auth_failed
 
 if TYPE_CHECKING:
     from .call import CallManager
@@ -71,9 +72,17 @@ class LokiCoordinator(DataUpdateCoordinator[dict[int, LokiDevice]]):
         try:
             devices = await self.client.async_get_devices()
         except LokiAuthError as err:
-            # Only a fresh SMS login can recover from this.
-            raise ConfigEntryAuthFailed(str(err)) from err
+            # Only a fresh SMS login can recover from this. The event is latched, so
+            # this fires once rather than on every poll for as long as it stays broken.
+            async_fire_auth_failed(self.hass, self.config_entry, err)
+            raise ConfigEntryAuthFailed(
+                str(err),
+                translation_domain=DOMAIN,
+                translation_key="auth_expired",
+                translation_placeholders={"phone": str(self.config_entry.title)},
+            ) from err
         except LokiApiError as err:
             raise UpdateFailed(str(err)) from err
 
+        async_clear_auth_failed(self.hass, self.config_entry)
         return {device.id: device for device in devices}

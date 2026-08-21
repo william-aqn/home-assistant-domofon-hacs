@@ -27,8 +27,8 @@
         }
       },
       "reauth_confirm": {
-        "title": "Re-authenticate",
-        "description": "The session for {phone} has expired. This is expected: the server never renews the refresh token, so signing in again is required roughly every 90 days.\n\nSubmit to receive a new code by SMS."
+        "title": "Sign in again",
+        "description": "The session for {phone} has ended.\n\nThere are two possible reasons: the token expired (this happens routinely and is expected), or **someone signed in elsewhere with this same number** — the service allows only one active session per number.\n\n⚠️ If another device took the session, signing in here will **sign that device out**. If this keeps happening, get a separate number for Home Assistant and add it through the official app.\n\nSubmit to receive a new code by SMS."
       }
     },
     "error": {
@@ -110,7 +110,23 @@
       }
     }
   },
+  "issues": {
+    "reauth_unrecoverable": {
+      "title": "Loki: account \"{title}\" cannot be recovered",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Set the account up again",
+            "description": "The stored data for account \"{title}\" holds no phone number, so signing in again is impossible — there is nothing to sign in with.\n\nSubmit to remove the entry, then add the integration again via \"Add integration → Loki\". Your devices and their identifiers are preserved."
+          }
+        }
+      }
+    }
+  },
   "exceptions": {
+    "auth_expired": {
+      "message": "The session for {phone} has ended — you need to sign in again. There are two possible reasons: the token expired (this happens routinely), or someone signed in elsewhere with this same number, as the service allows only one active session per number. If this keeps happening, get a separate number for Home Assistant."
+    },
     "device_not_found": {
       "message": "Device {device_id} was not found in any account"
     },

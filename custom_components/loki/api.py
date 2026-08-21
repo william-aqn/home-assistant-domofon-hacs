@@ -18,6 +18,7 @@ from yarl import URL
 from .const import DEFAULT_API_HOST, DEFAULT_USER_AGENT
 from .models import KEY_CAMERAS, KEY_DOORS, LokiDevice, parse_device_list
 from .protocol import auth_hash
+from .redact import describe_response, redact
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +36,25 @@ _DEVICE_LIST_OPTIONS = {
 
 
 class LokiError(Exception):
-    """Base error for this integration."""
+    """Base error for this integration.
+
+    Carries the HTTP status and the server's own message when there was one, so a
+    caller can record *what the backend actually said* rather than only our prose.
+    That record is the only route to ever distinguishing a routine token expiry from
+    a session taken over elsewhere -- today they are indistinguishable.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status: int | None = None,
+        server_message: str | None = None,
+    ) -> None:
+        """Initialise the error."""
+        super().__init__(message)
+        self.status = status
+        self.server_message = server_message
 
 
 class LokiApiError(LokiError):
@@ -126,6 +145,9 @@ class LokiClient:
 
         # This second call is what actually sends the SMS.
         await self._post("/api/auth/showPin", {"phone": phone}, auth=False)
+        # The backend acknowledges the request but says nothing about delivery, so
+        # this records that we asked -- not that an SMS arrived.
+        _LOGGER.debug("SMS requested for %s", redact({"phone": phone})["phone"])
         return str(token)
 
     async def confirm_sms(
@@ -180,7 +202,11 @@ class LokiClient:
             # A rejected refresh token is unrecoverable: it is never rotated, so
             # there is nothing to retry with. Only a new SMS login fixes it, and
             # surfacing LokiAuthError is what starts the reauth flow.
-            raise LokiAuthError(f"refresh rejected: {err}") from err
+            raise LokiAuthError(
+                f"refresh rejected: {err}",
+                status=err.status,
+                server_message=err.server_message,
+            ) from err
 
         token = response.get("token") if isinstance(response, dict) else None
         if not token:
@@ -320,15 +346,30 @@ class LokiClient:
                     await self.async_refresh_token()
             status, payload = await self._raw_post(path, body, auth=auth)
 
+        server_message = (
+            str(payload.get("message"))
+            if isinstance(payload, dict) and payload.get("message")
+            else None
+        )
+
         if status == 401:
-            raise LokiAuthError(f"{path} returned 401")
+            raise LokiAuthError(
+                f"{path} returned 401", status=401, server_message=server_message
+            )
         if status == 400:
             # Left unclassified on purpose: what a 400 means depends entirely on the
             # endpoint, so each caller narrows it.
-            message = payload.get("message") if isinstance(payload, dict) else None
-            raise LokiBadRequest(str(message or "bad request"))
+            raise LokiBadRequest(
+                server_message or "bad request",
+                status=400,
+                server_message=server_message,
+            )
         if status != 200:
-            raise LokiApiError(f"{path} returned HTTP {status}")
+            raise LokiApiError(
+                f"{path} returned HTTP {status}",
+                status=status,
+                server_message=server_message,
+            )
 
         return payload
 
@@ -371,10 +412,26 @@ class LokiClient:
             raise LokiApiError(f"{path} failed: {err}") from err
 
         if not text:
+            _LOGGER.debug("POST %s %s -> %s, empty body", path, redact(body), status)
             return status, None
 
         try:
-            return status, json.loads(text)
+            parsed = json.loads(text)
         except ValueError:
-            _LOGGER.debug("%s returned a non-JSON body", path)
+            _LOGGER.debug(
+                "POST %s %s -> %s, non-JSON body (%d bytes)",
+                path,
+                redact(body),
+                status,
+                len(text),
+            )
             return status, text
+
+        _LOGGER.debug(
+            "POST %s %s -> %s %s",
+            path,
+            redact(body),
+            status,
+            describe_response(parsed),
+        )
+        return status, parsed

@@ -16,6 +16,8 @@ from .api import LokiApiError, LokiAuthError, LokiClient
 from .call import CallManager
 from .const import CONF_REFRESH_TOKEN, DOMAIN
 from .coordinator import LokiConfigEntry, LokiCoordinator, LokiRuntimeData
+from .reauth import async_clear_auth_failed, async_fire_auth_failed
+from .repairs import async_clear_reauth_unrecoverable
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,6 +41,11 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool:
     """Set up Loki from a config entry."""
+    # Cleared first, before anything that can fail: reaching this line at all means
+    # the entry is usable again. It must not live in async_unload_entry, because an
+    # unload runs before every failing setup too.
+    async_clear_reauth_unrecoverable(hass, entry.entry_id)
+
     client = LokiClient(
         async_get_clientsession(hass),
         refresh_token=entry.data[CONF_REFRESH_TOKEN],
@@ -50,9 +57,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
     try:
         await client.async_refresh_token()
     except LokiAuthError as err:
-        raise ConfigEntryAuthFailed(str(err)) from err
+        async_fire_auth_failed(hass, entry, err)
+        raise ConfigEntryAuthFailed(
+            str(err),
+            translation_domain=DOMAIN,
+            translation_key="auth_expired",
+            translation_placeholders={"phone": str(entry.title)},
+        ) from err
     except LokiApiError as err:
         raise ConfigEntryNotReady(str(err)) from err
+
+    async_clear_auth_failed(hass, entry)
 
     coordinator = LokiCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()

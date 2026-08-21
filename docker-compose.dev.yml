@@ -1,0 +1,22 @@
+# Local Home Assistant for developing this integration.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml logs -f
+#
+# The integration is bind-mounted, so edits land immediately; reload the entry (or
+# restart the container) to pick them up. ./config is gitignored and disposable --
+# delete it to start from a clean Home Assistant.
+
+services:
+  ha:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: loki-ha-dev
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+    volumes:
+      - ./config:/config
+      - ./custom_components/loki:/config/custom_components/loki:ro
+      - ./blueprints/automation/loki:/config/blueprints/automation/loki:ro
+    environment:
+      TZ: Europe/Moscow

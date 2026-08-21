@@ -15,6 +15,9 @@ dist/
 build/
 *.egg-info/
 
+# IDE
+.idea
+
 # Home Assistant dev instance
 config/
 !config/.gitkeep

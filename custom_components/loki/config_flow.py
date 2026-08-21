@@ -43,6 +43,8 @@ from .const import (
 )
 from .coordinator import LokiConfigEntry
 from .protocol import normalize_phone
+from .reauth import async_record_auth_time
+from .repairs import async_create_reauth_unrecoverable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -174,7 +176,11 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._phone = normalize_phone(entry_data.get(CONF_PHONE))
         if self._phone is None:
             # Entry data predates phone storage or was hand-edited; there is nothing
-            # to reauthenticate against.
+            # to reauthenticate against. Core only raises its own repair card once a
+            # flow shows a form, so an abort here would otherwise be invisible
+            # outside the log -- raise our own.
+            entry = self._get_reauth_entry()
+            async_create_reauth_unrecoverable(self.hass, entry.entry_id, entry.title)
             return self.async_abort(reason="reauth_failed")
         return await self.async_step_reauth_confirm()
 
@@ -253,15 +259,19 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
         if client.refresh_token is None:
             return "invalid_code"
 
-        data = {
-            CONF_PHONE: self._phone,
-            CONF_REFRESH_TOKEN: client.refresh_token,
-            # The SIP credentials are issued only by this endpoint -- a token refresh
-            # does not return them -- so they must be persisted now.
-            CONF_SIP: session.get("sip"),
-            CONF_MASTER_FLG: session.get("master_flg"),
-            CONF_MAX_PHONES: session.get("max_phones"),
-        }
+        # This is the only place a refresh token is ever minted, so it is the only
+        # place its age can be stamped.
+        data = async_record_auth_time(
+            {
+                CONF_PHONE: self._phone,
+                CONF_REFRESH_TOKEN: client.refresh_token,
+                # The SIP credentials are issued only by this endpoint -- a token
+                # refresh does not return them -- so they must be persisted now.
+                CONF_SIP: session.get("sip"),
+                CONF_MASTER_FLG: session.get("master_flg"),
+                CONF_MAX_PHONES: session.get("max_phones"),
+            }
+        )
 
         if self.source == SOURCE_REAUTH:
             # Re-assert the account identity: the entry is keyed on the phone number,

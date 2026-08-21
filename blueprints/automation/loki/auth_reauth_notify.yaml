@@ -1,0 +1,64 @@
+blueprint:
+  name: Loki — уведомление о том, что нужен вход заново
+  description: >
+    Присылает уведомление на телефон, когда сессия Loki завершилась и требуется
+    повторный вход по SMS. Без этого домофон просто перестаёт работать, а причина
+    видна только в интерфейсе Home Assistant — то есть когда вы дома и смотрите
+    в него.
+
+
+    Тап по уведомлению открывает страницу интеграции, где можно сразу войти.
+
+
+    Событие приходит **один раз** на аккаунт, а не на каждую неудачную попытку
+    обновления, и повторяется после перезапуска Home Assistant, пока проблема
+    не решена.
+  domain: automation
+  source_url: https://github.com/william-aqn/home-assistant-domofon-hacs/blob/main/blueprints/automation/loki/auth_reauth_notify.yaml
+  author: william-aqn
+  input:
+    notify_device:
+      name: Телефон для уведомления
+      description: Устройство с установленным приложением Home Assistant.
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+
+mode: queued
+max: 5
+
+triggers:
+  - trigger: event
+    event_type: loki_event
+    event_data:
+      type: auth_failed
+
+conditions: []
+
+actions:
+  - alias: Подготовить текст
+    variables:
+      account: "{{ trigger.event.data.title | default('Loki', true) }}"
+      age: "{{ trigger.event.data.age_days }}"
+      detail: >-
+        {% if age is not none %}
+        Последний вход был {{ age }} дн. назад.
+        {% endif %}
+
+  - alias: Отправить уведомление
+    domain: mobile_app
+    type: notify
+    device_id: !input notify_device
+    title: Домофон отключился — нужен вход заново
+    message: >-
+      Сессия «{{ account }}» завершена, домофон не работает. {{ detail }}
+      Откройте, чтобы войти по SMS.
+    data: >-
+      {{ {'tag': 'loki_auth_failed',
+          'channel': 'Loki',
+          'importance': 'high',
+          'priority': 'high',
+          'ttl': 0,
+          'url': '/config/integrations/integration/loki',
+          'clickAction': '/config/integrations/integration/loki'} }}

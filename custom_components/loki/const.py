@@ -36,6 +36,9 @@ CONF_REFRESH_TOKEN: Final = "refresh_token"
 CONF_SIP: Final = "sip"
 CONF_MASTER_FLG: Final = "master_flg"
 CONF_MAX_PHONES: Final = "max_phones"
+# When the refresh token was issued. Recorded so the age of a failing token can be
+# logged; deliberately not used to guess *why* it failed.
+CONF_AUTH_TIME: Final = "auth_time"
 
 # --- phase 3 (SIP), not yet wired --------------------------------------------
 # Keys inside the ``sip`` object stored at entry.data[CONF_SIP]. Note CONF_SIP_USER
@@ -69,6 +72,11 @@ EVENT_LOKI: Final = "loki_event"
 
 EVENT_TYPE_CALL_INCOMING: Final = "call_incoming"
 EVENT_TYPE_CALL_ENDED: Final = "call_ended"
+EVENT_TYPE_AUTH_FAILED: Final = "auth_failed"
+
+# --- repairs -----------------------------------------------------------------
+
+ISSUE_REAUTH_UNRECOVERABLE: Final = "reauth_unrecoverable"
 
 # Matches HA's DoorbellEventType.RING. Imported as a literal rather than from
 # homeassistant.components.event because that enum postdates our minimum version.
