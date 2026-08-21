@@ -9,10 +9,76 @@ and pushing somebody else's out of the table.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 import secrets
 import uuid
 
 from .const import BRANCH_MAGIC, SIP_PORT
+from .uri import parse_params, parse_uri, split_commas, split_semis
+
+# pjsua derives its instance-id from a hash of the hostname rather than a UUID:
+# 26 zeros then 8 hex digits. On Android gethostname() is very often "localhost", so
+# two phones can even share one. A binding of this shape is a PJSIP client -- which is
+# what the official intercom app is.
+PJSUA_INSTANCE_SHAPE = re.compile(r"^0{8}-0000-0000-0000-0000[0-9a-f]{8}$", re.I)
+
+
+@dataclass(frozen=True, slots=True)
+class Binding:
+    """One Contact row from a registrar's 200 OK."""
+
+    uri: str
+    expires: int | None
+    instance_id: str | None  # lowercased, urn:uuid: stripped
+    reg_id: str | None
+
+    @property
+    def looks_like_pjsua(self) -> bool:
+        """Whether this binding was probably created by the official app."""
+        return bool(self.instance_id and PJSUA_INSTANCE_SHAPE.match(self.instance_id))
+
+
+def parse_bindings(rows: tuple[str, ...]) -> list[Binding]:
+    """Parse every Contact value a registrar reported into structured bindings."""
+    out: list[Binding] = []
+    for row in rows:
+        for item in split_commas(row):
+            uri, params = _split_contact(item)
+            instance = (params.get("+sip.instance") or "").strip("<>").strip('"')
+            if instance.lower().startswith("urn:uuid:"):
+                instance = instance[len("urn:uuid:") :]
+            raw_expires = params.get("expires")
+            out.append(
+                Binding(
+                    uri=uri,
+                    expires=int(raw_expires) if (raw_expires or "").isdigit() else None,
+                    instance_id=instance.lower() or None,
+                    reg_id=params.get("reg-id"),
+                )
+            )
+    return out
+
+
+def _split_contact(row: str) -> tuple[str, dict[str, str]]:
+    """Split one Contact value into its URI and its header parameters.
+
+    Handles both ``<sip:x@y>;expires=60`` and the equally legal bracket-less
+    ``sip:x@y;expires=60``. Mishandling the second form drops every parameter, which
+    would report a healthy binding as somebody else's.
+    """
+    if "<" in row and ">" in row:
+        start, end = row.index("<"), row.index(">")
+        return row[start + 1 : end].strip(), parse_params(split_semis(row[end + 1 :]))
+    pieces = split_semis(row)
+    return pieces[0], parse_params(pieces[1:])
+
+
+def uri_equal(first: str, second: str) -> bool:
+    """Compare two contact URIs per RFC 3261 §19.1.4, falling back to text."""
+    left, right = parse_uri(first), parse_uri(second)
+    if left is None or right is None:
+        return first.strip() == second.strip()
+    return left.equivalent(right)
 
 
 @dataclass
