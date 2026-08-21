@@ -19,12 +19,17 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "0.2.2";
+const CARD_VERSION = "0.3.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
 // everything live" has to be a deliberate act with an end to it.
-const DEFAULT_LIVE_TIMEOUT = 180;
+//
+// Thirty seconds because the job is "where is that person standing" -- long enough to
+// look along a row of doors, short enough that walking away from the tablet cannot
+// leave twenty streams running. Press it again for another thirty; the setting raises
+// it for anyone who wants longer.
+const DEFAULT_LIVE_TIMEOUT = 30;
 
 // How often a still is re-fetched. The camera's own frame interval is 10 s, so asking
 // faster only costs requests the backend answers from its own cache.
@@ -596,14 +601,17 @@ class LokiWallCard extends HTMLElement {
     return 2 + Math.ceil(this._cameras().length / 3) * 3;
   }
 
-  /** Sizing for sections views. A wall of doors wants the full width.
+  /** Sizing for sections views. A wall of doors wants the whole width.
 
-   * 12 is the whole grid, which is the widest a card can ask for. ``columns: "full"``
-   * exists in some versions but is not something this one's own cards use, and a value
-   * the layout does not recognise is a broken card rather than a wide one.
+   * ``"full"`` and not a number. The section grid is 24 columns wide here, so 12 --
+   * which is what most of Home Assistant's own cards ask for -- lands at exactly half
+   * the page. ``"full"`` is handled by a class of its own (``grid-column: 1 / -1``)
+   * rather than by the column counter, so it stays right whatever the grid width is,
+   * and a version that did not know the value would render this narrow rather than
+   * broken.
    */
   getGridOptions() {
-    return { columns: 12, rows: "auto", min_columns: 6, min_rows: 4 };
+    return { columns: "full", rows: "auto", min_columns: 6, min_rows: 4 };
   }
 
   disconnectedCallback() {
