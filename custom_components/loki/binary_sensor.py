@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .call import CallManager, CallUpdate, signal_call_update
 from .coordinator import LokiConfigEntry, LokiCoordinator
-from .entity import LokiEntity, build_unique_id
+from .entity import LokiAccountEntity, LokiEntity, build_unique_id
 from .models import LokiDevice
 
 PARALLEL_UPDATES = 0
@@ -41,6 +44,29 @@ async def async_setup_entry(
 
     entry.async_on_unload(coordinator.async_add_listener(_async_add_new))
     _async_add_new()
+    async_add_entities([LokiStreamReachable(coordinator)])
+
+
+class LokiStreamReachable(LokiAccountEntity, BinarySensorEntity):
+    """Whether live video can work at all.
+
+    Exists because the integration degrades too quietly without it: cameras keep
+    showing the backend's periodically-updated still even when no stream can be
+    opened, so a dashboard full of pictures looks healthy while live video is dead.
+    """
+
+    _attr_translation_key = "stream_reachable"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coordinator: LokiCoordinator) -> None:
+        """Initialise the sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{self._entry_id}_stream_reachable"
+
+    @property
+    def is_on(self) -> bool | None:
+        """True when a video host answered, None before the first check."""
+        return self.coordinator.stream_reachable
 
 
 class LokiCallActive(LokiEntity, BinarySensorEntity):

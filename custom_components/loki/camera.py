@@ -56,7 +56,6 @@ class LokiCamera(LokiEntity, Camera):
     """Live view of one intercom or camera."""
 
     _attr_name = None
-    _attr_supported_features = CameraEntityFeature.STREAM
     # Home Assistant drives its still-based MJPEG fallback at frame_interval (0.5s by
     # default). Polling faster than the snapshot cache just re-serves the same bytes.
     _attr_frame_interval = _SNAPSHOT_TTL
@@ -75,6 +74,28 @@ class LokiCamera(LokiEntity, Camera):
         self._attr_entity_registry_enabled_default = device.is_door
         self._cached_image: bytes | None = None
         self._cached_at = 0.0
+        self._attr_supported_features = self._features()
+
+    def _features(self) -> CameraEntityFeature:
+        """Advertise STREAM only while a stream could actually be played.
+
+        Advertising it and then returning no source is worse than not advertising:
+        the frontend takes the feature at its word, asks to play, and Home Assistant
+        logs "does not support play stream service" for every tile on the dashboard.
+        """
+        device = self.device
+        if device is None or device.stream is None:
+            return CameraEntityFeature(0)
+        # None means "not checked yet" -- stay optimistic until we know otherwise.
+        if self.coordinator.stream_reachable is False:
+            return CameraEntityFeature(0)
+        return CameraEntityFeature.STREAM
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Re-evaluate whether a stream is playable, then write state."""
+        self._attr_supported_features = self._features()
+        super()._handle_coordinator_update()
 
     @property
     def available(self) -> bool:
@@ -112,13 +133,22 @@ class LokiCamera(LokiEntity, Camera):
             self._cached_at = 0.0
 
     async def stream_source(self) -> str | None:
-        """Return the RTSP URL.
+        """Return the RTSP URL, or None when no stream could possibly open.
 
         RTSP rather than the HLS form the API hands out directly: HLS adds five to
         twenty seconds of latency, which is useless for answering a door.
+
+        Handing back a URL we already know is unreachable is worse than admitting it:
+        Home Assistant retries the stream every couple of minutes and fills the log
+        with ffmpeg timeouts, which buries the one line that would have explained the
+        problem. The still image keeps working either way.
         """
         device = self.device
-        return device.stream.rtsp if device and device.stream else None
+        if device is None or device.stream is None:
+            return None
+        if self.coordinator.stream_reachable is False:
+            return None
+        return device.stream.rtsp
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None

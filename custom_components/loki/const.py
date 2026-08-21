@@ -100,3 +100,7 @@ ATTR_DEVICE_ID: Final = "device_id"
 
 RTSP_PORT: Final = 8554
 HLS_PORT: Final = 8888
+
+# How long to wait when checking that a media host answers at all. Short on purpose:
+# this runs on every poll and a firewalled host should be reported, not waited for.
+MEDIA_PROBE_TIMEOUT: Final = 5.0

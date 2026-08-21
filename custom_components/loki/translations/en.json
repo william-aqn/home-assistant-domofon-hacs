@@ -65,6 +65,9 @@
     "binary_sensor": {
       "call_active": {
         "name": "Call in progress"
+      },
+      "stream_reachable": {
+        "name": "Video stream reachable"
       }
     },
     "button": {

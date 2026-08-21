@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
@@ -21,6 +22,36 @@ def build_unique_id(entry_id: str, device_id: int, suffix: str = "") -> str:
     format has exactly one definition.
     """
     return f"{entry_id}_{device_id}{suffix}"
+
+
+def account_device_info(entry_id: str, title: str) -> DeviceInfo:
+    """The device representing the account itself.
+
+    Integration-wide diagnostics -- video reachability now, SIP status later -- belong
+    to the account rather than to any one door, and hanging them off a door would put
+    a "video unavailable" card on an entrance that has nothing to do with the problem.
+    """
+    return DeviceInfo(
+        identifiers={(DOMAIN, f"account_{entry_id}")},
+        name=f"Loki {title}",
+        manufacturer="Loki",
+        model="Учётная запись",
+        entry_type=DeviceEntryType.SERVICE,
+    )
+
+
+class LokiAccountEntity(CoordinatorEntity[LokiCoordinator]):
+    """Base for entities describing the account rather than a device."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: LokiCoordinator) -> None:
+        """Initialise the entity."""
+        super().__init__(coordinator)
+        entry = coordinator.config_entry
+        self._entry_id = entry.entry_id
+        self._attr_device_info = account_device_info(entry.entry_id, entry.title)
 
 
 class LokiEntity(CoordinatorEntity[LokiCoordinator]):
