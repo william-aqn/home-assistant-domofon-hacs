@@ -117,6 +117,6 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
                 # Neither of these names an address, and together they answer the
                 # only question worth asking when the account looks busy: is this
                 # our own binding from before a restart, and how long until it goes.
-                attributes["foreign_at_our_address"] = snapshot.foreign_at_our_address
+                attributes["foreign_where"] = snapshot.foreign_where
                 attributes["foreign_expires_in"] = snapshot.foreign_expires_in
         return attributes

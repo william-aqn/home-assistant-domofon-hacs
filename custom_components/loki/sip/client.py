@@ -94,6 +94,22 @@ STOP_WITHDRAW_TIMEOUT = 3.0
 # before a restart, so the first look lands just after the one we saw would lapse; the
 # rest is a doubling curve, because an account that is genuinely in use must not be
 # probed every minute for ever.
+# Where a binding that is not ours sits, as far as a person needs to know.
+FOREIGN_PUBLIC = "наш публичный адрес"
+FOREIGN_LOCAL = "наш локальный адрес"
+FOREIGN_ELSEWHERE = "другой адрес"
+FOREIGN_UNKNOWN = "адрес неизвестен"
+
+
+def _host_only(sent_by: str | None) -> str | None:
+    """The host out of a ``host:port`` sent-by, brackets and all."""
+    if not sent_by:
+        return None
+    if sent_by.startswith("["):
+        return sent_by.partition("]")[0].lstrip("[") or None
+    return sent_by.rsplit(":", 1)[0] or None
+
+
 BLOCKED_RETRY_MIN = 30.0
 BLOCKED_RETRY_BASE = 60.0
 BLOCKED_RETRY_MAX = 900.0
@@ -132,21 +148,33 @@ class SipSnapshot:
         return len(self.foreign)
 
     @property
-    def foreign_at_our_address(self) -> bool:
-        """Whether a foreign binding sits at the address the registrar sees us at.
+    def foreign_where(self) -> str | None:
+        """Where the other binding sits, relative to us -- named without naming it.
 
-        The one fact that separates "our own leftover from before a restart" from
-        "the resident's phone", and it names neither: a leftover of ours carries the
-        same public host with an older port. Reported, never acted on -- a phone on
-        the same home Wi-Fi shares that host, so it can only ever be a hint.
+        The three answers mean different things, and together they are what separates
+        "our own leftover from before a restart" from "the resident's phone":
+
+        * at the public address the registrar sees us at -- almost always ours, from
+          a previous connection, still there until it lapses;
+        * at the address we send in our own Contact -- also ours, held by a registrar
+          that stores what it was given rather than what it saw;
+        * anywhere else -- somebody else, or us from an address that has changed
+          since.
+
+        Reported, never acted on. A phone on the same home Wi-Fi shares the public
+        address, so this can only ever be a hint to a person.
         """
-        if not self.received:
-            return False
-        return any(
-            (parsed := parse_uri(binding.uri)) is not None
-            and parsed.host == self.received
-            for binding in self.foreign
-        )
+        if not self.foreign:
+            return None
+        mine = {host for host in (self.received, _host_only(self.local)) if host}
+        if not mine:
+            return FOREIGN_UNKNOWN
+        for binding in self.foreign:
+            parsed = parse_uri(binding.uri)
+            if parsed is None or parsed.host not in mine:
+                continue
+            return FOREIGN_PUBLIC if parsed.host == self.received else FOREIGN_LOCAL
+        return FOREIGN_ELSEWHERE
 
     @property
     def foreign_expires_in(self) -> int | None:
