@@ -141,6 +141,12 @@ class SipSnapshot:
     local: str | None = None
     received: str | None = None
     rport: str | None = None
+    # How many Contact URIs the client is currently willing to claim as its own, and
+    # whether the bindings it refused carry our own extension. Two numbers, and
+    # together they say which half of the self-recognition failed: nothing remembered,
+    # or remembered and not matched. Neither names an address.
+    known_contacts: int = 0
+    foreign_same_user: bool = False
 
     @property
     def foreign_count(self) -> int:
@@ -1210,11 +1216,19 @@ class LokiSipClient:
         params = parse_params(split_semis(via)[1:]) if via else {}
         challenge = next(iter(self._challenges.values()), None)
 
+        foreign = tuple(self._foreign(bindings))
+        known = [self._state.contact_uri, *(p.uri for p in self._state.prior_contacts)]
         self._events.on_snapshot(
             SipSnapshot(
                 state=state,
                 bindings=tuple(bindings),
-                foreign=tuple(self._foreign(bindings)),
+                foreign=foreign,
+                known_contacts=len([uri for uri in known if uri]),
+                foreign_same_user=any(
+                    (parsed := parse_uri(binding.uri)) is not None
+                    and parsed.user == self._state.user
+                    for binding in foreign
+                ),
                 realm=challenge.realm if challenge else None,
                 algorithm=challenge.algorithm if challenge else None,
                 local=self._state.sent_by,

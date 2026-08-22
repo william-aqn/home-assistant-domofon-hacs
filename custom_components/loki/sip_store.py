@@ -111,6 +111,12 @@ class SipStoredState:
     # to the resident's phone would then be withdrawn as though it were ours --
     # the precise harm this whole design exists to prevent.
     contacts: list[tuple[str, float]] = field(default_factory=list)
+    # The public address the registrar last said it saw us at. Kept only to answer
+    # one question after a restart: did it change? If a provider hands out a
+    # different external address per connection, recognising our own leftover
+    # binding by its address cannot work at all, and no amount of remembering
+    # strings will fix it.
+    last_received: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise for the store."""
@@ -121,6 +127,7 @@ class SipStoredState:
             "terminal_detail": self.terminal_detail,
             "resolved": self.resolved,
             "contacts": [{"uri": uri, "at": at} for uri, at in self.contacts],
+            "last_received": self.last_received,
         }
 
     @classmethod
@@ -165,6 +172,11 @@ class SipStoredState:
             ),
             resolved=resolved,
             contacts=_parse_contacts(raw.get("contacts"), raw.get("contacts_at")),
+            last_received=(
+                raw.get("last_received")
+                if isinstance(raw.get("last_received"), str)
+                else None
+            ),
         )
 
     def fresh_contacts(self) -> list[str]:
@@ -258,6 +270,13 @@ class SipStore:
         """Record that the client stopped for good."""
         self.state.terminal = state
         self.state.terminal_detail = detail
+        await self.async_save()
+
+    async def async_record_seen_at(self, received: str) -> None:
+        """Remember the public address the registrar reports for us."""
+        if not received or self.state.last_received == received:
+            return
+        self.state.last_received = received
         await self.async_save()
 
     async def async_record_contacts(self, uris: Sequence[str]) -> None:

@@ -110,6 +110,12 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
         diagnostics, where redaction applies, and out of a state attribute.
         """
         attributes: dict[str, Any] = {"detail": self._bridge.detail}
+        # Whether the registrar sees us at a different public address than it did
+        # before the restart. If a provider hands out a new one per connection,
+        # remembering our own Contact by address is hopeless -- and that is a
+        # different repair from anything else on this sensor.
+        if self._bridge.address_changed is not None:
+            attributes["address_changed"] = self._bridge.address_changed
         if (snapshot := self._bridge.snapshot) is not None:
             attributes["foreign_bindings"] = snapshot.foreign_count
             attributes["realm"] = snapshot.realm
@@ -119,4 +125,10 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
                 # our own binding from before a restart, and how long until it goes.
                 attributes["foreign_where"] = snapshot.foreign_where
                 attributes["foreign_expires_in"] = snapshot.foreign_expires_in
+                # Which half of the self-recognition failed. `known_contacts: 0`
+                # means nothing was remembered from the previous run; a non-zero
+                # count with a binding still refused means the strings did not
+                # match. The two need opposite fixes.
+                attributes["known_contacts"] = snapshot.known_contacts
+                attributes["foreign_same_user"] = snapshot.foreign_same_user
         return attributes

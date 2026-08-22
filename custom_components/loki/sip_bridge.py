@@ -126,6 +126,9 @@ class SipBridge:
         self.state: SipState = SipState.DISABLED
         self.detail: str | None = None
         self.snapshot: SipSnapshot | None = None
+        # None until the registrar first tells us how it sees us. Then: did that
+        # address survive the restart, or does every connection get a new one?
+        self.address_changed: bool | None = None
 
         self._client: LokiSipClient | None = None
         self._task: asyncio.Task[None] | None = None
@@ -318,6 +321,14 @@ class SipBridge:
     def on_snapshot(self, snapshot: SipSnapshot) -> None:
         """A fresh look at the account's bindings."""
         self.snapshot = snapshot
+        if snapshot.received and self.address_changed is None:
+            previous = self._store.state.last_received
+            self.address_changed = bool(previous) and previous != snapshot.received
+            self.entry.async_create_task(
+                self.hass,
+                self._store.async_record_seen_at(snapshot.received),
+                f"{DOMAIN}_sip_seen_at",
+            )
         async_dispatcher_send(self.hass, signal_sip_update(self.entry.entry_id))
 
     @callback
