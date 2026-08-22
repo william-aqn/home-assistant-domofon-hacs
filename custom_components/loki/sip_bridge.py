@@ -224,6 +224,10 @@ class SipBridge:
         Fired before the core tears anything down, so the socket is still open and
         there is still time for one REGISTER with ``Expires: 0``.
         """
+        # A once-listener removes itself as it fires. Unsubscribing it again from
+        # async_stop made the core log "Unable to remove unknown job listener" as an
+        # error on every shutdown -- the last line Loki wrote, and a wrong one.
+        self._unsub_stop = None
         await self.async_stop()
 
     async def async_stop(self) -> None:
