@@ -80,6 +80,33 @@ blueprint:
           options:
             - notify.persistent_notification
 
+    repeat_times:
+      name: Сколько раз повторить
+      description: >
+        Один раз — сказать и замолчать. Больше — повторять, пока гость стоит у двери:
+        как настоящий звонок, который не унимается. Повтор прекращается сам, как
+        только вызов закончился или дверь открыли.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 20
+          step: 1
+          mode: box
+    repeat_every:
+      name: Пауза между повторами, с
+      description: >
+        Считается от конца фразы. Меньше, чем длится сама фраза, ставить смысла нет —
+        получится каша.
+      default: 10
+      selector:
+        number:
+          min: 3
+          max: 120
+          step: 1
+          unit_of_measurement: с
+          mode: box
+
     quiet:
       name: Молчать ночью
       default: false
@@ -129,46 +156,73 @@ actions:
       engine_in: !input tts_engine
       entities_in: !input notify_entities
       services_in: !input notify_services
+      times_in: !input repeat_times
+      every_in: !input repeat_every
 
       door_name: "{{ trigger.event.data.device_name }}"
+      call_id: "{{ trigger.event.data.call_id }}"
       # Объявлено ПОСЛЕ door_name, и это обязательно: значения переменных
       # рендерятся по порядку, и текст пользователя со ссылкой на door_name
       # получит пустоту, если поменять их местами.
       text: !input message
 
-  - alias: Произнести
-    if:
-      - condition: template
-        value_template: "{{ speakers_in | count > 0 and engine_in | count > 0 }}"
-    then:
-      # continue_on_error на каждом канале: молчащая колонка не повод не отправить
-      # сообщение в мессенджер.
-      - action: tts.speak
-        continue_on_error: true
-        target:
-          entity_id: "{{ engine_in | first }}"
-        data:
-          media_player_entity_id: "{{ speakers_in }}"
-          message: "{{ text }}"
-
-  - alias: Отправить оповещателям
-    if:
-      - condition: template
-        value_template: "{{ entities_in | count > 0 }}"
-    then:
-      - action: notify.send_message
-        continue_on_error: true
-        target:
-          entity_id: "{{ entities_in }}"
-        data:
-          message: "{{ text }}"
-
-  - alias: Отправить старым службам из configuration.yaml
-    # По одной: у каждой свой набор полей, и общий вызов на список невозможен.
+  - alias: Говорить, пока гость у двери
     repeat:
-      for_each: "{{ services_in }}"
       sequence:
-        - action: "{{ repeat.item }}"
-          continue_on_error: true
-          data:
-            message: "{{ text }}"
+        - alias: Произнести
+          if:
+            - condition: template
+              value_template: >-
+                {{ speakers_in | count > 0 and engine_in | count > 0 }}
+          then:
+            # continue_on_error на каждом канале: молчащая колонка не повод не
+            # отправить сообщение в мессенджер.
+            - action: tts.speak
+              continue_on_error: true
+              target:
+                entity_id: "{{ engine_in | first }}"
+              data:
+                media_player_entity_id: "{{ speakers_in }}"
+                message: "{{ text }}"
+
+        - alias: Отправить оповещателям
+          if:
+            - condition: template
+              value_template: "{{ entities_in | count > 0 }}"
+          then:
+            - action: notify.send_message
+              continue_on_error: true
+              target:
+                entity_id: "{{ entities_in }}"
+              data:
+                message: "{{ text }}"
+
+        - alias: Отправить службам, которых нет в списке
+          # По одной: у каждой свой набор полей, общий вызов на список невозможен.
+          repeat:
+            for_each: "{{ services_in }}"
+            sequence:
+              - action: "{{ repeat.item }}"
+                continue_on_error: true
+                data:
+                  message: "{{ text }}"
+
+        - alias: Подождать — или замолчать, если звонок закончился
+          # Ожидание, а не задержка: гость ушёл или дверь открыли — и повтор
+          # прекращается в ту же секунду, а не досказывает фразу в пустоту.
+          # Открытие двери и `loki.hangup` оба порождают это событие.
+          wait_for_trigger:
+            - trigger: event
+              event_type: loki_event
+              event_data:
+                type: call_ended
+                call_id: "{{ call_id }}"
+          timeout:
+            seconds: "{{ every_in | int }}"
+          continue_on_timeout: true
+      until:
+        - condition: template
+          # `is not none`, а не `is defined`: по таймауту wait.trigger определён и
+          # равен none, так что проверка на определённость вышла бы из цикла сразу.
+          value_template: >-
+            {{ wait.trigger is not none or repeat.index >= times_in | int }}

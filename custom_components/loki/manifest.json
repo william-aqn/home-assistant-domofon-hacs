@@ -18,5 +18,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/william-aqn/home-assistant-domofon-hacs/issues",
   "requirements": [],
-  "version": "1.5.5"
+  "version": "1.6.0"
 }

@@ -52,6 +52,20 @@ _CAPTURE_TTL = 300.0
 # about three and a half seconds against the live intercom.
 _CAPTURE_FRESH = 8.0
 
+# How long the stream is kept ready after a ring, with nobody watching.
+#
+# Connecting to the intercom is the fast part -- measured at 3.6 s. The rest of the
+# wait is HLS: the stream has to cut segments on keyframes and pile up enough of them
+# before a player will start, and on this hardware that turned fifteen to twenty
+# seconds of staring at a spinner. Started at the ring instead, those seconds are
+# spent while the phone is still buzzing, and the picture is there by the time anyone
+# opens the card.
+#
+# The number is an idle timeout, not a lifetime: every read from a viewer pushes it
+# back, so watching keeps it alive and looking away lets it go. Long enough to cover a
+# whole call with nobody watching at all.
+_WARM_STREAM = 150.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -162,8 +176,37 @@ class LokiCamera(LokiEntity, Camera):
         if not self._attr_supported_features & CameraEntityFeature.STREAM:
             return
         self.hass.async_create_task(
-            self.async_capture_from_stream(), f"{DOMAIN}_ring_frame_{self._device_id}"
+            self._async_on_ring(), f"{DOMAIN}_ring_{self._device_id}"
         )
+
+    async def _async_on_ring(self) -> None:
+        """Get the video ready while somebody is still walking to the screen.
+
+        Two things, in this order and for the same reason: both are worth the one RTSP
+        connection a ring justifies, and both are useless if they arrive late.
+        """
+        await self._async_warm_stream()
+        await self.async_capture_from_stream()
+
+    async def _async_warm_stream(self) -> None:
+        """Start the stream now so it is not started when somebody presses play.
+
+        Nothing consumes it here. The point is the pipeline: connected, decoding, and
+        cutting segments, so a viewer arriving in twenty seconds finds them waiting
+        rather than starting the clock themselves. If nobody arrives, the idle timer
+        takes it all down again.
+        """
+        try:
+            async with asyncio.timeout(_CAPTURE_TIMEOUT):
+                stream = await self.async_create_stream()
+                if stream is None:
+                    return
+                stream.add_provider("hls", timeout=_WARM_STREAM)
+                await stream.start()
+        except (TimeoutError, HomeAssistantError, OSError) as err:
+            # The media host is routinely unreachable -- a VPN, a firewall -- and a
+            # doorbell must not care.
+            _LOGGER.debug("Warming stream for %s failed: %s", self._device_id, err)
 
     async def stream_source(self) -> str | None:
         """Return the RTSP URL.
