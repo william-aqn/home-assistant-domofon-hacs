@@ -131,4 +131,10 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
             # readable BEFORE the restart that loses it -- afterwards there is
             # nothing left to compare against.
             attributes["known_contacts"] = snapshot.known_contacts
+            # How many rows the account carries in total, ours included. While
+            # registered this should be one. Two means registering leaves a second
+            # row behind -- the address of our own socket, which the correction was
+            # supposed to withdraw -- and that second row is what the next start
+            # cannot recognise once the container comes up on a different address.
+            attributes["bindings_total"] = len(snapshot.bindings)
         return attributes
