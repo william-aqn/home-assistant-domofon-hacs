@@ -775,13 +775,34 @@ class LokiSipClient:
         return gone
 
     async def _withdraw_own_contact(self) -> None:
-        """Take our binding back off the account, and nothing else."""
+        """Take our bindings back off the account, and nothing else.
+
+        Plural, and that is the whole point. Registering leaves more than one row
+        behind: the first REGISTER carries the address of our own socket -- inside a
+        container, an address the registrar can never reach -- and only then do we
+        learn the address it actually sees us at and register again. The first row is
+        asked to go in that same message, but if the registrar keeps it anyway, we
+        walk away leaving it there.
+
+        The next start cannot recognise it. A container gets a new internal address,
+        so the leftover matches neither the address we hold now nor the one the
+        registrar sees, and the account looks occupied by a stranger carrying our own
+        number. Measured on the live account: `known_contacts: 2`,
+        `foreign_same_user: true`, `address_changed: false` -- remembered, ours, and
+        still unmatched.
+
+        So the list withdrawn here is the registrar's own answer to "which of these
+        are yours", taken at the last verification, plus the contact we hold. Nothing
+        else: every URI in it has already been through `_is_ours`.
+        """
         if not self._state.contact_uri:
             return
         # Through build_contacts rather than by hand: that is the one place the ban on
         # a wildcard Contact is enforced, and a `*` with Expires: 0 would wipe every
         # binding on the account -- the resident's phone along with ours.
-        contacts = self._state.build_contacts(live=None, reap=[self._state.contact_uri])
+        reap = [self._state.contact_uri]
+        reap += [uri for uri in self._own_bindings if uri and uri not in reap]
+        contacts = self._state.build_contacts(live=None, reap=reap)
         # Whatever happens next, we are no longer holding it on purpose. A failed
         # withdrawal leaves the registrar to expire it, and a second attempt from the
         # stop path would have nothing new to say.

@@ -98,6 +98,7 @@ class FakeRegistrar:
         report_bindings: bool = True,
         rewrite_contact: bool = False,
         nat_port: int | None = 44444,
+        ignore_reap: bool = False,
         reply_delay: float = 0.0,
         echo_instance_id: bool = True,
     ) -> None:
@@ -110,6 +111,11 @@ class FakeRegistrar:
         self.report_bindings = report_bindings
         self.rewrite_contact = rewrite_contact
         self.reply_delay = reply_delay
+        # A registrar that keeps a binding it was asked to drop, when the same message
+        # also creates one. Models what the live account does: the pre-rewrite row --
+        # the client's own container address -- survives the message that corrects it,
+        # and is then left behind for the next process to trip over.
+        self.ignore_reap = ignore_reap
         # The port the client appears to come from. A fixed one keeps tests that pin
         # the reported value readable; None models a real NAT, which hands out a
         # fresh port per connection -- and that is what makes a restart unable to
@@ -323,14 +329,20 @@ class FakeRegistrar:
             # RFC 3261 §10.2.3: report the bindings, change nothing.
             return self._build(200, "OK", headers, bindings=True)
 
-        for row in contacts:
-            for item in _split(row, ","):
-                if item.strip() == "*":
-                    # Never expected from our own code; recorded so a test can assert
-                    # the probe and client never send it.
-                    self.wildcard_seen = True
-                    return self._build(400, "Bad Request", headers)
-                self._apply(item, int(one("expires") or 3600))
+        rows = [item for row in contacts for item in _split(row, ",")]
+        # Whether this message registers anything at all, as opposed to being a pure
+        # withdrawal. Only the first kind ignores reaps; see `ignore_reap`.
+        creating = any(";expires=0" not in item.replace(" ", "") for item in rows)
+        for item in rows:
+            if item.strip() == "*":
+                # Never expected from our own code; recorded so a test can assert
+                # the probe and client never send it.
+                self.wildcard_seen = True
+                return self._build(400, "Bad Request", headers)
+            dropping = ";expires=0" in item.replace(" ", "")
+            if dropping and creating and self.ignore_reap:
+                continue
+            self._apply(item, int(one("expires") or 3600))
 
         return self._build(200, "OK", headers, bindings=True)
 

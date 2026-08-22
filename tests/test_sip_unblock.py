@@ -80,7 +80,11 @@ async def test_a_busy_account_is_never_registered_on() -> None:
         await _hard_stop(client, task)
         await registrar.stop()
 
-    assert client.state is SipState.BLOCKED
+    # Not "where is it now": with these timings it cycles connect -> probe -> refuse
+    # several times a second, and catching it mid-probe says nothing. The invariant is
+    # that it never got past the gate, however many times it tried.
+    assert not any(state is SipState.REGISTERED for state, _ in recorder.states)
+    assert any(state is SipState.BLOCKED for state, _ in recorder.states)
     assert len(registrar.bindings) == 1
     assert registrar.evictions == 0
     assert not registrar.wildcard_seen

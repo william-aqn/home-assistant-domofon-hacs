@@ -124,3 +124,43 @@ async def test_every_block_raises_its_own_card(
         await registrar.stop()
 
     assert recorder.terminal_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_stop_takes_back_the_row_the_registrar_kept() -> None:
+    """Registering leaves two rows behind, and a stop has to take back both.
+
+    The first REGISTER carries the address of our own socket -- inside a container,
+    one the registrar can never reach. The corrected registration asks for that row to
+    go in the same message, and this registrar keeps it anyway. Nothing notices,
+    because at that moment both rows are ours.
+
+    The next start is what notices. A container comes up with a new internal address,
+    so the leftover matches nothing we hold or remember, and the account looks occupied
+    by a stranger carrying our own number. Measured on the live account before this was
+    fixed: known_contacts 2, foreign_same_user true, address_changed false.
+    """
+    registrar = WireTap(
+        password=PASSWORD,
+        echo_instance_id=False,
+        rewrite_contact=True,
+        nat_port=None,
+        ignore_reap=True,
+    )
+    port = await registrar.start()
+    client = LokiSipClient(_config(port), Recorder())
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(15):
+            while client.state is not SipState.REGISTERED:
+                await asyncio.sleep(0.02)
+        # Both rows are on the account, and both are ours.
+        assert len(registrar.bindings) == 2
+        await client.async_stop()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert registrar.bindings == [], "a row was left for the next start to trip over"
+    assert not registrar.wildcard_seen
