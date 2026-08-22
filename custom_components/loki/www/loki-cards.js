@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.6.1";
+const CARD_VERSION = "1.6.4";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -439,8 +439,8 @@ class DoorMedia {
         this._loader.hidden = true;
         return;
       }
-      const video = findVideo(this._child, 6);
-      if (video && video.videoWidth > 0) {
+      const media = findLiveMedia(this._child, 12);
+      if (media) {
         this._loader.hidden = true;
         // Only now is there something to replace it with.
         this._img.hidden = true;
@@ -1732,16 +1732,26 @@ async function pressOpen(hass, door, button, label) {
   }
 }
 
-/** The <video> inside a composed card, wherever its shadow roots have put it. */
-function findVideo(root, depth) {
+/** The playing media inside a composed card, wherever its shadow roots have put it.
+ *
+ * Depth twelve, not the six this started with: the chain runs picture-entity ->
+ * ha-card -> hui-image -> ha-camera-stream -> player -> video, and six was exactly
+ * enough -- until one wrapper div pushed the video out of reach, the search came back
+ * empty, and the "connecting" chip sat on top of a stream that was visibly playing.
+ * Depth is a guard against cycles here, not a budget to spend precisely.
+ *
+ * An <img> with pixels counts too: when HLS cannot carry the codec, Home Assistant
+ * falls back to MJPEG, and that path has no <video> at all. */
+function findLiveMedia(root, depth) {
   if (!root || depth < 0) return null;
-  if (root.tagName === "VIDEO") return root;
+  if (root.tagName === "VIDEO" && root.videoWidth > 0) return root;
+  if (root.tagName === "IMG" && root.naturalWidth > 0) return root;
   const kids = [
     ...(root.shadowRoot ? root.shadowRoot.children : []),
     ...(root.children || []),
   ];
   for (const kid of kids) {
-    const found = findVideo(kid, depth - 1);
+    const found = findLiveMedia(kid, depth - 1);
     if (found) return found;
   }
   return null;
