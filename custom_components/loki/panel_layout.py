@@ -46,12 +46,21 @@ def _entry(hass: HomeAssistant, entry_id: str | None) -> ConfigEntry | None:
 
 @callback
 def layout_of(entry: ConfigEntry) -> dict[str, Any]:
-    """The stored arrangement, in the shape the page expects."""
+    """The stored arrangement, in the shape the page expects.
+
+    ``tile_size`` is None until somebody has chosen one: the page picks its own
+    default from the screen it is on -- small tiles on a phone, medium elsewhere --
+    and a stored "medium" would override that without anyone having asked for it.
+
+    ``entry_id`` names the entry the arrangement belongs to, so the page can send it
+    back on save instead of relying on "the only one" still being the only one.
+    """
     options = entry.options
     return {
+        "entry_id": entry.entry_id,
         "order": list(options.get(OPT_PANEL_ORDER) or []),
         "hidden": list(options.get(OPT_PANEL_HIDDEN) or []),
-        "tile_size": options.get(OPT_PANEL_TILE_SIZE) or "medium",
+        "tile_size": options.get(OPT_PANEL_TILE_SIZE) or None,
     }
 
 
@@ -72,9 +81,11 @@ def ws_get(
     if entry is None:
         # Not an error: a page opened before the integration finished loading, or on
         # an install with two accounts and no way to guess. The page falls back to
-        # showing everything, which is the state it started in.
+        # showing everything, which is the state it started in -- and with no
+        # entry_id it knows there is nothing to edit, so it offers no pencil.
         connection.send_result(
-            msg["id"], {"order": [], "hidden": [], "tile_size": None}
+            msg["id"],
+            {"entry_id": None, "order": [], "hidden": [], "tile_size": None},
         )
         return
     connection.send_result(msg["id"], layout_of(entry))

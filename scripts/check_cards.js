@@ -269,8 +269,219 @@ if (STYLE_BLOCK) {
   );
 }
 
-if (failures.length) {
-  console.error(`\n${failures.length} check(s) failed`);
-  process.exit(1);
+// ---- the page's arrangement -------------------------------------------------
+
+/** Four doors, alphabetical by entity id -- the order the wall starts in. */
+function doorsHass(extra) {
+  const hass = { states: {}, entities: {}, devices: {}, panels: {}, ...extra };
+  for (const id of ["a", "b", "c", "d"]) {
+    hass.states[`camera.${id}`] = {
+      state: "idle",
+      attributes: {
+        friendly_name: id.toUpperCase(),
+        entity_picture: `/api/camera_proxy/camera.${id}?t=1`,
+      },
+    };
+    hass.entities[`camera.${id}`] = { device_id: `dev-${id}`, platform: "loki" };
+    hass.entities[`button.${id}`] = { device_id: `dev-${id}`, platform: "loki" };
+    hass.devices[`dev-${id}`] = {
+      identifiers: [["loki", String(id.charCodeAt(0))]],
+      name: id.toUpperCase(),
+    };
+  }
+  return hass;
 }
-console.log("\nall card checks passed");
+
+/** A store that answers at once and remembers what it was asked to keep. */
+function fakeStore(layout) {
+  const store = {
+    saved: [],
+    load: async () => layout,
+    save: async (_hass, message) => {
+      store.saved.push(message);
+      return message;
+    },
+  };
+  return store;
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+async function checkLayout() {
+  const Wall = defined["loki-wall-card"];
+  const admin = doorsHass({ user: { is_admin: true } });
+
+  // Stored: c before a, b put away, d never mentioned -- so d goes last.
+  const card = new Wall();
+  card.setConfig({});
+  card.layoutStore = fakeStore({
+    entry_id: "e1",
+    order: ["camera.c", "camera.a"],
+    hidden: ["camera.b"],
+    tile_size: null,
+  });
+  card.hass = admin;
+  check(
+    "nothing is drawn while the arrangement is still loading",
+    card._arranged().pending === true
+  );
+  await settle();
+  let { active, hidden } = card._arranged();
+  check(
+    "stored order wins, unknown doors go last, put-away doors are off the wall",
+    active.join() === "camera.c,camera.a,camera.d" && hidden.join() === "camera.b",
+    `${active.join()} | ${hidden.join()}`
+  );
+  check("an admin with a store gets the pencil", card._editBtn.hidden === false);
+  check(
+    "the tile size falls back to the card's own when none was chosen",
+    card._tileSize() === "medium"
+  );
+  check(
+    "put-away tiles are not built outside the editor",
+    !card._tiles.has("camera.b")
+  );
+
+  card._setEditing(true);
+  check(
+    "the editor swaps the pencil for done and the sizes",
+    card._editBtn.hidden && !card._doneBtn.hidden && !card._sizes.hidden
+  );
+  const tileA = card._tiles.get("camera.a");
+  check(
+    "no door opens from the editor",
+    tileA.open.hidden === true && tileA.putAwayBtn.hidden === false && tileA.handle.hidden === false
+  );
+  const tileB = card._tiles.get("camera.b");
+  check(
+    "a put-away tile offers bring back and nothing else",
+    Boolean(tileB)
+      && tileB.restore.hidden === false
+      && tileB.open.hidden === true
+      && tileB.putAwayBtn.hidden === true
+      && tileB.handle.hidden === true
+  );
+
+  card._putAway("camera.d");
+  ({ active, hidden } = card._arranged());
+  check(
+    "a put-away door leaves the wall and joins the end of the put-away list",
+    active.join() === "camera.c,camera.a" && hidden.join() === "camera.b,camera.d",
+    `${active.join()} | ${hidden.join()}`
+  );
+  card._bringBack("camera.b");
+  ({ active, hidden } = card._arranged());
+  check(
+    "a door brought back goes to the end of the wall, before the put-away ones",
+    active.join() === "camera.c,camera.a,camera.b" && hidden.join() === "camera.d",
+    `${active.join()} | ${hidden.join()}`
+  );
+  card._layout.move("camera.b", 0, card._available());
+  card._update();
+  check(
+    "moving a door puts it at the index asked for",
+    card._arranged().active.join() === "camera.b,camera.c,camera.a",
+    card._arranged().active.join()
+  );
+  card._chooseSize("large");
+  check("choosing a size applies it", card._tileSize() === "large");
+  await settle();
+  const { saved } = card._store;
+  const last = saved[saved.length - 1];
+  check(
+    "every change is written back, with the entry it belongs to",
+    saved.length === 3
+      && Boolean(last)
+      && last.entry_id === "e1"
+      && last.tile_size === "large"
+      && last.order.join() === "camera.b,camera.c,camera.a"
+      && last.hidden.join() === "camera.d",
+    JSON.stringify(saved)
+  );
+
+  card._setEditing(false);
+  check(
+    "leaving the editor takes the put-away tiles off the wall",
+    !card._tiles.has("camera.d") && card._tiles.has("camera.b")
+  );
+
+  // Ids of doors the account does not report right now survive a change: a hidden
+  // door that is away for a day must come back still hidden.
+  const Layout = card._layout.constructor;
+  const layout = new Layout({ order: ["camera.gone", "camera.a"], hidden: ["camera.away"] });
+  layout.hide("camera.a", ["camera.a", "camera.b"]);
+  const message = layout.message("medium");
+  check(
+    "absent doors keep their place in the stored lists",
+    message.order.includes("camera.gone") && message.hidden.join() === "camera.away,camera.a",
+    JSON.stringify(message)
+  );
+  // Restoring puts a door at the end of the wall even when nothing was ever
+  // arranged -- not back into its alphabetical slot.
+  const fresh = new Layout({ hidden: ["camera.a"] });
+  fresh.restore("camera.a", ["camera.a", "camera.b", "camera.c"]);
+  check(
+    "a restored door lands after the others, not where the alphabet had it",
+    fresh.arrange(["camera.a", "camera.b", "camera.c"]).active.join() === "camera.b,camera.c,camera.a"
+  );
+
+  // No pencil on a dashboard card, for anyone but an admin, or when the integration
+  // could not say which entry to write.
+  const plain = new Wall();
+  plain.setConfig({});
+  plain.hass = admin;
+  check("a dashboard card has no pencil", plain._editBtn.hidden === true);
+
+  const guest = new Wall();
+  guest.setConfig({});
+  guest.layoutStore = fakeStore({ entry_id: "e1", order: [], hidden: [], tile_size: null });
+  guest.hass = doorsHass({ user: { is_admin: false } });
+  await settle();
+  check(
+    "a guest sees the wall but gets no pencil",
+    guest._editBtn.hidden === true && guest._arranged().active.length === 4
+  );
+
+  const nowhere = new Wall();
+  nowhere.setConfig({});
+  nowhere.layoutStore = fakeStore({ entry_id: null, order: [], hidden: [], tile_size: null });
+  nowhere.hass = admin;
+  await settle();
+  check(
+    "no pencil when the integration cannot say which entry to write",
+    nowhere._editBtn.hidden === true && nowhere._arranged().active.length === 4
+  );
+
+  // A store that fails still yields a page: everything, alphabetical, no pencil.
+  const broken = new Wall();
+  broken.setConfig({});
+  const realWarn = console.warn;
+  console.warn = () => {};
+  broken.layoutStore = {
+    load: async () => {
+      throw new Error("no");
+    },
+    save: async () => {},
+  };
+  broken.hass = admin;
+  await settle();
+  console.warn = realWarn;
+  check(
+    "a store that fails leaves the wall whole and uneditable",
+    broken._arranged().active.length === 4 && broken._editBtn.hidden === true
+  );
+
+  for (const each of [card, plain, guest, nowhere, broken]) each._teardown();
+}
+
+checkLayout()
+  .catch((err) => {
+    check("layout checks run to the end", false, (err && err.stack) || String(err));
+  })
+  .then(() => {
+    if (failures.length) {
+      console.error(`\n${failures.length} check(s) failed`);
+      process.exit(1);
+    }
+    console.log("\nall card checks passed");
+  });

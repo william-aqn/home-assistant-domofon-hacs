@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.6.4";
+const CARD_VERSION = "1.7.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -57,6 +57,13 @@ const LIVE_WAIT = 20;
 const TILE_SIZES = { compact: 200, medium: 320, large: 460 };
 const DEFAULT_TILE_SIZE = "medium";
 
+// How far a pressed tile has to travel before it counts as a drag rather than a
+// press with a shaky hand. Pixels.
+const DRAG_THRESHOLD = 6;
+// Dragging a tile to within this many pixels of the top or bottom of the window
+// scrolls the page, so a door can be moved further than one screen in one go.
+const SCROLL_EDGE = 56;
+
 // How long a real visit at the door lasts before the bar is empty. Not the
 // integration's own CALL_TIMEOUT (120 s) -- that one is a safety net for a call whose
 // end was never announced, and draining over two minutes would leave the bar looking
@@ -68,6 +75,11 @@ const ICON_HANGUP = "mdi:phone-hangup-outline";
 const ICON_LIVE = "mdi:video-outline";
 const ICON_STOP = "mdi:video-off-outline";
 const ICON_SHOT = "mdi:camera-outline";
+const ICON_EDIT = "mdi:pencil-outline";
+const ICON_DONE = "mdi:check";
+const ICON_PUT_AWAY = "mdi:close";
+const ICON_RESTORE = "mdi:restore";
+const ICON_DRAG = "mdi:drag";
 
 const t = {
   open: "Открыть",
@@ -110,6 +122,23 @@ const t = {
   callTimeout: "Сколько длится вызов, с",
   opened: "Открыто",
   failed: "Ошибка",
+  edit: "Изменить",
+  editTitle: "Поменять порядок, убрать лишние, выбрать размер",
+  done: "Готово",
+  editHint:
+    "Перетащите плитку, чтобы поменять порядок (пальцем — за ручку в углу). "
+    + "Крестик убирает домофон со страницы: убранные собираются внизу серыми, "
+    + "их можно вернуть.",
+  putAway: "Убрать со страницы",
+  putAwayGroup: "Убраны со страницы",
+  bringBack: "Вернуть",
+  dragHandle: "Перетащить",
+  tileSize: "Размер плиток",
+  sizeCompact: "Мелкие",
+  sizeMedium: "Средние",
+  sizeLarge: "Крупные",
+  allPutAway: "Все домофоны убраны со страницы. Вернуть — через «Изменить».",
+  saveFailed: "Не удалось сохранить раскладку страницы",
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -287,8 +316,139 @@ function pictureBar() {
   const open = el("button", "loki-open");
   const openLabel = el("span", null, t.open);
   open.append(icon(ICON_OPEN), openLabel);
-  bar.append(label, open);
-  return { bar, label, open, openLabel };
+  // Where "open" would be, on a tile that has been put away: it is the one thing
+  // there is to do with such a tile, and the hand already knows the spot.
+  const restore = el("button", "loki-open loki-restore");
+  restore.append(icon(ICON_RESTORE), el("span", null, t.bringBack));
+  restore.hidden = true;
+  bar.append(label, open, restore);
+  return { bar, label, open, openLabel, restore };
+}
+
+/* --------------------------------------------------------- the arrangement */
+
+/**
+ * How a wall of doors is arranged: which are shown, in what order, how big.
+ *
+ * Two lists rather than one list with a flag, because their orders mean different
+ * things: ``order`` is where a door stands on the page, ``hidden`` is the sequence in
+ * which doors were put away. A door in neither -- added to the account after the
+ * page was arranged -- goes to the end of the visible ones, where a new thing is
+ * expected to turn up.
+ *
+ * Every change is made against the doors that exist right now, and then the ids of
+ * doors the account does not currently report are kept behind them. So a hidden door
+ * that disappears for a day comes back still hidden, rather than reappearing on the
+ * page because the list was tidied while it was gone.
+ */
+class WallLayout {
+  constructor(data) {
+    const source = data || {};
+    this.entryId = source.entry_id || null;
+    this.order = Array.isArray(source.order) ? [...source.order] : [];
+    this.hidden = Array.isArray(source.hidden) ? [...source.hidden] : [];
+    this.tileSize = TILE_SIZES[source.tile_size] ? source.tile_size : null;
+  }
+
+  clone() {
+    return new WallLayout({
+      entry_id: this.entryId,
+      order: this.order,
+      hidden: this.hidden,
+      tile_size: this.tileSize,
+    });
+  }
+
+  /** Split the doors there are into the ones on the page and the ones put away. */
+  arrange(available) {
+    const hidden = this.hidden.filter((id) => available.includes(id));
+    const placed = this.order.filter(
+      (id) => available.includes(id) && !hidden.includes(id)
+    );
+    const rest = available.filter(
+      (id) => !placed.includes(id) && !hidden.includes(id)
+    );
+    return { active: [...placed, ...rest], hidden };
+  }
+
+  /** Write the visible order down in full, the ids of absent doors behind it. */
+  _place(active, available) {
+    this.order = [...active, ...this.order.filter((id) => !available.includes(id))];
+  }
+
+  hide(id, available) {
+    this._place(this.arrange(available).active.filter((x) => x !== id), available);
+    if (!this.hidden.includes(id)) this.hidden.push(id);
+  }
+
+  /** Back onto the page, at the end of the visible ones -- not where it used to be,
+   * which nobody remembers by then. */
+  restore(id, available) {
+    this.hidden = this.hidden.filter((x) => x !== id);
+    const active = this.arrange(available).active.filter((x) => x !== id);
+    this._place([...active, id], available);
+  }
+
+  /** Put a door at the given position among the visible ones. */
+  move(id, index, available) {
+    const active = this.arrange(available).active.filter((x) => x !== id);
+    active.splice(Math.max(0, Math.min(index, active.length)), 0, id);
+    this._place(active, available);
+  }
+
+  /** Whether two layouts put the same doors in the same places. */
+  sameAs(other, available) {
+    const mine = this.arrange(available);
+    const theirs = other.arrange(available);
+    return (
+      mine.active.join("\n") === theirs.active.join("\n")
+      && mine.hidden.join("\n") === theirs.hidden.join("\n")
+      && this.tileSize === other.tileSize
+    );
+  }
+
+  /** What the integration's ``set`` command takes. */
+  message(tileSize) {
+    const out = {
+      order: [...this.order],
+      hidden: [...this.hidden],
+      tile_size: tileSize,
+    };
+    if (this.entryId) out.entry_id = this.entryId;
+    return out;
+  }
+}
+
+/**
+ * The sidebar page's arrangement lives in the integration's own options, so it is
+ * the same on the phone as on the tablet that made it. Two websocket commands,
+ * both registered by panel_layout.py.
+ */
+const panelLayoutStore = {
+  load: (hass) => hass.callWS({ type: "loki/panel_layout/get" }),
+  save: (hass, layout) => hass.callWS({ type: "loki/panel_layout/set", ...layout }),
+};
+
+/** The nearest ancestor that scrolls, crossing shadow roots on the way up.
+ *
+ * The page sits several shadow roots deep inside Home Assistant, and which of its
+ * wrappers does the scrolling is not ours to know.
+ */
+function scrollParent(node) {
+  let current = node;
+  while (current) {
+    if (current.nodeType === 1) {
+      const style = window.getComputedStyle(current);
+      if (
+        /auto|scroll/.test(style.overflowY)
+        && current.scrollHeight > current.clientHeight
+      ) {
+        return current;
+      }
+    }
+    current = current.parentNode || current.host || null;
+  }
+  return document.scrollingElement || document.documentElement;
 }
 
 /* --------------------------------------------------------------- the picture */
@@ -311,6 +471,9 @@ class DoorMedia {
     this._img = document.createElement("img");
     this._img.className = "loki-still";
     this._img.alt = "";
+    // An <img> starts a drag of its own on the second pixel of movement, and that
+    // one would win over the editor's.
+    this._img.draggable = false;
     this.el.appendChild(this._img);
 
     this._loader = el("div", "loki-loader", t.connecting);
@@ -328,6 +491,11 @@ class DoorMedia {
   reload() {
     if (this._live) return;
     this._refreshStill(true);
+  }
+
+  /** The address of the picture on screen, for a copy of it to follow the pointer. */
+  pictureSrc() {
+    return this._img.getAttribute("src");
   }
 
   /** Fetch a new still right now, rather than waiting for the next tick.
@@ -553,6 +721,8 @@ const STYLE = `
   .loki-stamp[hidden],
   .loki-empty[hidden],
   .loki-pill[hidden],
+  .loki-sizes[hidden],
+  .loki-divider[hidden],
   .loki-confirm[hidden] {
     display: none;
   }
@@ -917,7 +1087,7 @@ const STYLE = `
   .loki-pill[disabled] { opacity: 0.4; cursor: default; }
   .loki-pill.on {
     color: var(--text-primary-color, #fff);
-    background: currentColor;
+    background: var(--primary-color, #03a9f4);
     border-color: transparent;
   }
   /* Red, because it is the expensive one. The colour is the warning; the dialog is
@@ -956,6 +1126,79 @@ const STYLE = `
     background: var(--error-color, #db4437);
     border-color: transparent;
     color: #fff;
+  }
+
+  /* The editor. The tile itself is the thing being dragged, so nothing on it may be
+     selected, called out or dragged natively -- the browser's own image drag starts
+     on the second pixel of movement and wins. */
+  .loki-editing .loki-media {
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  .loki-editing .loki-still { pointer-events: none; -webkit-user-drag: none; }
+  .loki-editing .loki-put-away { cursor: default; }
+  /* Grey, but only the picture: the bar with "bring back" on it stays readable. */
+  .loki-put-away .loki-still { filter: grayscale(1); opacity: 0.45; }
+  /* Where the tile came from, while its copy is under the pointer. */
+  .loki-drag-source { opacity: 0.35; cursor: grabbing; }
+  .loki-drag-source::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border: 2px dashed var(--primary-color, #03a9f4);
+    border-radius: 10px;
+    pointer-events: none;
+  }
+  /* The one place a finger can take hold: everywhere else on the tile the page still
+     scrolls, which on a wall of twenty doors is not negotiable. A mouse can grab the
+     tile anywhere. */
+  .loki-handle {
+    left: 6px;
+    right: auto;
+    cursor: grab;
+    touch-action: none;
+  }
+  .loki-handle:active { cursor: grabbing; }
+  .loki-restore { background: var(--secondary-text-color, #727272); }
+  .loki-divider {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+    font-size: 13px;
+    color: var(--secondary-text-color, #727272);
+  }
+  .loki-divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--divider-color, rgba(127, 127, 127, 0.3));
+  }
+  .loki-sizes {
+    display: inline-flex;
+    border: 1px solid var(--primary-color, #03a9f4);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .loki-sizes button {
+    font: inherit;
+    font-size: 13px;
+    padding: 4px 12px;
+    border: none;
+    background: none;
+    color: var(--primary-color, #03a9f4);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .loki-sizes button + button {
+    border-left: 1px solid var(--primary-color, #03a9f4);
+  }
+  .loki-sizes button.on {
+    background: var(--primary-color, #03a9f4);
+    color: var(--text-primary-color, #fff);
   }
 `;
 
@@ -1289,6 +1532,13 @@ class LokiWallCard extends HTMLElement {
     this._tiles = new Map();
     this._built = false;
     this._liveTimer = null;
+    // The shared arrangement, when there is one. The sidebar page attaches a store;
+    // a dashboard card never does, and shows its configured list as it is.
+    this._store = null;
+    this._layout = null;
+    this._layoutPending = false;
+    this._editing = false;
+    this._drag = null;
   }
 
   setConfig(config) {
@@ -1306,6 +1556,22 @@ class LokiWallCard extends HTMLElement {
     }
   }
 
+  /**
+   * Where the arrangement of this wall is kept, if anywhere.
+   *
+   * A property rather than a config key: a dashboard card is configured with a plain
+   * list of doors and has no store, and this is not something YAML should be able to
+   * point at. Without one the card shows what it was told to, in that order, and
+   * offers no pencil.
+   */
+  set layoutStore(store) {
+    this._store = store || null;
+    this._layout = null;
+    this._layoutPending = false;
+    this._setEditing(false);
+    if (this._hass) this._update();
+  }
+
   set hass(hass) {
     this._hass = hass;
     if (!this._built) this._build();
@@ -1313,7 +1579,7 @@ class LokiWallCard extends HTMLElement {
   }
 
   getCardSize() {
-    return 2 + Math.ceil(this._cameras().length / 3) * 3;
+    return 2 + Math.ceil(this._arranged().active.length / 3) * 3;
   }
 
   /** Roughly how many tiles fit across, for the size hints below. */
@@ -1321,8 +1587,7 @@ class LokiWallCard extends HTMLElement {
     const columns = Number(this._config.columns);
     if (columns) return Math.max(1, columns);
     const width = this.getBoundingClientRect().width || 900;
-    const min =
-      TILE_SIZES[this._config.tile_size] || TILE_SIZES[DEFAULT_TILE_SIZE];
+    const min = TILE_SIZES[this._tileSize()];
     return Math.max(1, Math.floor(width / (min + 10)));
   }
 
@@ -1344,11 +1609,60 @@ class LokiWallCard extends HTMLElement {
     this._teardown();
   }
 
-  /** Configured cameras, or every door when the card has not been narrowed down. */
-  _cameras() {
-    const configured = this._config && this._config.cameras;
-    if (configured && configured.length) return configured;
+  /** The tile size in effect: the one chosen on the page, else the card's own. */
+  _tileSize() {
+    const chosen = this._layout && this._layout.tileSize;
+    if (TILE_SIZES[chosen]) return chosen;
+    return TILE_SIZES[this._config.tile_size] ? this._config.tile_size : DEFAULT_TILE_SIZE;
+  }
+
+  /** Every door the account has, in the order the alphabet puts them. */
+  _available() {
     return this._hass ? findDoorCameras(this._hass) : [];
+  }
+
+  /**
+   * The doors on the wall, and the doors put away.
+   *
+   * A configured list wins outright: that card shows what it was told to. Otherwise
+   * every door, arranged by the stored layout when there is one -- and nothing at
+   * all while that layout is still on its way, rather than an alphabetical wall that
+   * rearranges itself a moment later.
+   */
+  _arranged() {
+    const configured = this._config.cameras;
+    if (configured && configured.length) return { active: [...configured], hidden: [] };
+    if (this._store && !this._layout) return { active: [], hidden: [], pending: true };
+    const available = this._available();
+    if (!this._layout) return { active: available, hidden: [] };
+    return this._layout.arrange(available);
+  }
+
+  _ensureLayout() {
+    if (!this._store || this._layout || this._layoutPending || !this._hass) return;
+    this._layoutPending = true;
+    const store = this._store;
+    const hass = this._hass;
+    Promise.resolve()
+      .then(() => store.load(hass))
+      .then(
+        (data) => this._adoptLayout(store, data),
+        (err) => {
+          // Shown as if nothing had been arranged. Not editable either: without an
+          // entry id a save has nowhere to go, and the page says nothing rather
+          // than offering a pencil that cannot write.
+          console.warn("Loki: раскладка страницы не загрузилась", err);
+          this._adoptLayout(store, {});
+        }
+      );
+  }
+
+  _adoptLayout(store, data) {
+    // The store may have been swapped or taken away while the answer was on its way.
+    if (store !== this._store) return;
+    this._layoutPending = false;
+    this._layout = new WallLayout(data);
+    if (this._hass && this._built) this._update();
   }
 
   _build() {
@@ -1392,6 +1706,7 @@ class LokiWallCard extends HTMLElement {
     `;
 
     const card = document.createElement("ha-card");
+    this._card = card;
 
     const header = el("div", "loki-header");
     this._titleEl = el("div", "loki-title");
@@ -1410,7 +1725,39 @@ class LokiWallCard extends HTMLElement {
     this._liveBtn.append(this._liveIcon, this._liveLabel);
     this._liveBtn.addEventListener("click", () => this._askLive());
 
-    actions.append(this._shotBtn, this._liveBtn);
+    // The pencil. Only on a wall with a store behind it, and only for an admin:
+    // the integration refuses anyone else's save, and a button that leads to a
+    // refusal is worse than none.
+    this._editBtn = el("button", "loki-pill");
+    this._editBtn.append(icon(ICON_EDIT), el("span", null, t.edit));
+    this._editBtn.title = t.editTitle;
+    this._editBtn.hidden = true;
+    this._editBtn.addEventListener("click", () => this._setEditing(true));
+
+    // While editing, the header trades its two buttons for the size switch and
+    // "done". The size is part of the arrangement, so it lives with the editor.
+    this._sizes = el("div", "loki-sizes");
+    this._sizes.setAttribute("role", "group");
+    this._sizes.setAttribute("aria-label", t.tileSize);
+    this._sizes.hidden = true;
+    this._sizeBtns = new Map();
+    for (const [name, label] of [
+      ["compact", t.sizeCompact],
+      ["medium", t.sizeMedium],
+      ["large", t.sizeLarge],
+    ]) {
+      const button = el("button", null, label);
+      button.addEventListener("click", () => this._chooseSize(name));
+      this._sizes.appendChild(button);
+      this._sizeBtns.set(name, button);
+    }
+
+    this._doneBtn = el("button", "loki-pill on");
+    this._doneBtn.append(icon(ICON_DONE), el("span", null, t.done));
+    this._doneBtn.hidden = true;
+    this._doneBtn.addEventListener("click", () => this._setEditing(false));
+
+    actions.append(this._shotBtn, this._liveBtn, this._editBtn, this._sizes, this._doneBtn);
     header.append(this._titleEl, actions);
 
     // Built once and shown on demand: a dialog imported from Home Assistant would be
@@ -1433,6 +1780,9 @@ class LokiWallCard extends HTMLElement {
     this._note = el("div", "loki-note", t.unavailable);
     this._note.hidden = true;
 
+    this._hint = el("div", "loki-note", t.editHint);
+    this._hint.hidden = true;
+
     // A refreshed snapshot usually looks identical to the one it replaced -- the
     // camera may not have moved, and the backend keeps a frame for ten seconds.
     // Without a line saying so, the button reads as broken.
@@ -1443,10 +1793,14 @@ class LokiWallCard extends HTMLElement {
     this._empty = el("div", "loki-empty", t.noDoors);
     this._empty.hidden = true;
 
+    // The line between the doors on the page and the doors put away, in the editor.
+    this._divider = el("div", "loki-divider", t.putAwayGroup);
+
     card.append(
       header,
       this._confirm,
       this._note,
+      this._hint,
       this._stamp,
       this._empty,
       this._grid
@@ -1457,19 +1811,33 @@ class LokiWallCard extends HTMLElement {
 
   _update() {
     const hass = this._hass;
-    const cameras = this._cameras();
+    this._ensureLayout();
+    const { active, hidden, pending } = this._arranged();
+    const editing = this._editing;
     const reachable = streamReachable(hass, this._config.stream_sensor);
+    const canEdit = Boolean(
+      this._store
+        && this._layout
+        && this._layout.entryId
+        && hass.user
+        && hass.user.is_admin
+    );
 
     this._titleEl.textContent = this._config.title;
-    this._empty.hidden = cameras.length > 0;
-    this._note.hidden = reachable;
+    const nothing = !pending && active.length === 0 && !(editing && hidden.length);
+    this._empty.hidden = !nothing;
+    this._empty.textContent = hidden.length ? t.allPutAway : t.noDoors;
+    this._note.hidden = reachable || editing;
+    this._hint.hidden = !editing;
+    this._card.classList.toggle("loki-editing", editing);
 
-    this._shotBtn.hidden = cameras.length === 0;
+    const idle = !editing && active.length > 0;
+    this._shotBtn.hidden = !idle;
     // A frame can only come from the stream, so when the stream is gone this button
     // has nothing to do -- exactly like the live one next to it.
     this._shotBtn.disabled = !reachable;
     this._shotBtn.title = reachable ? t.shotHint : t.shotBlocked;
-    this._liveBtn.hidden = cameras.length === 0;
+    this._liveBtn.hidden = !idle;
     this._liveBtn.disabled = !reachable;
     this._liveBtn.title = reachable ? "" : t.liveBlocked;
     this._liveBtn.classList.toggle("on", this._live && reachable);
@@ -1478,8 +1846,17 @@ class LokiWallCard extends HTMLElement {
       "icon",
       this._live && reachable ? ICON_STOP : ICON_LIVE
     );
-    if (!reachable) this._confirm.hidden = true;
-    this._confirmQuestion.textContent = `${t.confirmLive} Камер: ${cameras.length}.`;
+    if (!reachable || editing) this._confirm.hidden = true;
+    this._confirmQuestion.textContent = `${t.confirmLive} Камер: ${active.length}.`;
+
+    this._editBtn.hidden = editing || !canEdit;
+    this._doneBtn.hidden = !editing;
+    this._sizes.hidden = !editing;
+    const size = this._tileSize();
+    for (const [name, button] of this._sizeBtns) {
+      button.classList.toggle("on", name === size);
+      button.setAttribute("aria-pressed", name === size ? "true" : "false");
+    }
 
     // Width-driven by default: a fixed column count is either cramped on a phone or
     // absurdly stretched on a monitor. `columns` remains as an explicit override.
@@ -1487,41 +1864,56 @@ class LokiWallCard extends HTMLElement {
     // min(100%, …) so a narrow card shrinks the tile instead of overflowing rather
     // than pushing the page sideways. A wall of doors is for recognising a person, so
     // past a certain point more columns stop helping and start hiding faces.
-    const minWidth =
-      TILE_SIZES[this._config.tile_size] || TILE_SIZES[DEFAULT_TILE_SIZE];
+    const minWidth = TILE_SIZES[size];
     this._grid.style.gridTemplateColumns = columns
       ? `repeat(${Math.max(1, columns)}, minmax(0, 1fr))`
       : `repeat(auto-fill, minmax(min(100%, ${minWidth}px), 1fr))`;
 
+    // Put-away doors are on screen only in the editor, grey and below the line.
+    const shown = editing ? [...active, ...hidden] : active;
     for (const [camera, tile] of this._tiles) {
-      if (!cameras.includes(camera)) {
+      if (!shown.includes(camera)) {
         tile.media.destroy();
         tile.root.remove();
         this._tiles.delete(camera);
       }
     }
 
-    cameras.forEach((camera, index) => {
-      let tile = this._tiles.get(camera);
-      if (!tile) {
-        tile = this._buildTile(camera);
-        this._tiles.set(camera, tile);
+    // Keep DOM order in step with the arrangement, which the editor changes live --
+    // on every hass update too, so a drag in progress is never undone underneath.
+    const nodes = active.map((camera) => this._tileFor(camera).root);
+    if (editing && hidden.length) {
+      nodes.push(this._divider);
+      for (const camera of hidden) nodes.push(this._tileFor(camera).root);
+    } else {
+      this._divider.remove();
+    }
+    nodes.forEach((node, index) => {
+      if (this._grid.children[index] !== node) {
+        this._grid.insertBefore(node, this._grid.children[index] || null);
       }
-      // Keep DOM order in step with the configured order, which the editor lets the
-      // user rearrange.
-      if (this._grid.children[index] !== tile.root) {
-        this._grid.insertBefore(tile.root, this._grid.children[index] || null);
-      }
+    });
 
+    for (const camera of shown) {
+      const tile = this._tiles.get(camera);
+      const putAway = hidden.includes(camera);
       const door = resolveDoor(hass, camera);
       tile.door = door;
       tile.label.textContent = door.name;
-      tile.open.hidden = !door.button;
+      tile.root.classList.toggle("loki-put-away", putAway);
+
+      // Nothing opens from the editor. A tile is about to be grabbed and dragged,
+      // and the button under the thumb must not be the one that opens the door.
+      tile.open.hidden = !door.button || editing;
+      tile.restore.hidden = !(editing && putAway);
+      tile.putAwayBtn.hidden = !(editing && !putAway);
+      tile.handle.hidden = !(editing && !putAway);
+      tile.liveBtn.hidden = editing;
 
       // Only a tile that leads somewhere looks and behaves like one: a pointer, a
       // stop on the tab order, and a name for whoever is listening rather than
       // looking.
-      const linked = Boolean(door.loki) && panelReady(hass);
+      const linked = Boolean(door.loki) && panelReady(hass) && !editing;
       tile.root.classList.toggle("loki-linked", linked);
       if (linked) {
         tile.root.tabIndex = 0;
@@ -1534,9 +1926,9 @@ class LokiWallCard extends HTMLElement {
       }
 
       const call = door.call ? hass.states[door.call] : null;
-      tile.ringing.hidden = !(call && call.state === "on");
+      tile.ringing.hidden = editing || !(call && call.state === "on");
 
-      const live = (this._live || tile.solo) && reachable;
+      const live = !editing && (this._live || tile.solo) && reachable;
       tile.liveBtn.disabled = !reachable;
       tile.liveBtn.title = reachable ? (live ? t.stop : t.live) : t.liveBlocked;
       tile.liveBtn.classList.toggle("on", live);
@@ -1544,7 +1936,16 @@ class LokiWallCard extends HTMLElement {
 
       tile.media.setHass(hass);
       tile.media.render(camera, live);
-    });
+    }
+  }
+
+  _tileFor(camera) {
+    let tile = this._tiles.get(camera);
+    if (!tile) {
+      tile = this._buildTile(camera);
+      this._tiles.set(camera, tile);
+    }
+    return tile;
   }
 
   _buildTile(camera) {
@@ -1553,15 +1954,26 @@ class LokiWallCard extends HTMLElement {
     ringing.hidden = true;
 
     const liveBtn = iconButton(ICON_LIVE, t.live);
+    // The editor's two controls on the picture: a handle to take hold of, and a
+    // cross to put the door away. Hidden until the editor is open.
+    const handle = iconButton(ICON_DRAG, t.dragHandle);
+    handle.classList.add("loki-handle");
+    handle.hidden = true;
+    const putAwayBtn = iconButton(ICON_PUT_AWAY, t.putAway);
+    putAwayBtn.hidden = true;
     const parts = pictureBar();
-    media.el.append(ringing, liveBtn, parts.bar);
+    media.el.append(ringing, liveBtn, handle, putAwayBtn, parts.bar);
 
     const tile = {
+      camera,
       root: media.el,
       media,
       label: parts.label,
       open: parts.open,
       openLabel: parts.openLabel,
+      restore: parts.restore,
+      handle,
+      putAwayBtn,
       ringing,
       liveBtn,
       solo: false,
@@ -1577,12 +1989,22 @@ class LokiWallCard extends HTMLElement {
     parts.open.addEventListener("click", () =>
       pressOpen(this._hass, tile.door, parts.open, parts.openLabel)
     );
+    putAwayBtn.addEventListener("click", () => this._putAway(camera));
+    parts.restore.addEventListener("click", () => this._bringBack(camera));
+
+    // Dragging, on pointer events so that one piece of code serves the mouse and the
+    // finger. The tile captures the pointer, so the drag survives leaving it.
+    media.el.addEventListener("pointerdown", (event) => this._dragStart(event, tile));
+    media.el.addEventListener("pointermove", (event) => this._dragMove(event));
+    media.el.addEventListener("pointerup", (event) => this._dragEnd(event, false));
+    media.el.addEventListener("pointercancel", (event) => this._dragEnd(event, true));
 
     // Tapping the picture opens that door on its own page. A tile is a thumbnail, and
     // the question a thumbnail raises -- who is that by the gate? -- wants a bigger
     // picture, not a squint. The buttons drawn on top keep doing their own job.
     const follow = (event) => {
-      if (event.target.closest("button")) return;
+      // Not from the editor: the click that ends a drag lands here too.
+      if (this._editing || event.target.closest("button")) return;
       if (!tile.door || !tile.door.loki || !panelReady(this._hass)) return;
       goTo(`/${PANEL_PATH}/${tile.door.loki}`);
     };
@@ -1595,6 +2017,232 @@ class LokiWallCard extends HTMLElement {
     });
 
     return tile;
+  }
+
+  /* ---- the editor ---- */
+
+  _setEditing(on) {
+    if (this._editing === on) return;
+    this._editing = on;
+    this._cancelDrag();
+    // Twenty streams behind an editor nobody is watching is the one thing this
+    // card must not do; and the tiles are about to lose their live buttons anyway.
+    if (on) this._stopLive();
+    if (this._hass && this._built) this._update();
+  }
+
+  _putAway(camera) {
+    if (!this._layout || !this._editing) return;
+    this._layout.hide(camera, this._available());
+    this._update();
+    this._save();
+  }
+
+  _bringBack(camera) {
+    if (!this._layout || !this._editing) return;
+    this._layout.restore(camera, this._available());
+    this._update();
+    this._save();
+  }
+
+  _chooseSize(size) {
+    if (!this._layout || !TILE_SIZES[size] || size === this._tileSize()) return;
+    this._layout.tileSize = size;
+    this._update();
+    this._save();
+  }
+
+  /** Write the arrangement back. Every change, as it happens: a page left without
+   * pressing anything is a page whose changes are kept, and the restore button is
+   * the undo. */
+  async _save() {
+    if (!this._store || !this._layout || !this._hass) return;
+    try {
+      await this._store.save(this._hass, this._layout.message(this._tileSize()));
+    } catch (err) {
+      fire(this, "hass-notification", {
+        message: `${t.saveFailed}: ${(err && err.message) || err}`,
+      });
+    }
+  }
+
+  /* ---- dragging ---- */
+
+  _dragStart(event, tile) {
+    if (!this._editing || this._drag || !this._layout) return;
+    if (event.button !== 0) return;
+    const onHandle = Boolean(event.target.closest(".loki-handle"));
+    if (!onHandle && event.target.closest("button")) return;
+    // A finger takes hold by the handle only, so the rest of the tile still scrolls
+    // the page; a mouse can take hold anywhere.
+    if (!onHandle && event.pointerType !== "mouse") return;
+    // Put-away tiles stay put: their order is the order they were put away in.
+    if (!this._arranged().active.includes(tile.camera)) return;
+    event.preventDefault();
+    this._drag = {
+      tile,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      rect: tile.root.getBoundingClientRect(),
+      before: this._layout.clone(),
+      moved: false,
+      ghost: null,
+      scroller: null,
+      scrollSpeed: 0,
+      frame: null,
+    };
+    try {
+      tile.root.setPointerCapture(event.pointerId);
+    } catch (err) {
+      // Not every pointer can be captured; the drag then works while it stays over
+      // the tile, which is better than no drag.
+    }
+  }
+
+  _dragMove(event) {
+    const drag = this._drag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.moved) {
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+      drag.moved = true;
+      this._lift(drag);
+    }
+    event.preventDefault();
+    drag.lastX = event.clientX;
+    drag.lastY = event.clientY;
+    drag.ghost.style.transform = `translate(${drag.rect.left + dx}px, ${drag.rect.top + dy}px)`;
+    this._hover(event.clientX, event.clientY);
+    this._autoScroll(event.clientY);
+  }
+
+  _dragEnd(event, cancelled) {
+    const drag = this._drag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    this._drag = null;
+    this._settle(drag);
+    if (cancelled) {
+      // The browser took the pointer away -- a scroll it decided to run, usually.
+      // Half a drag must not be kept.
+      this._layout = drag.before;
+      this._update();
+      return;
+    }
+    if (drag.moved && !drag.before.sameAs(this._layout, this._available())) {
+      this._save();
+    }
+  }
+
+  _cancelDrag() {
+    const drag = this._drag;
+    if (!drag) return;
+    this._drag = null;
+    this._settle(drag);
+    this._layout = drag.before;
+  }
+
+  /** Pick the tile up: a copy of its picture under the pointer, a dashed outline
+   * where it came from. */
+  _lift(drag) {
+    const root = drag.tile.root;
+    const { rect } = drag;
+    const ghost = el("div", "loki-ghost");
+    // Styled inline. The ghost floats in document.body, outside the tree the
+    // stylesheet lives in -- the page sits inside Home Assistant's shadow roots --
+    // and position: fixed inside the card would be caught by any transformed
+    // ancestor between here and the viewport.
+    ghost.style.cssText =
+      `position: fixed; left: 0; top: 0; width: ${rect.width}px; height: ${rect.height}px;`
+      + " z-index: 10000; pointer-events: none; border-radius: 10px; overflow: hidden;"
+      + " background: #2a2a2a; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);"
+      + " opacity: 0.92; will-change: transform;";
+    const src = drag.tile.media.pictureSrc();
+    if (src) {
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = "";
+      img.draggable = false;
+      img.style.cssText = "display: block; width: 100%; height: 100%; object-fit: cover;";
+      ghost.appendChild(img);
+    }
+    const name = el("div", null, drag.tile.label.textContent);
+    name.style.cssText =
+      "position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 8px;"
+      + " font: 13px/1.25 Roboto, sans-serif; color: #fff; white-space: nowrap;"
+      + " overflow: hidden; text-overflow: ellipsis;"
+      + " background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));";
+    ghost.appendChild(name);
+    ghost.style.transform = `translate(${rect.left}px, ${rect.top}px)`;
+    document.body.appendChild(ghost);
+    drag.ghost = ghost;
+    root.classList.add("loki-drag-source");
+    drag.scroller = scrollParent(root);
+  }
+
+  /** Put everything back the way a drag found it, whatever the order is now. */
+  _settle(drag) {
+    if (drag.frame) window.cancelAnimationFrame(drag.frame);
+    drag.frame = null;
+    drag.scrollSpeed = 0;
+    if (drag.ghost) drag.ghost.remove();
+    drag.tile.root.classList.remove("loki-drag-source");
+    try {
+      drag.tile.root.releasePointerCapture(drag.pointerId);
+    } catch (err) {
+      // Already released, or never captured.
+    }
+  }
+
+  /** The tile under the pointer takes the dragged one's place.
+   *
+   * By geometry rather than elementFromPoint: the tiles are several shadow roots
+   * deep, and a handful of bounding boxes is cheaper to ask for than to reason
+   * about which root to ask. Once the dragged tile has moved into the slot under the
+   * pointer it is the one found there, and nothing moves again until the pointer
+   * reaches another.
+   */
+  _hover(x, y) {
+    const drag = this._drag;
+    if (!drag || !drag.moved) return;
+    const { active } = this._arranged();
+    for (const camera of active) {
+      if (camera === drag.tile.camera) continue;
+      const tile = this._tiles.get(camera);
+      if (!tile) continue;
+      const box = tile.root.getBoundingClientRect();
+      if (x < box.left || x > box.right || y < box.top || y > box.bottom) continue;
+      this._layout.move(drag.tile.camera, active.indexOf(camera), this._available());
+      this._update();
+      return;
+    }
+  }
+
+  /** Scroll the page while the pointer is held near its top or bottom edge. */
+  _autoScroll(y) {
+    const drag = this._drag;
+    if (!drag || !drag.moved || !drag.scroller) return;
+    const height = window.innerHeight;
+    let speed = 0;
+    if (y < SCROLL_EDGE) speed = -Math.ceil((SCROLL_EDGE - y) / 4);
+    else if (y > height - SCROLL_EDGE) speed = Math.ceil((y - (height - SCROLL_EDGE)) / 4);
+    drag.scrollSpeed = speed;
+    if (!speed || drag.frame) return;
+    const step = () => {
+      const current = this._drag;
+      if (!current || !current.scrollSpeed) {
+        if (current) current.frame = null;
+        return;
+      }
+      current.scroller.scrollTop += current.scrollSpeed;
+      // The pointer has not moved, but the tiles under it have.
+      this._hover(current.lastX, current.lastY);
+      current.frame = window.requestAnimationFrame(step);
+    };
+    drag.frame = window.requestAnimationFrame(step);
   }
 
   /** One real frame from every door, now.
@@ -1679,6 +2327,7 @@ class LokiWallCard extends HTMLElement {
   }
 
   _teardown() {
+    this._cancelDrag();
     // The DOM nodes go too, not just the bookkeeping. Switching dashboard tabs
     // disconnects the card and reconnects the same element without calling setConfig
     // again -- so a teardown that forgot the tiles but left them on screen meant the
@@ -2047,6 +2696,9 @@ class LokiPanel extends HTMLElement {
     const wrap = el("div", "loki-panel");
     this._card = document.createElement("loki-wall-card");
     this._card.setConfig(this._config());
+    // What makes the page editable: the arrangement is kept by the integration,
+    // and the card knows how to ask for it and how to put it back.
+    this._card.layoutStore = panelLayoutStore;
     wrap.appendChild(this._card);
     this.append(style, wrap);
   }
