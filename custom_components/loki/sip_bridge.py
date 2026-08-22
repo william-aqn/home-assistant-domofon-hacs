@@ -339,9 +339,11 @@ class SipBridge:
             # the account up as soon as it is free. Saying otherwise in the log sends
             # whoever reads it looking for a switch to flick.
             _LOGGER.warning(
-                "SIP не регистрируется — аккаунт занят (%s): %s; проверю снова",
+                "SIP не регистрируется — аккаунт занят (%s): %s; проверю снова. "
+                "Диагностика: %s",
                 kind,
                 detail,
+                self._blocked_diagnostics(),
             )
         else:
             _LOGGER.error("SIP остановлен окончательно (%s): %s", kind, detail)
@@ -365,6 +367,23 @@ class SipBridge:
                 "detail": detail,
             },
         )
+
+    def _blocked_diagnostics(self) -> str:
+        """What the sensor would show about a refusal, for the log.
+
+        A block on our own leftover clears itself within one expiry, and the card
+        goes with it -- so the attributes that say whose binding it was are gone
+        before anybody reads them. The probe that found the binding published its
+        snapshot just before the gate refused, so it is the right one to quote.
+        """
+        if (snapshot := self.snapshot) is None:
+            return "снимка аккаунта нет"
+        changed = (
+            "null"
+            if self.address_changed is None
+            else ("true" if self.address_changed else "false")
+        )
+        return f"{snapshot.diagnostics}, address_changed={changed}"
 
     async def on_incoming(self, call_id: str, remote_uri: str) -> bool:
         """Announce a ring. False releases the SIP branch immediately."""

@@ -114,6 +114,15 @@ def _is_private(host: str) -> bool:
         return False
 
 
+def _json_like(value: bool | int | None) -> str:
+    """true / false / null / a number -- the way the attributes panel shows them."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def _host_only(sent_by: str | None) -> str | None:
     """The host out of a ``host:port`` sent-by, brackets and all."""
     if not sent_by:
@@ -219,6 +228,29 @@ class SipSnapshot:
             if binding.expires is not None and binding.expires > 0
         ]
         return max(left) if left else None
+
+    @property
+    def diagnostics(self) -> str:
+        """The refusal explained in one line, for the log.
+
+        The sensor shows the same fields, but only while the block lasts -- five
+        minutes, usually, and then the leftover lapses and takes the evidence with
+        it. Measured on the live account: by the time anybody looked, the card was
+        gone and the sensor said ``registered``. The log keeps it.
+
+        Same names and the same true/false/null as the sensor attributes, so a line
+        from the log reads against the same table. Every value is a count, a flag
+        or a label; none is an address.
+        """
+        return (
+            f"foreign_where={self.foreign_where or 'null'}, "
+            f"foreign_expires_in={_json_like(self.foreign_expires_in)}, "
+            f"foreign_same_user={_json_like(self.foreign_same_user)}, "
+            f"foreign_private={_json_like(self.foreign_private)}, "
+            f"foreign_host_known={_json_like(self.foreign_host_known)}, "
+            f"known_contacts={self.known_contacts}, "
+            f"bindings_total={len(self.bindings)}"
+        )
 
 
 class SipEvents(Protocol):

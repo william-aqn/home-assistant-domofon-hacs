@@ -377,3 +377,48 @@ async def test_a_connection_dropped_during_baseline_is_noticed_at_once(
     # timeout is 32 s, so a client that only noticed on the next probe would have
     # blown the 10 s deadline above.
     assert any(s is SipState.BACKOFF for s, _ in recorder.states)
+
+
+def test_snapshot_diagnostics_name_every_bit_and_never_an_address() -> None:
+    """The one line the log keeps after a self-inflicted block has cleared itself.
+
+    It has to carry every bit the sensor would have shown -- the sensor's copy is
+    gone with the card by the time anybody looks -- and it must not carry the one
+    thing the sensor deliberately withholds, which is where anybody is.
+    """
+    stranger = Binding("sip:1009999@203.0.113.7:5060;transport=tcp", 287, None, None)
+    snapshot = SipSnapshot(
+        state=SipState.BLOCKED,
+        bindings=(stranger,),
+        foreign=(stranger,),
+        local="172.25.0.2:36202",
+        received="198.51.100.1",
+        rport="63330",
+        known_contacts=2,
+        foreign_same_user=True,
+        foreign_private=False,
+        foreign_host_known=False,
+    )
+    line = snapshot.diagnostics
+    for address in ("203.0.113.7", "198.51.100.1", "172.25.0.2", "63330", "36202"):
+        assert address not in line
+    for fact in (
+        f"foreign_where={client_module.FOREIGN_ELSEWHERE}",
+        "foreign_expires_in=287",
+        "foreign_same_user=true",
+        "foreign_private=false",
+        "foreign_host_known=false",
+        "known_contacts=2",
+        "bindings_total=1",
+    ):
+        assert fact in line
+
+    # Nothing known about the other side: every unknown reads as null, like the
+    # attributes panel, rather than as an empty string somebody has to guess at.
+    blank = SipSnapshot(state=SipState.BLOCKED)
+    assert "foreign_where=null" in blank.diagnostics
+    assert "foreign_expires_in=null" in blank.diagnostics
+    assert "foreign_private=null" in blank.diagnostics
+    assert "foreign_host_known=null" in blank.diagnostics
+    assert "foreign_same_user=false" in blank.diagnostics
+
