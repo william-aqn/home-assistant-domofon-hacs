@@ -139,10 +139,12 @@ actions:
 
       # Косая черта на конце — самая частая опечатка в таком поле, и она превратила бы
       # адрес в `http://ha:8123//loki/5`.
+      # Страница одной двери сама открывается с живым видео, поэтому «картинка» — это
+      # явный `?live=0`, а не отсутствие параметра.
       base: >-
         {{ base_in | trim | regex_replace('/+$', '') }}
       path: >-
-        {{ '/loki' if what_in == 'all' else '/loki/' ~ device_id ~ ('?live=1' if what_in == 'door_live' else '') }}
+        {{ '/loki' if what_in == 'all' else '/loki/' ~ device_id ~ ('?live=1' if what_in == 'door_live' else '?live=0') }}
       target_url: "{{ base }}{{ path }}"
 
       # Идентификаторы сущностей Home Assistant собирает из английских названий при

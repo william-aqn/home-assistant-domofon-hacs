@@ -1443,10 +1443,10 @@ class LokiDoorCard extends HTMLElement {
       this._live && reachable ? ICON_STOP : ICON_LIVE
     );
 
-    // ``live: true`` -- what /loki/<id>?live=1 sets, and what a wall panel woken by a
-    // ring wants: the stream, not a still somebody has to walk over and tap. Once per
-    // configuration, and never against an unreachable stream: after the timeout has
-    // stopped it, or after somebody stopped it by hand, it stays stopped.
+    // ``live: true`` -- what the door's own page sets, and what a wall panel woken by
+    // a ring wants: the stream, not a still somebody has to walk over and tap. Once
+    // per configuration, and never against an unreachable stream: after the timeout
+    // has stopped it, or after somebody stopped it by hand, it stays stopped.
     if (this._config.live && !this._autoLive && reachable) {
       this._autoLive = true;
       this._toggleLive();
@@ -2629,10 +2629,12 @@ class LokiPanel extends HTMLElement {
     const path = (route && route.path) || "";
     const match = path.match(/(\d+)/);
     const door = match ? match[1] : null;
-    // ``?live=1`` opens straight into the stream. The router hands us the path only,
-    // so the query is read off the address bar -- which is where a panel woken by a
-    // doorbell lands, and it should be showing the door by the time somebody looks.
-    const live = new URLSearchParams(window.location.search).get("live") === "1";
+    // One door opens straight into the stream: whoever came here -- from a tile, a
+    // notification, a wall panel woken by the doorbell -- came to see who is there,
+    // and a still they then have to tap is one tap too many. ``?live=0`` asks for the
+    // still instead. The router hands us the path only, so the query is read off the
+    // address bar.
+    const live = new URLSearchParams(window.location.search).get("live") !== "0";
     if (door === this._door && live === this._live) return;
     this._live = live;
     this._door = door;
