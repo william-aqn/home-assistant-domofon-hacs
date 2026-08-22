@@ -17,6 +17,7 @@ from collections.abc import Sequence
 import contextlib
 from dataclasses import dataclass, field
 from enum import StrEnum
+import ipaddress
 import logging
 import random
 import time
@@ -101,6 +102,18 @@ FOREIGN_ELSEWHERE = "другой адрес"
 FOREIGN_UNKNOWN = "адрес неизвестен"
 
 
+def _is_private(host: str) -> bool:
+    """Whether an address is one only this machine's own network can reach.
+
+    A hostname that is not an address at all counts as public: the question being
+    asked is "is this the inside of a container", and a name is not.
+    """
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_private
+    except ValueError:
+        return False
+
+
 def _host_only(sent_by: str | None) -> str | None:
     """The host out of a ``host:port`` sent-by, brackets and all."""
     if not sent_by:
@@ -147,6 +160,19 @@ class SipSnapshot:
     # or remembered and not matched. Neither names an address.
     known_contacts: int = 0
     foreign_same_user: bool = False
+    # Two bits that split the remaining explanations for a binding we cannot claim,
+    # and neither says where anybody is.
+    #
+    # `foreign_private`: is it at a private address -- the inside of a container --
+    # or a public one. A leftover at a private address is a row created before the
+    # registrar told us how it really sees us.
+    #
+    # `foreign_host_known`: does its host appear in a Contact we remember, port aside.
+    # Together: private and known means our own old container address; private and
+    # unknown means one we never recorded; public and unknown means something that is
+    # not us at all, whatever the number in it says.
+    foreign_private: bool | None = None
+    foreign_host_known: bool | None = None
 
     @property
     def foreign_count(self) -> int:
@@ -1239,12 +1265,32 @@ class LokiSipClient:
 
         foreign = tuple(self._foreign(bindings))
         known = [self._state.contact_uri, *(p.uri for p in self._state.prior_contacts)]
+        known_hosts = {
+            parsed.host
+            for uri in known
+            if uri and (parsed := parse_uri(uri)) is not None
+        }
+        foreign_hosts = [
+            parsed.host
+            for binding in foreign
+            if (parsed := parse_uri(binding.uri)) is not None
+        ]
         self._events.on_snapshot(
             SipSnapshot(
                 state=state,
                 bindings=tuple(bindings),
                 foreign=foreign,
                 known_contacts=len([uri for uri in known if uri]),
+                foreign_private=(
+                    any(_is_private(host) for host in foreign_hosts)
+                    if foreign_hosts
+                    else None
+                ),
+                foreign_host_known=(
+                    any(host in known_hosts for host in foreign_hosts)
+                    if foreign_hosts
+                    else None
+                ),
                 foreign_same_user=any(
                     (parsed := parse_uri(binding.uri)) is not None
                     and parsed.user == self._state.user

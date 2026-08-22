@@ -126,6 +126,8 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
                 attributes["foreign_where"] = snapshot.foreign_where
                 attributes["foreign_expires_in"] = snapshot.foreign_expires_in
                 attributes["foreign_same_user"] = snapshot.foreign_same_user
+                attributes["foreign_private"] = snapshot.foreign_private
+                attributes["foreign_host_known"] = snapshot.foreign_host_known
             # Not only while something is being refused. Half the diagnosis is
             # whether anything was remembered at all, and that half has to be
             # readable BEFORE the restart that loses it -- afterwards there is
