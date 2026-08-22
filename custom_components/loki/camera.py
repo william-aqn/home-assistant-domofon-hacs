@@ -14,6 +14,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import LokiApiError, LokiAuthError
 from .call import CallUpdate, signal_call_update
+from .const import DOMAIN
 from .coordinator import LokiConfigEntry, LokiCoordinator
 from .entity import LokiEntity, build_unique_id
 from .models import LokiDevice
@@ -43,6 +44,13 @@ _CAPTURE_TIMEOUT = 20.0
 # wall silently reverted to placeholders a few seconds after the user pressed the
 # button. A frame that was explicitly requested outranks one nobody asked for.
 _CAPTURE_TTL = 300.0
+
+# A capture this young is reused rather than repeated. A ring sets several things off
+# at once -- the integration's own grab, a Telegram blueprint, somebody pressing the
+# button on the card -- and each opening its own RTSP connection to photograph the
+# same second would be three connections for one picture. Measured: a capture takes
+# about three and a half seconds against the live intercom.
+_CAPTURE_FRESH = 8.0
 
 
 async def async_setup_entry(
@@ -96,6 +104,9 @@ class LokiCamera(LokiEntity, Camera):
         self._cached_at = 0.0
         self._captured_image: bytes | None = None
         self._captured_at = 0.0
+        # The capture in flight, if any. Shared rather than duplicated: see
+        # _CAPTURE_FRESH.
+        self._capturing: asyncio.Task[bool] | None = None
         # Advertised whenever the device has a stream URL at all, even while the media
         # host is unreachable. Withdrawing the feature when video is down was tried and
         # made things worse: Home Assistant's own camera dialog stops rendering the
@@ -131,16 +142,28 @@ class LokiCamera(LokiEntity, Camera):
 
     @callback
     def _handle_call_update(self, update: CallUpdate) -> None:
-        """Expire the cached still when this camera's door starts ringing.
+        """Take a real frame the moment this camera's door starts ringing.
 
-        The notification the blueprint sends fetches a snapshot the moment the call
-        arrives; without this it could serve a frame up to the cache TTL old, i.e. the
-        doorway before the visitor stepped into it.
+        The backend's own still does not follow the camera -- it is the same bytes
+        minutes later -- so a notification built from it shows the doorway, not the
+        person standing in it. Only the stream knows who is there, and the one moment
+        it is worth paying for a stream is this one.
+
+        Started here rather than left to each notification: a ring feeds a phone, a
+        messenger, a wall panel and a dashboard, and every one of them wanting its own
+        photograph of the same second would be several RTSP connections for one
+        picture. They share this capture through _CAPTURE_FRESH.
         """
-        if update.device_id == self._device_id and update.kind == "start":
-            # Expire, don't discard: the cached frame is still the best fallback if
-            # the fresh fetch fails, and it fails exactly when the cloud is busy.
-            self._cached_at = 0.0
+        if update.device_id != self._device_id or update.kind != "start":
+            return
+        # Expire, don't discard: the cached frame is still the best fallback if the
+        # fresh fetch fails, and it fails exactly when the cloud is busy.
+        self._cached_at = 0.0
+        if not self._attr_supported_features & CameraEntityFeature.STREAM:
+            return
+        self.hass.async_create_task(
+            self.async_capture_from_stream(), f"{DOMAIN}_ring_frame_{self._device_id}"
+        )
 
     async def stream_source(self) -> str | None:
         """Return the RTSP URL.
@@ -166,9 +189,28 @@ class LokiCamera(LokiEntity, Camera):
         Deliberately not wired into ``async_camera_image``: that would put an RTSP
         connection behind every dashboard tile, which is the cost the cheap still
         exists to avoid. This is an action somebody asks for, one frame at a time.
+
+        Callers arriving together share one capture, and one that has just finished is
+        not repeated -- otherwise a single ring would photograph the same second three
+        times over three separate connections.
         """
         if not self._attr_supported_features & CameraEntityFeature.STREAM:
             return False
+
+        now = time.monotonic()
+        fresh = self._captured_image is not None
+        if fresh and now - self._captured_at < _CAPTURE_FRESH:
+            return True
+        if self._capturing is not None and not self._capturing.done():
+            return await asyncio.shield(self._capturing)
+
+        self._capturing = self.hass.async_create_task(
+            self._async_grab_frame(), f"{DOMAIN}_capture_{self._device_id}"
+        )
+        return await asyncio.shield(self._capturing)
+
+    async def _async_grab_frame(self) -> bool:
+        """The capture itself. One at a time per camera; see the caller."""
         try:
             async with asyncio.timeout(_CAPTURE_TIMEOUT):
                 stream = await self.async_create_stream()
