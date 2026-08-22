@@ -125,10 +125,10 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
                 # our own binding from before a restart, and how long until it goes.
                 attributes["foreign_where"] = snapshot.foreign_where
                 attributes["foreign_expires_in"] = snapshot.foreign_expires_in
-                # Which half of the self-recognition failed. `known_contacts: 0`
-                # means nothing was remembered from the previous run; a non-zero
-                # count with a binding still refused means the strings did not
-                # match. The two need opposite fixes.
-                attributes["known_contacts"] = snapshot.known_contacts
                 attributes["foreign_same_user"] = snapshot.foreign_same_user
+            # Not only while something is being refused. Half the diagnosis is
+            # whether anything was remembered at all, and that half has to be
+            # readable BEFORE the restart that loses it -- afterwards there is
+            # nothing left to compare against.
+            attributes["known_contacts"] = snapshot.known_contacts
         return attributes
