@@ -196,6 +196,20 @@ class LokiCamera(LokiEntity, Camera):
         rather than starting the clock themselves. If nobody arrives, the idle timer
         takes it all down again.
         """
+        # Never against a host the coordinator has already found dead.
+        #
+        # A stream started against an unreachable host does not fail and stop: the
+        # worker retries for ever on a widening backoff, and the one thing that would
+        # take it down -- the provider's idle timer -- is only armed by the arrival of
+        # a first segment, which never comes. The camera then reports itself
+        # unavailable until Home Assistant restarts, and the media host is hammered
+        # the whole time. A timeout on this side does not help: it abandons the wait,
+        # not the thread.
+        #
+        # `is False` and not falsiness: None means nobody has looked yet, and refusing
+        # then would leave the picture off until the first poll.
+        if self.coordinator.stream_reachable is False:
+            return
         try:
             async with asyncio.timeout(_CAPTURE_TIMEOUT):
                 stream = await self.async_create_stream()
@@ -254,6 +268,9 @@ class LokiCamera(LokiEntity, Camera):
 
     async def _async_grab_frame(self) -> bool:
         """The capture itself. One at a time per camera; see the caller."""
+        # Same guard, same reason: this opens a stream too.
+        if self.coordinator.stream_reachable is False:
+            return False
         try:
             async with asyncio.timeout(_CAPTURE_TIMEOUT):
                 stream = await self.async_create_stream()
