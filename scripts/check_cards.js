@@ -30,13 +30,32 @@ const defined = {};
 /** Enough of an element for the module to build its DOM without a browser. */
 const stubElement = () => {
   const attrs = {};
+  const classes = new Set();
   return {
     className: "",
     style: {},
     textContent: "",
     hidden: false,
     disabled: false,
-    classList: { add() {}, remove() {}, toggle() {} },
+    // Classes are kept, not dropped: whether the picture stands alone in its row
+    // is said with one, and that is a thing worth checking.
+    classList: {
+      add(...names) {
+        names.forEach((name) => classes.add(name));
+      },
+      remove(...names) {
+        names.forEach((name) => classes.delete(name));
+      },
+      toggle(name, force) {
+        const on = force === undefined ? !classes.has(name) : Boolean(force);
+        if (on) classes.add(name);
+        else classes.delete(name);
+        return on;
+      },
+      contains(name) {
+        return classes.has(name);
+      },
+    },
     append() {},
     appendChild() {},
     addEventListener() {},
@@ -245,6 +264,58 @@ check(
   check("the capture button changes the picture URL", Boolean(forced) && bucketed !== forced);
   check("a captured frame survives the state updates that follow", forced === after);
   media.destroy();
+}
+
+// The column beside the picture holds the open button and, during a call, the
+// hang-up button. A plain camera has neither, and keeping the column gave its
+// picture 70% of the card with a blank strip next to it.
+{
+  const hass = {
+    states: {
+      "camera.door": {
+        state: "idle",
+        attributes: { friendly_name: "Дверь", entity_picture: "/api/camera_proxy/door" },
+      },
+      "camera.yard": {
+        state: "idle",
+        attributes: { friendly_name: "Двор", entity_picture: "/api/camera_proxy/yard" },
+      },
+      "camera.gate": {
+        state: "idle",
+        attributes: { friendly_name: "Калитка", entity_picture: "/api/camera_proxy/gate" },
+      },
+      "binary_sensor.gate": { state: "on", last_changed: new Date().toISOString() },
+    },
+    entities: {
+      "camera.door": { device_id: "door", platform: "loki" },
+      "button.door": { device_id: "door", platform: "loki" },
+      "camera.yard": { device_id: "yard", platform: "loki" },
+      // A door with no lock to open, ringing: the hang-up button needs the column.
+      "camera.gate": { device_id: "gate", platform: "loki" },
+      "binary_sensor.gate": { device_id: "gate", platform: "loki" },
+    },
+    devices: {
+      door: { identifiers: [["loki", "1"]], name: "Дверь" },
+      yard: { identifiers: [["loki", "2"]], name: "Двор" },
+      gate: { identifiers: [["loki", "3"]], name: "Калитка" },
+    },
+    panels: {},
+  };
+  const show = (camera) => {
+    const card = new defined["loki-door-card"]();
+    card.setConfig({ camera });
+    card.hass = hass;
+    const alone = card._side.hidden && card._grid.classList.contains("loki-alone");
+    const beside = !card._side.hidden && !card._grid.classList.contains("loki-alone");
+    card.disconnectedCallback();
+    return { alone, beside };
+  };
+  check("a door keeps the column for its open button", show("camera.door").beside);
+  check("a plain camera's picture takes the whole row", show("camera.yard").alone);
+  check(
+    "a door with no lock keeps the column while a call is up",
+    show("camera.gate").beside
+  );
 }
 
 // Every class that lays itself out with flex or grid must also say what [hidden] means

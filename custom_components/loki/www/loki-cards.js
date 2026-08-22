@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.8.0";
+const CARD_VERSION = "1.8.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -1015,6 +1015,10 @@ const STYLE = `
   .loki-side .loki-actions { width: 100%; }
   @container (min-width: 520px) {
     .loki-grid { grid-template-columns: 1fr minmax(150px, 30%); align-items: center; }
+    /* Nothing to put beside the picture -- a plain camera has no lock to open, and
+       nobody rings from it -- so the picture takes the whole width rather than
+       leaving a blank column where the button would have stood. */
+    .loki-grid.loki-alone { grid-template-columns: 1fr; }
   }
 
   /* One row: preview, who and how long, and the buttons. For a dashboard where the
@@ -1023,6 +1027,7 @@ const STYLE = `
     grid-template-columns: 104px minmax(0, 1fr) auto;
     align-items: center;
   }
+  .loki-compact .loki-grid.loki-alone { grid-template-columns: 104px minmax(0, 1fr); }
   .loki-compact .loki-head,
   .loki-compact .loki-callbar { display: none; }
   .loki-compact .loki-strip { display: block; min-width: 0; }
@@ -1447,6 +1452,14 @@ class LokiDoorCard extends HTMLElement {
     this._ringing.hidden = true;
     this._callBar.hidden = !ringing;
     this._hangupWrap.hidden = !ringing;
+    // A plain camera -- the yard, the car park -- has no button to stand beside its
+    // picture, and nobody rings from it. With the column kept, the picture had 70%
+    // of the card and a blank strip next to it; now it takes the whole width. A door
+    // with no lock still gets the column while a call is up: the hang-up button
+    // lives there.
+    const alone = this._actions.hidden && this._hangupWrap.hidden;
+    this._side.hidden = alone;
+    this._grid.classList.toggle("loki-alone", alone);
     this._since = ringing ? call.last_changed : null;
     this._tickTimer(ringing);
 
