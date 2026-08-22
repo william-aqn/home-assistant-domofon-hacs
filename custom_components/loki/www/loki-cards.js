@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.7.0";
+const CARD_VERSION = "1.7.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -748,7 +748,7 @@ const STYLE = `
     position: absolute;
     left: 8px;
     bottom: 8px;
-    z-index: 2;
+    z-index: 3;
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -776,14 +776,28 @@ const STYLE = `
      still is the best picture there is, and it is a real one. The container carries
      the aspect ratio, so taking it out of the flow costs no layout. */
   .loki-still { position: absolute; inset: 0; object-fit: cover; }
-  .loki-live { position: relative; z-index: 1; }
-  .loki-live ha-card {
-    box-shadow: none; border: none; background: none; border-radius: 0;
+  /* Layers: the still at the bottom, the stream at 1 above it, and everything
+     drawn on top of the picture -- the bar with the name and the open button, the
+     badges, the corner buttons -- at 2. They used to sit at auto, and the day the
+     stream got its 1 they all went behind it: a tile with live video on had no
+     open button, no name and no way to stop the stream. */
+  .loki-live {
+    position: relative;
+    z-index: 1;
+    /* The composed card draws its own ha-card inside a shadow root, where a
+       selector from here cannot reach; its custom properties can. Transparent, so
+       the still underneath stays in view until the stream paints over it, and no
+       white frame around a stream whose shape differs from the tile's. */
+    --ha-card-background: transparent;
+    --ha-card-box-shadow: none;
+    --ha-card-border-width: 0;
+    --ha-card-border-radius: 0;
   }
 
   .loki-bar {
     position: absolute;
     left: 0; right: 0; bottom: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -946,6 +960,7 @@ const STYLE = `
     position: absolute;
     top: 8px;
     left: 8px;
+    z-index: 2;
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -1025,6 +1040,7 @@ const STYLE = `
   .loki-icon-btn {
     position: absolute;
     top: 6px; right: 6px;
+    z-index: 2;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1043,6 +1059,7 @@ const STYLE = `
   .loki-ringing {
     position: absolute;
     top: 6px; left: 6px;
+    z-index: 2;
     padding: 2px 9px;
     font-size: 11px;
     font-weight: 600;
