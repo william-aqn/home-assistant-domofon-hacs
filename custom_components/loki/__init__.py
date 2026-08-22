@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_integration
@@ -111,6 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
     )
     entry.async_on_unload(call_manager.async_shutdown)
 
+    _async_enable_plain_cameras(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # The sidebar page is per installation, not per account: one page shows every
@@ -125,6 +127,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: LokiConfigEntry) -> bool
         await bridge.async_start()
 
     return True
+
+
+@callback
+def _async_enable_plain_cameras(hass: HomeAssistant, entry: LokiConfigEntry) -> None:
+    """Lift the disablement earlier versions put on plain cameras.
+
+    Up to 1.7 the camera entities of anything that was not a door were registered
+    disabled, and the registry keeps that choice for ever: flipping the default only
+    reaches entities created after the flip. So the ones the integration itself
+    disabled are re-enabled here, once. Anything a person disabled by hand carries a
+    different ``disabled_by`` and is left alone.
+
+    Before the platforms are set up, so the camera platform adds them in this very
+    start. Home Assistant schedules a reload of the entry thirty seconds after an
+    entity is re-enabled -- one extra reload, on the first start after the update,
+    and then nothing is left to re-enable.
+    """
+    registry = er.async_get(hass)
+    enabled = 0
+    for entity_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if (
+            entity_entry.domain != Platform.CAMERA
+            or entity_entry.disabled_by is not er.RegistryEntryDisabler.INTEGRATION
+        ):
+            continue
+        registry.async_update_entity(entity_entry.entity_id, disabled_by=None)
+        enabled += 1
+    if enabled:
+        _LOGGER.info(
+            "Включены камеры, которые прежние версии регистрировали отключёнными: %d",
+            enabled,
+        )
 
 
 async def _async_sync_panel(hass: HomeAssistant) -> None:

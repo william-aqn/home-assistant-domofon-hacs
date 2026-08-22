@@ -111,9 +111,11 @@ class LokiCamera(LokiEntity, Camera):
         # attribute sets, so the order between them does not matter.
         Camera.__init__(self)
         self._attr_unique_id = build_unique_id(self._entry_id, device.id)
-        # Plain cameras are numerous and mostly uninteresting; doors are the point of
-        # the integration, so only those are enabled out of the box.
-        self._attr_entity_registry_enabled_default = device.is_door
+        # Plain cameras used to be registered disabled -- numerous, and not what the
+        # integration is for. They are enabled now because the «Домофоны» page gives
+        # them a place: put away by default, one tap to bring out. A disabled entity
+        # has no state and no picture, so the page could not show them at all.
+        # __init__ lifts the old disablement on existing installs.
         self._cached_image: bytes | None = None
         self._cached_at = 0.0
         self._captured_image: bytes | None = None

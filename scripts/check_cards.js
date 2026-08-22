@@ -271,9 +271,24 @@ if (STYLE_BLOCK) {
 
 // ---- the page's arrangement -------------------------------------------------
 
-/** Four doors, alphabetical by entity id -- the order the wall starts in. */
-function doorsHass(extra) {
+/** Four doors, alphabetical by entity id -- the order the wall starts in -- and,
+ * when asked, plain cameras: a picture with no open button on the device. */
+function doorsHass(extra, plain = []) {
   const hass = { states: {}, entities: {}, devices: {}, panels: {}, ...extra };
+  for (const id of plain) {
+    hass.states[`camera.${id}`] = {
+      state: "idle",
+      attributes: {
+        friendly_name: id.toUpperCase(),
+        entity_picture: `/api/camera_proxy/camera.${id}?t=1`,
+      },
+    };
+    hass.entities[`camera.${id}`] = { device_id: `dev-${id}`, platform: "loki" };
+    hass.devices[`dev-${id}`] = {
+      identifiers: [["loki", String(id.charCodeAt(0))]],
+      name: id.toUpperCase(),
+    };
+  }
   for (const id of ["a", "b", "c", "d"]) {
     hass.states[`camera.${id}`] = {
       state: "idle",
@@ -376,7 +391,7 @@ async function checkLayout() {
     active.join() === "camera.c,camera.a,camera.b" && hidden.join() === "camera.d",
     `${active.join()} | ${hidden.join()}`
   );
-  card._layout.move("camera.b", 0, card._available());
+  card._layout.move("camera.b", 0, card._roster());
   card._update();
   check(
     "moving a door puts it at the index asked for",
@@ -409,7 +424,7 @@ async function checkLayout() {
   // door that is away for a day must come back still hidden.
   const Layout = card._layout.constructor;
   const layout = new Layout({ order: ["camera.gone", "camera.a"], hidden: ["camera.away"] });
-  layout.hide("camera.a", ["camera.a", "camera.b"]);
+  layout.hide("camera.a", { doors: ["camera.a", "camera.b"], cameras: [] });
   const message = layout.message("medium");
   check(
     "absent doors keep their place in the stored lists",
@@ -419,11 +434,65 @@ async function checkLayout() {
   // Restoring puts a door at the end of the wall even when nothing was ever
   // arranged -- not back into its alphabetical slot.
   const fresh = new Layout({ hidden: ["camera.a"] });
-  fresh.restore("camera.a", ["camera.a", "camera.b", "camera.c"]);
+  const three = { doors: ["camera.a", "camera.b", "camera.c"], cameras: [] };
+  fresh.restore("camera.a", three);
   check(
     "a restored door lands after the others, not where the alphabet had it",
-    fresh.arrange(["camera.a", "camera.b", "camera.c"]).active.join() === "camera.b,camera.c,camera.a"
+    fresh.arrange(three).active.join() === "camera.b,camera.c,camera.a"
   );
+
+  // Plain cameras -- a picture with no lock behind it -- are on the roster but put
+  // away until somebody brings one out, below the doors put away on purpose.
+  const mixed = doorsHass({ user: { is_admin: true } }, ["x", "y"]);
+  const yard = new Wall();
+  yard.setConfig({});
+  yard.layoutStore = fakeStore({ entry_id: "e1", order: [], hidden: ["camera.d"], tile_size: null });
+  yard.hass = mixed;
+  await settle();
+  let got = yard._arranged();
+  check(
+    "plain cameras start put away, after the doors somebody put away",
+    got.active.join() === "camera.a,camera.b,camera.c"
+      && got.hidden.join() === "camera.d,camera.x,camera.y",
+    `${got.active.join()} | ${got.hidden.join()}`
+  );
+  yard._setEditing(true);
+  yard._bringBack("camera.y");
+  yard._setEditing(false);
+  got = yard._arranged();
+  const tileY = yard._tiles.get("camera.y");
+  check(
+    "a plain camera brought out joins the end of the wall, with no open button",
+    got.active.join() === "camera.a,camera.b,camera.c,camera.y"
+      && got.hidden.join() === "camera.d,camera.x"
+      && Boolean(tileY) && tileY.open.hidden === true && tileY.liveBtn.hidden === false,
+    `${got.active.join()} | ${got.hidden.join()}`
+  );
+  yard._setEditing(true);
+  yard._putAway("camera.y");
+  got = yard._arranged();
+  check(
+    "a plain camera put away again lists with the doors put away, ahead of the rest",
+    got.active.join() === "camera.a,camera.b,camera.c"
+      && got.hidden.join() === "camera.d,camera.y,camera.x",
+    `${got.active.join()} | ${got.hidden.join()}`
+  );
+  yard._setEditing(false);
+  await settle();
+  check(
+    "the stored lists carry the camera, so the choice survives a reload",
+    yard._store.saved.length === 2 && yard._store.saved[1].hidden.join() === "camera.d,camera.y",
+    JSON.stringify(yard._store.saved)
+  );
+  const doorsOnly = new Wall();
+  doorsOnly.setConfig({});
+  doorsOnly.hass = mixed;
+  check(
+    "a dashboard card without a store shows doors only",
+    doorsOnly._arranged().active.join() === "camera.a,camera.b,camera.c,camera.d"
+  );
+  yard._teardown();
+  doorsOnly._teardown();
 
   // No pencil on a dashboard card, for anyone but an admin, or when the integration
   // could not say which entry to write.

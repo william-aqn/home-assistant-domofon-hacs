@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.7.2";
+const CARD_VERSION = "1.8.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -127,8 +127,8 @@ const t = {
   done: "Готово",
   editHint:
     "Перетащите плитку, чтобы поменять порядок (пальцем — за ручку в углу). "
-    + "Крестик убирает домофон со страницы: убранные собираются внизу серыми, "
-    + "их можно вернуть.",
+    + "Крестик убирает плитку со страницы: убранные собираются внизу серыми, там же "
+    + "лежат обычные камеры; «Вернуть» ставит плитку на страницу.",
   putAway: "Убрать со страницы",
   putAwayGroup: "Убраны со страницы",
   bringBack: "Вернуть",
@@ -209,8 +209,14 @@ function streamReachable(hass, configured) {
   return !(state && state.state === "off");
 }
 
-/** Every Loki camera that also has an open button, i.e. every door with a picture. */
-function findDoorCameras(hass) {
+/**
+ * Every Loki camera there is, split by what stands behind it.
+ *
+ * A door is a camera with an open button on the same device; a plain camera -- the
+ * yard, the car park -- has the picture and nothing else. The page treats them
+ * differently: doors are what it is for, plain cameras are put away until asked.
+ */
+function lokiRoster(hass) {
   const registry = (hass && hass.entities) || {};
   const byDevice = {};
   for (const [entityId, entry] of Object.entries(registry)) {
@@ -219,10 +225,16 @@ function findDoorCameras(hass) {
     if (entityId.startsWith("camera.")) bucket.camera = entityId;
     if (entityId.startsWith("button.")) bucket.button = entityId;
   }
-  return Object.values(byDevice)
-    .filter((bucket) => bucket.camera && bucket.button)
-    .map((bucket) => bucket.camera)
-    .sort();
+  const buckets = Object.values(byDevice).filter((bucket) => bucket.camera);
+  return {
+    doors: buckets.filter((bucket) => bucket.button).map((bucket) => bucket.camera).sort(),
+    cameras: buckets.filter((bucket) => !bucket.button).map((bucket) => bucket.camera).sort(),
+  };
+}
+
+/** Every door with a picture, i.e. what a card shows when nobody narrowed it down. */
+function findDoorCameras(hass) {
+  return lokiRoster(hass).doors;
 }
 
 /** The numeric Loki device id behind a door, which the services take.
@@ -359,47 +371,57 @@ class WallLayout {
     });
   }
 
-  /** Split the doors there are into the ones on the page and the ones put away. */
-  arrange(available) {
+  /**
+   * Split what the account has into the tiles on the page and the tiles put away.
+   *
+   * ``roster`` is what lokiRoster returns: doors and plain cameras apart. A door
+   * nobody has placed or put away is shown -- that is what the page is for. A plain
+   * camera nobody has placed is put away: thirty yard cameras arriving on the page
+   * unasked would bury the doors, so they wait below the line until brought out,
+   * after the doors somebody put away on purpose.
+   */
+  arrange(roster) {
+    const available = [...roster.doors, ...roster.cameras];
     const hidden = this.hidden.filter((id) => available.includes(id));
     const placed = this.order.filter(
       (id) => available.includes(id) && !hidden.includes(id)
     );
-    const rest = available.filter(
-      (id) => !placed.includes(id) && !hidden.includes(id)
-    );
-    return { active: [...placed, ...rest], hidden };
+    const unplaced = (id) => !placed.includes(id) && !hidden.includes(id);
+    const rest = roster.doors.filter(unplaced);
+    const parked = roster.cameras.filter(unplaced);
+    return { active: [...placed, ...rest], hidden: [...hidden, ...parked] };
   }
 
-  /** Write the visible order down in full, the ids of absent doors behind it. */
-  _place(active, available) {
+  /** Write the visible order down in full, the ids of absent tiles behind it. */
+  _place(active, roster) {
+    const available = [...roster.doors, ...roster.cameras];
     this.order = [...active, ...this.order.filter((id) => !available.includes(id))];
   }
 
-  hide(id, available) {
-    this._place(this.arrange(available).active.filter((x) => x !== id), available);
+  hide(id, roster) {
+    this._place(this.arrange(roster).active.filter((x) => x !== id), roster);
     if (!this.hidden.includes(id)) this.hidden.push(id);
   }
 
   /** Back onto the page, at the end of the visible ones -- not where it used to be,
-   * which nobody remembers by then. */
-  restore(id, available) {
+   * which nobody remembers by then. A plain camera comes out the same way. */
+  restore(id, roster) {
     this.hidden = this.hidden.filter((x) => x !== id);
-    const active = this.arrange(available).active.filter((x) => x !== id);
-    this._place([...active, id], available);
+    const active = this.arrange(roster).active.filter((x) => x !== id);
+    this._place([...active, id], roster);
   }
 
-  /** Put a door at the given position among the visible ones. */
-  move(id, index, available) {
-    const active = this.arrange(available).active.filter((x) => x !== id);
+  /** Put a tile at the given position among the visible ones. */
+  move(id, index, roster) {
+    const active = this.arrange(roster).active.filter((x) => x !== id);
     active.splice(Math.max(0, Math.min(index, active.length)), 0, id);
-    this._place(active, available);
+    this._place(active, roster);
   }
 
-  /** Whether two layouts put the same doors in the same places. */
-  sameAs(other, available) {
-    const mine = this.arrange(available);
-    const theirs = other.arrange(available);
+  /** Whether two layouts put the same tiles in the same places. */
+  sameAs(other, roster) {
+    const mine = this.arrange(roster);
+    const theirs = other.arrange(roster);
     return (
       mine.active.join("\n") === theirs.active.join("\n")
       && mine.hidden.join("\n") === theirs.hidden.join("\n")
@@ -1633,9 +1655,9 @@ class LokiWallCard extends HTMLElement {
     return TILE_SIZES[this._config.tile_size] ? this._config.tile_size : DEFAULT_TILE_SIZE;
   }
 
-  /** Every door the account has, in the order the alphabet puts them. */
-  _available() {
-    return this._hass ? findDoorCameras(this._hass) : [];
+  /** Everything the account has a picture of, doors and plain cameras apart. */
+  _roster() {
+    return this._hass ? lokiRoster(this._hass) : { doors: [], cameras: [] };
   }
 
   /**
@@ -1650,9 +1672,10 @@ class LokiWallCard extends HTMLElement {
     const configured = this._config.cameras;
     if (configured && configured.length) return { active: [...configured], hidden: [] };
     if (this._store && !this._layout) return { active: [], hidden: [], pending: true };
-    const available = this._available();
-    if (!this._layout) return { active: available, hidden: [] };
-    return this._layout.arrange(available);
+    const roster = this._roster();
+    // No store, no editor -- and so no way to bring a plain camera out. Doors only.
+    if (!this._layout) return { active: roster.doors, hidden: [] };
+    return this._layout.arrange(roster);
   }
 
   _ensureLayout() {
@@ -2050,14 +2073,14 @@ class LokiWallCard extends HTMLElement {
 
   _putAway(camera) {
     if (!this._layout || !this._editing) return;
-    this._layout.hide(camera, this._available());
+    this._layout.hide(camera, this._roster());
     this._update();
     this._save();
   }
 
   _bringBack(camera) {
     if (!this._layout || !this._editing) return;
-    this._layout.restore(camera, this._available());
+    this._layout.restore(camera, this._roster());
     this._update();
     this._save();
   }
@@ -2149,7 +2172,7 @@ class LokiWallCard extends HTMLElement {
       this._update();
       return;
     }
-    if (drag.moved && !drag.before.sameAs(this._layout, this._available())) {
+    if (drag.moved && !drag.before.sameAs(this._layout, this._roster())) {
       this._save();
     }
   }
@@ -2232,7 +2255,7 @@ class LokiWallCard extends HTMLElement {
       if (!tile) continue;
       const box = tile.root.getBoundingClientRect();
       if (x < box.left || x > box.right || y < box.top || y > box.bottom) continue;
-      this._layout.move(drag.tile.camera, active.indexOf(camera), this._available());
+      this._layout.move(drag.tile.camera, active.indexOf(camera), this._roster());
       this._update();
       return;
     }
