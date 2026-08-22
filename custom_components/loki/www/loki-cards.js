@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.6.0";
+const CARD_VERSION = "1.6.1";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -417,7 +417,6 @@ class DoorMedia {
       if (this._hass) child.hass = this._hass;
       this.el.insertBefore(child, this.el.firstChild);
       this._child = child;
-      this._img.hidden = true;
       this._waitForFrame(token);
     } catch (err) {
       this._live = false;
@@ -443,6 +442,8 @@ class DoorMedia {
       const video = findVideo(this._child, 6);
       if (video && video.videoWidth > 0) {
         this._loader.hidden = true;
+        // Only now is there something to replace it with.
+        this._img.hidden = true;
         return;
       }
       if (Date.now() - started > LIVE_WAIT * 1000) {
@@ -565,28 +566,35 @@ const STYLE = `
   }
   .loki-still, .loki-live { display: block; width: 100%; height: 100%; }
 
-  /* Between pressing "live" and the first frame there are a few seconds of nothing,
-     and the composed card paints them white. On a wall of tiles that reads as a
-     broken camera rather than as one that is still connecting. */
+  /* Between pressing "live" and the first frame there are seconds of nothing, and
+     the composed card paints them white.
+
+     A chip in the corner, not a curtain. The first shape of this was a full-size
+     grey panel, and it made things worse rather than better: Home Assistant puts the
+     last still on the video as a poster and has it up in about four seconds, and the
+     panel covered exactly that. The eye was told to wait twenty seconds for something
+     it could have been looking at in four. */
   .loki-loader {
     position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
+    left: 8px;
+    bottom: 8px;
+    z-index: 2;
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    gap: 10px;
-    background: var(--secondary-background-color, #2a2a2a);
-    color: var(--secondary-text-color, #9e9e9e);
-    font-size: 13px;
+    gap: 8px;
+    padding: 5px 10px 5px 8px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 12px;
   }
   .loki-loader[hidden] { display: none; }
   .loki-loader::before {
     content: "";
-    width: 28px;
-    height: 28px;
+    width: 13px;
+    height: 13px;
     border-radius: 50%;
-    border: 3px solid currentColor;
+    border: 2px solid currentColor;
     border-top-color: transparent;
     animation: loki-spin 0.9s linear infinite;
   }
@@ -594,7 +602,11 @@ const STYLE = `
   @media (prefers-reduced-motion: reduce) {
     .loki-loader::before { animation-duration: 3s; }
   }
-  .loki-still { object-fit: cover; }
+  /* Underneath rather than taken away: while the stream is being negotiated the
+     still is the best picture there is, and it is a real one. The container carries
+     the aspect ratio, so taking it out of the flow costs no layout. */
+  .loki-still { position: absolute; inset: 0; object-fit: cover; }
+  .loki-live { position: relative; z-index: 1; }
   .loki-live ha-card {
     box-shadow: none; border: none; background: none; border-radius: 0;
   }

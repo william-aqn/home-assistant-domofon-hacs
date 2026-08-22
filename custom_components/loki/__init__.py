@@ -23,6 +23,7 @@ from .frontend import (
     async_remove_panel,
     async_remove_resource,
 )
+from .panel_layout import async_register_layout_api
 from .reauth import async_clear_auth_failed, async_fire_auth_failed
 from .repairs import async_clear_reauth_unrecoverable, async_clear_sip_terminal
 from .services import async_setup_services
@@ -55,6 +56,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # now warns about, and the loader has the answer in memory.
     integration = await async_get_integration(hass, DOMAIN)
     await async_register_cards(hass, str(integration.version or "0"))
+    # Registered once for the whole integration, not per entry: websocket commands
+    # are global, and a second registration would raise.
+    async_register_layout_api(hass)
     return True
 
 

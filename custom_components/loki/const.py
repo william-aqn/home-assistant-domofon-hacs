@@ -75,6 +75,14 @@ OPT_SCAN_INTERVAL: Final = "scan_interval"
 # the options afterwards.
 OPT_PANEL: Final = "sidebar_panel"
 
+# How the «Домофоны» page is arranged: the order doors appear in, the ones put away,
+# and how big the tiles are. Written by the page itself through a websocket command --
+# see panel_layout.py -- and kept in the options because a layout that lives in one
+# browser is a layout the phone does not have.
+OPT_PANEL_ORDER: Final = "panel_order"
+OPT_PANEL_HIDDEN: Final = "panel_hidden"
+OPT_PANEL_TILE_SIZE: Final = "panel_tile_size"
+
 # --- events ------------------------------------------------------------------
 
 EVENT_LOKI: Final = "loki_event"
