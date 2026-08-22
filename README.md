@@ -119,8 +119,8 @@ HACS blueprint'ы не скачивает — только по кнопке в�
 ## Планшет на стене
 
 Готовый blueprint — для планшета в прихожей с **Fully Kiosk Browser**. При звонке он
-будит экран и открывает на планшете страницу той двери, в которую звонят: видео и
-кнопка «Открыть». Пока идёт вызов, экран не гаснет; после — панель возвращается к
+будит экран и открывает на планшете страницу той двери, в которую звонят: видео во
+весь экран и кнопка «Открыть». Пока идёт вызов, экран не гаснет; после — панель возвращается к
 своей обычной странице и, если экран был выключен, снова гаснет.
 
 [![Импортировать blueprint в Home Assistant](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fwilliam-aqn%2Fhome-assistant-domofon-hacs%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Floki%2Fring_kiosk_show.yaml)

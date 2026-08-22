@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.8.1";
+const CARD_VERSION = "1.8.2";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -731,6 +731,8 @@ const STYLE = `
   .loki-round[hidden],
   .loki-round-wrap[hidden],
   .loki-grid[hidden],
+  .loki-body[hidden],
+  .loki-fill[hidden],
   .loki-side[hidden],
   .loki-head[hidden],
   .loki-callbar[hidden],
@@ -1019,7 +1021,26 @@ const STYLE = `
        nobody rings from it -- so the picture takes the whole width rather than
        leaving a blank column where the button would have stood. */
     .loki-grid.loki-alone { grid-template-columns: 1fr; }
+    /* On a page-sized card 30% is half a metre of button. Capped, and the
+       picture gets the rest. */
+    .loki-fill .loki-grid { grid-template-columns: 1fr minmax(150px, min(30%, 320px)); }
+    .loki-fill .loki-grid.loki-alone { grid-template-columns: 1fr; }
   }
+
+  /* The page is the card. Only the panel asks for this: it hands the card the
+     viewport's height, and the card fills it -- the picture grows to whatever is
+     left once the head and the buttons have had theirs, and is shown whole rather
+     than cropped, the way the stream already is. A dashboard card is never given a
+     height, and there these same rules fall back to the usual 16:9 by themselves: a
+     percentage of nothing resolves to auto, and the aspect ratio takes over. */
+  .loki-fill { display: flex; flex-direction: column; height: 100%; }
+  .loki-fill .loki-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .loki-fill .loki-grid { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+  /* Both sizes spelled out. With only the height given, the box would take its
+     width from the 16:9 ratio and run past its column; with both, the ratio is
+     ignored and the box is its grid area. */
+  .loki-fill .loki-media { width: 100%; height: 100%; }
+  .loki-fill .loki-still { object-fit: contain; }
 
   /* One row: preview, who and how long, and the buttons. For a dashboard where the
      domofon is one line among many. */
@@ -1443,6 +1464,7 @@ class LokiDoorCard extends HTMLElement {
     this._sub.hidden = !area;
 
     this._card.classList.toggle("loki-compact", this._config.layout === "compact");
+    this._card.classList.toggle("loki-fill", Boolean(this._config.fill));
     this._actions.hidden = !door.button;
 
     const call = door.call ? hass.states[door.call] : null;
@@ -2708,7 +2730,8 @@ class LokiPanel extends HTMLElement {
 
   _buildOne() {
     const camera = cameraForLokiId(this._hass, this._door);
-    const wrap = el("div", "loki-panel");
+    // One door is the page: the card takes the whole of it, see .loki-one below.
+    const wrap = el("div", "loki-panel loki-one");
 
     const back = document.createElement("a");
     back.className = "loki-back";
@@ -2725,7 +2748,7 @@ class LokiPanel extends HTMLElement {
     }
 
     this._card = document.createElement("loki-door-card");
-    this._card.setConfig({ camera, live: this._live });
+    this._card.setConfig({ camera, live: this._live, fill: true });
     wrap.appendChild(this._card);
     return wrap;
   }
@@ -2735,7 +2758,14 @@ class LokiPanel extends HTMLElement {
     style.textContent = `
       .loki-panel { padding: 8px; box-sizing: border-box; }
       .loki-panel loki-wall-card, .loki-panel loki-door-card { display: block; }
-      .loki-panel loki-door-card { max-width: 760px; margin: 0 auto; }
+      /* One door: the page is the card. Whoever came here came to see who is
+         there, and on a wall tablet or in a desktop window that means the picture
+         as large as the screen allows, not a 760px column in the middle of it.
+         The height is the viewport's, not the parent's -- Home Assistant gives a
+         custom panel no height of its own. */
+      .loki-one { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+      .loki-one .loki-back { align-self: flex-start; }
+      .loki-one loki-door-card { flex: 1; min-height: 0; }
       .loki-back {
         display: inline-block;
         margin: 4px 8px 10px;

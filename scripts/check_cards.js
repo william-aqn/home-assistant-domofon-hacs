@@ -73,6 +73,10 @@ const stubElement = () => {
     },
     remove() {},
     insertBefore() {},
+    // What the panel hands the card it creates; kept so the check can read it.
+    setConfig(config) {
+      this.config = config;
+    },
     children: [],
     // The icon inside a button; the cards swap its `icon` attribute.
     firstChild: { setAttribute() {} },
@@ -315,6 +319,49 @@ check(
   check(
     "a door with no lock keeps the column while a call is up",
     show("camera.gate").beside
+  );
+}
+
+// The one-door page hands the card its height and asks it to fill the page; a
+// dashboard card asks for nothing and keeps its own 16:9.
+{
+  const hass = {
+    states: {
+      "camera.x": {
+        state: "idle",
+        attributes: { friendly_name: "Дверь", entity_picture: "/api/camera_proxy/x" },
+      },
+    },
+    entities: {
+      "camera.x": { device_id: "dev", platform: "loki" },
+      "button.x": { device_id: "dev", platform: "loki" },
+    },
+    devices: { dev: { identifiers: [["loki", "1"]], name: "Дверь" } },
+    panels: { loki: {} },
+  };
+  const fills = (config) => {
+    const card = new defined["loki-door-card"]();
+    card.setConfig(config);
+    card.hass = hass;
+    const on = card._card.classList.contains("loki-fill");
+    card.disconnectedCallback();
+    return on;
+  };
+  check("a dashboard card does not try to fill its host", !fills({ camera: "camera.x" }));
+  check("a card asked to fill the page says so on itself", fills({ camera: "camera.x", fill: true }));
+
+  const panel = new defined["loki-panel"]();
+  panel._hass = hass;
+  panel._door = "1";
+  const wrap = panel._buildOne();
+  const config = panel._card && panel._card.config;
+  check(
+    "the one-door page is the card: it asks the card to fill the page",
+    wrap.className.split(" ").includes("loki-one") &&
+      Boolean(config) &&
+      config.camera === "camera.x" &&
+      config.fill === true,
+    JSON.stringify({ className: wrap.className, config })
   );
 }
 
