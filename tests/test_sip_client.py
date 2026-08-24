@@ -227,6 +227,83 @@ async def test_unreachable_registrar_backs_off_instead_of_giving_up() -> None:
     assert any(s is SipState.BACKOFF for s, _ in recorder.states)
 
 
+@pytest.mark.asyncio
+async def test_a_long_lived_flow_is_rebuilt_at_once_after_being_cut() -> None:
+    """The live registrar cuts every registered connection roughly hourly.
+
+    Such a cut is not a failure of ours: the account and the path were proven
+    seconds earlier, and while the stale binding stands it points at a dead socket
+    -- so every second of RFC 5626 backoff is a second the doorbell is deaf. A
+    client that waited out the full first backoff here blows the deadline below.
+    """
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(
+        _config(
+            port,
+            register=True,
+            first_registration_done=True,
+            long_lived_flow=0.5,
+        ),
+        recorder,
+    )
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(10):
+            while not any(s is SipState.REGISTERED for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.6)  # old enough to count as long-lived
+            registrar.drop_connection()
+            while (
+                sum(1 for s, _ in recorder.states if s is SipState.REGISTERED) < 2
+            ):
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    delays = [d for s, d in recorder.states if s is SipState.BACKOFF and d]
+    assert delays, "the rebuild still passes through backoff, however short"
+    assert all(int(d.split()[2]) <= 2 for d in delays), delays
+
+
+@pytest.mark.asyncio
+async def test_a_flow_that_dies_young_keeps_the_rfc_backoff() -> None:
+    """The quick rebuild is only for flows that had proven themselves.
+
+    A registration that collapses right away is a genuine failure, and retrying
+    one of those in a tight loop is how an IP ends up banned.
+    """
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(
+        _config(port, register=True, first_registration_done=True), recorder
+    )
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(10):
+            while not any(s is SipState.REGISTERED for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+            registrar.drop_connection()
+            while not any(s is SipState.BACKOFF for s, _ in recorder.states):
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    delays = [d for s, d in recorder.states if s is SipState.BACKOFF and d]
+    assert delays
+    assert all(int(d.split()[2]) >= 30 for d in delays), delays
+
+
 def test_backoff_grows_and_stays_within_the_rfc_bounds() -> None:
     """RFC 5626 §4.5: base 30s, cap 1800s, 50-100% jitter."""
     client = LokiSipClient(

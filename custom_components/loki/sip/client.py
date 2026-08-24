@@ -53,6 +53,16 @@ BASELINE_INTERVAL = 150.0
 BACKOFF_BASE = 30.0
 BACKOFF_MAX = 1800.0
 
+# A flow that stayed healthy this long before dying was cut from outside, not broken:
+# the live registrar closes every registered connection after about an hour (measured:
+# 62-63 minutes of lifetime, a clean FIN, with keepalives and renewals flowing the
+# whole time). Ten minutes spans several granted expiries, so the credentials, the
+# account and the path have all just been proven -- and every second of backoff after
+# such a cut is a second an incoming call has no way in.
+LONG_LIVED_FLOW = 600.0
+QUICK_RETRY_MIN = 1.0
+QUICK_RETRY_MAX = 2.0
+
 # RFC 5626 §4.4.1 keepalive. Short because a lapsed NAT mapping costs a doorbell.
 KEEPALIVE = 90.0
 
@@ -293,6 +303,10 @@ class SipConfig:
     blocked_retry_min: float = BLOCKED_RETRY_MIN
     blocked_retry_base: float = BLOCKED_RETRY_BASE
     blocked_retry_max: float = BLOCKED_RETRY_MAX
+    # How long a flow must have stayed healthy for its death to be read as the far
+    # side's session limit rather than a failure of ours. Configurable for the same
+    # reason the baseline is: the real value is minutes long.
+    long_lived_flow: float = LONG_LIVED_FLOW
     # False keeps the client in the probe-only mode: it looks and reports, and cannot
     # change anything on the account.
     register: bool = False
@@ -349,6 +363,9 @@ class LokiSipClient:
         self._blocks = 0
         self._stopping = False
         self._current = SipState.DISABLED
+        # When the current flow reached its steady state, if it has. What the retry
+        # delay is decided by: a flow that died old was cut, one that died young broke.
+        self._healthy_since: float | None = None
         # What the registrar calls our binding, in its own words. Persisted by the
         # bridge, because what we think our Contact is and what the registrar reports
         # back are not always the same string.
@@ -434,8 +451,7 @@ class LokiSipClient:
 
                 if self._stopping:
                     return
-                self._failures += 1
-                delay = self._backoff()
+                delay = self._retry_delay()
                 self._set_state(SipState.BACKOFF, f"повтор через {delay:.0f} с")
                 await asyncio.sleep(delay)
         finally:
@@ -502,6 +518,28 @@ class LokiSipClient:
         ]
         return float(max(left)) if left else None
 
+    def _retry_delay(self) -> float:
+        """How long to wait before rebuilding a failed flow.
+
+        A flow that had been healthy for a long time did not break -- it was cut.
+        The live registrar does that to every registered connection roughly hourly,
+        and while the old binding still stands it points at a dead socket, so every
+        second of backoff is a second the doorbell is deaf. The rebuild goes almost
+        at once; the RFC 5626 curve is kept for flows that keep dying young, because
+        retrying a genuine failure in a tight loop is how an IP ends up banned.
+        """
+        healthy_for = (
+            0.0
+            if self._healthy_since is None
+            else time.monotonic() - self._healthy_since
+        )
+        if healthy_for >= self._config.long_lived_flow:
+            # Not counted as a failure: the account was proven seconds ago. Still
+            # jittered -- a cut can hit many clients at once.
+            return random.uniform(QUICK_RETRY_MIN, QUICK_RETRY_MAX)  # noqa: S311
+        self._failures += 1
+        return self._backoff()
+
     def _backoff(self) -> float:
         """RFC 5626 §4.5: base 30s, cap 1800s, 50-100% jitter.
 
@@ -516,6 +554,7 @@ class LokiSipClient:
 
     async def _one_flow(self) -> None:
         """Connect, probe, gate, and hold the answer."""
+        self._healthy_since = None
         self._set_state(SipState.CONNECTING, None)
         await self._connect()
 
@@ -541,6 +580,7 @@ class LokiSipClient:
             # costs the registrar nothing and keeps the reported snapshot fresh.
             self._failures = 0
             self._blocks = 0
+            self._healthy_since = time.monotonic()
             await self._idle()
             return
 
@@ -551,6 +591,7 @@ class LokiSipClient:
         # on its own leftover would go on to hide the day the resident's phone really
         # does take the account, and the doorbell would just stop with no explanation.
         self._blocks = 0
+        self._healthy_since = time.monotonic()
         self._set_state(
             SipState.REGISTERED,
             f"срок действия {self._state.granted_expires} с",
