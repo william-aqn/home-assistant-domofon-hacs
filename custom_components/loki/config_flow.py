@@ -178,14 +178,31 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Point this account at a different phone number.
+        """Sign in by SMS again -- with the same number, or with a different one.
 
-        The number is the account: the refresh token, the SIP credentials and the list
-        of doors all hang off it. Reauthentication deliberately refuses to change it --
-        it exists to renew a session, not to swap accounts -- so this is the way.
+        Both uses are real and both end here. The same number is a plain re-login: it
+        renews the session and re-reads the SIP credentials, which is precisely what a
+        registrar that refused those credentials asks for, and what the repair card
+        for that sends people to do. A different number moves this entry to another
+        account -- and this is the only way to do that, because entity unique ids carry
+        the entry id, so deleting the entry and adding it again renames every entity in
+        the house.
 
-        Everything keyed on the Loki device id survives, because that is global: the
-        device cards, their names and their areas stay as they are.
+        Neither of Home Assistant's two guards fits on its own, and taking one on faith
+        breaks the other use. Measured against 2026.8.2:
+
+        * ``_abort_if_unique_id_mismatch`` aborts the moment the number differs from
+          this entry's own -- which is the very thing this step exists to allow. It was
+          the call here, so the step refused every new number while its own text asked
+          for one;
+        * ``_abort_if_unique_id_configured`` aborts when *any* entry holds that number,
+          this one included, so it would refuse the re-login instead.
+
+        Hence the comparison in ``_abort_if_number_belongs_elsewhere``: the collision
+        check is only ever asked about a number this entry does not already own.
+
+        Everything keyed on the Loki device id survives either way, because that is
+        global: the device cards, their names and their areas stay as they are.
         """
         errors: dict[str, str] = {}
 
@@ -195,8 +212,10 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_PHONE] = "invalid_phone"
             else:
                 await self.async_set_unique_id(phone)
-                # A second entry already using that number would collide on unique_id.
-                self._abort_if_unique_id_mismatch(reason="already_configured")
+                # Checked before the SMS is sent, not after: the code costs the user a
+                # message and twenty minutes of validity, and a flow that was going to
+                # abort anyway should not spend either.
+                self._abort_if_number_belongs_elsewhere()
                 if error := await self._async_send_sms(phone):
                     errors["base"] = error
                 else:
@@ -324,13 +343,22 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._entry_data = data
         if self.source == SOURCE_RECONFIGURE:
             entry = self._get_reconfigure_entry()
-            # Asserted before anything is destroyed. An abort after the SIP state was
-            # already deleted would leave the entry exactly as it was except for the
-            # one part of it that cannot be rebuilt without ten minutes of silence.
+            # Re-asserted here as well as in the step, because the two are minutes
+            # apart -- an SMS is typed in between -- and another flow could have taken
+            # the number in the meantime. Asserted before anything is destroyed: an
+            # abort after the SIP state was already deleted would leave the entry as it
+            # was except for the one part of it that cannot be rebuilt without ten
+            # minutes of silence.
             await self.async_set_unique_id(self._phone)
-            self._abort_if_unique_id_mismatch(reason="already_configured")
+            self._abort_if_number_belongs_elsewhere()
             await self._async_drop_sip_state_if_moved(entry, data)
-            return self.async_update_reload_and_abort(entry, data=data)
+            # The unique id and the title are the number, so both follow it. Without
+            # this the entry would answer to the old number for every later flow --
+            # a reauth would refuse itself as a mismatch, and a second entry could be
+            # added for the number this one had just moved to.
+            return self.async_update_reload_and_abort(
+                entry, unique_id=self._phone, title=self._phone, data=data
+            )
 
         if self.source == SOURCE_REAUTH:
             entry = self._get_reauth_entry()
@@ -343,6 +371,17 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
 
         # The entry is created by async_step_panel, after the last question.
         return None
+
+    @callback
+    def _abort_if_number_belongs_elsewhere(self) -> None:
+        """Refuse a number another entry already holds; allow this entry's own.
+
+        The service allows one session per number, so two entries on one number would
+        take turns logging each other out. This entry keeping the number it already
+        has is not that case -- it is a re-login, and the commonest reason to be here.
+        """
+        if self.unique_id != self._get_reconfigure_entry().unique_id:
+            self._abort_if_unique_id_configured()
 
     async def _async_drop_sip_state_if_moved(
         self, entry: LokiConfigEntry, data: Mapping[str, Any]

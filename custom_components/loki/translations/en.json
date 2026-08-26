@@ -38,13 +38,13 @@
         }
       },
       "reconfigure": {
-        "title": "A different phone number",
-        "description": "Currently using **{phone}**.\n\nEnter the new number — an SMS code will be sent to it. Doors and cameras are kept: their device cards are keyed on the intercom system's own ids, not on the phone number.\n\n⚠️ SIP credentials are issued per number. If the service returns the same SIP identity, the SIP state is kept and registration comes back at once; if it returns a different one, Loki starts afresh and spends about ten minutes watching the account again before it registers.",
+        "title": "Sign in by SMS again",
+        "description": "Currently using **{phone}**.\n\nEnter a phone number — an SMS code will be sent to it.\n\n- **The same number** is a fresh sign-in: it renews the session and the SIP credentials. This is what clears the “the registrar refused” card.\n- **A different number** moves this entry to another account. Doors and cameras are kept: their device cards are keyed on the intercom system's own ids, not on the phone number. A number another Loki entry already uses cannot be taken — the service allows one session per number.\n\n⚠️ SIP credentials are issued per number. If the service returns the same SIP identity, the SIP state is kept and registration comes back at once; if it returns a different one, Loki starts afresh and spends about ten minutes watching the account again before it registers.",
         "data": {
-          "phone": "New phone number"
+          "phone": "Phone number"
         },
         "data_description": {
-          "phone": "Any format: +7 999 123-45-67, 8 999 1234567, 9991234567"
+          "phone": "Any format: +7 999 123-45-67, 8 999 1234567, 9991234567. The same number just means a fresh sign-in."
         }
       }
     },
