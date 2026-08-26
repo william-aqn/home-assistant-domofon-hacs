@@ -12,7 +12,7 @@ import hashlib
 import secrets
 from typing import Any
 
-from .errors import SipPermanentError
+from .errors import SipRejectedError
 from .uri import parse_params, split_commas
 
 
@@ -71,7 +71,12 @@ class DigestChallenge:
         algorithm = self.algorithm.lower()
         factory = _ALGORITHMS.get(algorithm)
         if factory is None:
-            raise SipPermanentError(f"unsupported digest algorithm {self.algorithm!r}")
+            # A refusal, not a stop: the registrar offered something we cannot
+            # compute, which is its configuration to change and not ours. Latching
+            # it would keep the doorbell off long after the far side was fixed.
+            raise SipRejectedError(
+                f"регистратор требует алгоритм {self.algorithm!r}, которого мы не умеем"
+            )
 
         def h(text: str) -> str:
             return factory(text.encode("utf-8")).hexdigest()

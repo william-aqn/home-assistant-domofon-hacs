@@ -29,6 +29,27 @@ class SipPermanentError(SipError):
     """Retrying will not help. The client stops until a person acts."""
 
 
+class SipRejectedError(SipPermanentError):
+    """The registrar refused to register this account at all.
+
+    Stale credentials, an address-of-record it does not know, an account not allowed
+    to use SIP -- and a challenge we could not answer, which looks the same from here.
+    Permanent in the sense that the very next attempt would fail identically, so it
+    is not retried on the transport curve.
+
+    It is *not* permanent in the sense the states above are. Nothing on the account
+    changes because of it: a REGISTER whose credentials are refused creates no
+    binding, displaces nothing, and leaves the resident's phone exactly where it was.
+    The only cost of looking again is a failed-authentication event at the registrar,
+    which is why the recheck is slow rather than absent -- absent is what it was, and
+    it cost the doorbell every second between the credentials being renewed and
+    somebody noticing a repair card.
+
+    Handled before ``SipPermanentError`` in the supervisor's except chain. It is a
+    subclass, so the broader clause would otherwise swallow it and stop for good.
+    """
+
+
 class SipBlockedError(SipPermanentError):
     """Registering would displace somebody else's binding, so we did not register."""
 

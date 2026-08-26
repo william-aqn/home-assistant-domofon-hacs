@@ -182,26 +182,239 @@ async def test_strict_guard_off_reports_but_does_not_block() -> None:
 # ------------------------------------------------------------------ failures
 
 
+def _refusing(port: int, **overrides: object) -> SipConfig:
+    """A client whose recheck curve is measured in milliseconds, not minutes."""
+    base: dict[str, object] = {
+        "register": True,
+        "first_registration_done": True,
+        "rejected_retry_base": 0.05,
+        "rejected_retry_max": 0.05,
+    }
+    base.update(overrides)
+    return _config(port, **base)
+
+
+async def _await_terminal(recorder: Recorder, task: asyncio.Task[None]) -> None:
+    """Wait for the client to report something a person may need to know about."""
+    async with asyncio.timeout(10):
+        while recorder.terminal is None and not task.done():
+            await asyncio.sleep(0.02)
+    assert recorder.terminal is not None, "the client ended without reporting anything"
+
+
 @pytest.mark.asyncio
-async def test_bad_credentials_stop_rather_than_retry() -> None:
-    """Hammering a rejected credential is how an IP ends up banned."""
+async def test_a_refused_credential_is_rechecked_until_the_account_is_fixed() -> None:
+    """The cure happens elsewhere, and nothing here should have to be touched.
+
+    What the live account did: a sign-in somewhere else with the same number rotated
+    the SIP password, the registrar refused the one Home Assistant held, and the
+    client stopped for good. Renewing the credentials then changed nothing -- the
+    latch outlived the repair, and the doorbell stayed deaf until somebody found a
+    repair card and flicked a switch.
+
+    A refused REGISTER creates no binding and displaces nobody, so the only question
+    was ever how often to ask again, never whether.
+    """
     registrar = WireTap(password=PASSWORD)
     recorder = Recorder()
     port = await registrar.start()
-    client = LokiSipClient(_config(port, password="wrong"), recorder)
+    client = LokiSipClient(_refusing(port, password="wrong"), recorder)
 
     task = asyncio.create_task(client.async_run())
     try:
+        await _await_terminal(recorder, task)
+        assert not task.done(), "a refusal must not end the client"
+        # The account is repaired, by whatever happened on the far side: the password
+        # the client already holds is now the right one.
+        registrar.password = "wrong"
         async with asyncio.timeout(10):
-            while recorder.terminal is None:
+            while client.state is not SipState.REGISTERED:
                 await asyncio.sleep(0.02)
+        # Read before the stop, which hands the binding back.
+        held = list(registrar.bindings)
     finally:
+        await client.async_stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await registrar.stop()
 
     assert recorder.terminal is not None
-    assert recorder.terminal[0] is SipState.FAILED
+    assert recorder.terminal[0] is SipState.REJECTED
+    assert recorder.terminal_count == 1, "one card, not one per recheck"
+    assert held, "the account was taken up once it accepted us"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_says_which_status_it_was() -> None:
+    """Without it, the two ways of being refused read alike in a log.
+
+    They call for different repairs, so telling them apart is the point.
+    """
+    registrar = WireTap(password=PASSWORD)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_refusing(port, password="wrong"), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        await _await_terminal(recorder, task)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is not None
+    detail = recorder.terminal[2]
+    assert "401" in detail, detail
+    assert "учётные данные" in detail, detail
+
+
+@pytest.mark.asyncio
+async def test_a_password_refused_mid_connection_still_names_the_password() -> None:
+    """The shape a rotated password really has, and the one that read backwards.
+
+    RFC 2617 §3.2.1: a re-challenge without ``stale=true`` says the credentials were
+    wrong. The live registrar answers a refused digest with the very same nonce, so
+    reading a repeated nonce as "the registrar is misbehaving" turned the commonest
+    cause of all -- a password rotated by a sign-in somewhere else -- into a message
+    about protocol trivia, on a card whose whole job is to say what to fix.
+
+    The refusal here lands on the registration, i.e. on an exchange later than the
+    probe, which is exactly where the first attempt already carries credentials.
+    """
+    # The probe is answered; the registration that follows it is met with the very
+    # nonce the probe just used.
+    registrar = WireTap(password=PASSWORD, repeat_nonce_on_register=True)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_refusing(port), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        await _await_terminal(recorder, task)
+        # Several rechecks, because this refusal arrives *after* an exchange the
+        # registrar accepted -- the probe. Counting refusals per exchange rather than
+        # per flow made that reset the count every time round, which raised the card
+        # again on every recheck and kept the curve pinned at its shortest step.
+        async with asyncio.timeout(10):
+            while sum(1 for s, _ in recorder.states if s is SipState.REJECTED) < 3:
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is not None
+    assert recorder.terminal[0] is SipState.REJECTED
+    assert recorder.terminal_count == 1, "one card, not one per recheck"
+    detail = recorder.terminal[2]
+    assert "учётные данные" in detail, detail
+    assert "401" in detail, detail
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_we_cannot_read_is_its_own_repair() -> None:
+    """"We cannot answer this" must not read as "your password is stale".
+
+    One sends the user to re-enter credentials that were never the problem; the other
+    is about the registrar. They are separated by whether a Digest challenge could be
+    parsed at all, not by which attempt the refusal landed on.
+    """
+    registrar = WireTap(password=PASSWORD, broken_challenge=True)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_refusing(port), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        await _await_terminal(recorder, task)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is not None
+    assert recorder.terminal[0] is SipState.REJECTED
+    detail = recorder.terminal[2]
+    assert "challenge" in detail, detail
+    assert "учётные данные" not in detail, detail
+
+
+@pytest.mark.asyncio
+async def test_an_expired_nonce_is_answered_rather_than_reported() -> None:
+    """The live registrar expires a nonce in about forty seconds.
+
+    Measured against it: the next request is met with 401, a fresh nonce and
+    stale=true, which lands between every pair of registration refreshes. Reading
+    that as a refusal would raise a repair card roughly once a minute on a perfectly
+    healthy account -- which is exactly what dropping the ``stale`` half of the rule
+    in ``_register_exchange`` does, and what this test exists to catch.
+    """
+    registrar = WireTap(password=PASSWORD, stale_after=2)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_refusing(port), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        async with asyncio.timeout(10):
+            while client.state is not SipState.REGISTERED:
+                await asyncio.sleep(0.02)
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is None, "a re-challenge is not something to report"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 404])
+async def test_an_account_refused_outright_is_rechecked_too(status: int) -> None:
+    """Forbidden and unknown are refusals as well: nothing of ours reached the table."""
+    registrar = WireTap(password=PASSWORD, reject_status=status)
+    recorder = Recorder()
+    port = await registrar.start()
+    client = LokiSipClient(_refusing(port), recorder)
+
+    task = asyncio.create_task(client.async_run())
+    try:
+        await _await_terminal(recorder, task)
+        assert not task.done(), "a refusal must not end the client"
+    finally:
+        await client.async_stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await registrar.stop()
+
+    assert recorder.terminal is not None
+    assert recorder.terminal[0] is SipState.REJECTED
+    assert str(status) in recorder.terminal[2], recorder.terminal[2]
+
+
+def test_the_recheck_curve_stays_between_its_two_costs() -> None:
+    """Too often is an IP ban; too rarely is a doorbell nobody can reach.
+
+    Five minutes keeps every point on the curve under two attempts per ten-minute
+    window -- the shape of every fail2ban default -- and an hour bounds how long a
+    repair made outside Home Assistant can go unnoticed.
+    """
+    client = LokiSipClient(
+        SipConfig(host="h", user=USER, password=PASSWORD), Recorder()
+    )
+    delays = []
+    for _ in range(10):
+        delays.append(client._rejected_delay())
+        client._rejections += 1
+
+    assert delays[0] >= 300.0
+    assert delays == sorted(delays), delays
+    assert max(delays) <= 3600.0
+    assert delays[-1] == 3600.0, "the curve reaches its cap and stays there"
 
 
 @pytest.mark.asyncio

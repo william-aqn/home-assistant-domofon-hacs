@@ -63,6 +63,10 @@ class LokiSipStatusSensor(LokiAccountEntity, SensorEntity):
         SipState.REGISTERED.value,  # 8  green
         SipState.BASELINE.value,  # 9  deep blue -- the long quiet watch
         SipState.BLOCKED.value,  # 10 deep amber -- refused, on purpose
+        # Appended rather than placed next to `failed`, where it belongs by meaning:
+        # the colour is the position, and moving anything here would take green off
+        # `registered` and red off `failed` for the sake of a shade nobody asked for.
+        SipState.REJECTED.value,  # 11 whatever --color-12 is
     ]
 
     def __init__(self, coordinator: LokiCoordinator, bridge: SipBridge) -> None:

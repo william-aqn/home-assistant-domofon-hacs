@@ -101,6 +101,10 @@ class FakeRegistrar:
         ignore_reap: bool = False,
         reply_delay: float = 0.0,
         echo_instance_id: bool = True,
+        reject_status: int | None = None,
+        stale_after: int | None = None,
+        repeat_nonce_on_register: bool = False,
+        broken_challenge: bool = False,
     ) -> None:
         """Configure the policies that matter to the probe."""
         self.password = password
@@ -125,6 +129,30 @@ class FakeRegistrar:
         # makes URI comparison the primary way a client recognises its own binding
         # rather than the fallback. Switchable so both worlds can be tested.
         self.echo_instance_id = echo_instance_id
+        # What the registrar says once the credentials have been accepted. None means
+        # it registers; a status models an account it refuses outright (403) or an
+        # address-of-record it does not know (404).
+        self.reject_status = reject_status
+        # Asterisk expires a nonce after about forty seconds and answers the next
+        # request with 401, a *fresh* nonce and stale=true. Measured on the live
+        # registrar, where it lands between every pair of registration refreshes --
+        # so the client's second attempt is not an edge case, it is the normal path.
+        # This many accepted requests, then one such re-challenge.
+        self.stale_after = stale_after
+        # A registrar that answers the registration itself by asking again with a
+        # nonce it has already answered, and does not mark it stale. Answering that
+        # would be a replay, so the client has to say so rather than loop -- and
+        # saying so must not be mistaken for a wrong password, because the repairs are
+        # different. Aimed at the message that carries a Contact so that the probe
+        # still succeeds: a refusal arriving *after* an accepted exchange is the shape
+        # that broke the per-exchange counting of refusals.
+        self.repeat_nonce_on_register = repeat_nonce_on_register
+        # A challenge in a scheme we do not implement. Nothing observed does this,
+        # but it is the shape of every 401 the client cannot answer -- and that is
+        # a different repair from a password the registrar refused.
+        self.broken_challenge = broken_challenge
+        self._authenticated = 0
+        self._nonce = ""
         self.bindings: list[Binding] = []
         self.evictions = 0
         self.wildcard_seen = False
@@ -307,21 +335,26 @@ class FakeRegistrar:
         def one(name: str) -> str:
             return (headers.get(name) or [""])[0]
 
-        if self.require_auth and not headers.get("authorization"):
-            nonce = secrets.token_hex(16)
-            self._nonce = nonce
-            return self._build(
-                401,
-                "Unauthorized",
-                headers,
-                extra=[
-                    f'WWW-Authenticate: Digest realm="{REALM}", nonce="{nonce}", '
-                    f'qop="auth", algorithm=MD5'
-                ],
-            )
+        if self.require_auth:
+            if not self._check_auth(one("authorization")):
+                # Measured on the live registrar: a REGISTER with no credentials and
+                # one whose digest does not verify are answered the same way -- 401
+                # with a challenge -- except that the refused one repeats the very
+                # same nonce and does not mark it stale.
+                #
+                # This fake used to answer 403 to a bad digest, which no live
+                # registrar was ever seen to do, so the path a stale password
+                # actually takes went untested while a path nothing takes was.
+                return self._challenge(headers, fresh=not headers.get("authorization"))
 
-        if self.require_auth and not self._check_auth(one("authorization")):
-            return self._build(403, "Forbidden", headers)
+            self._authenticated += 1
+            if self._authenticated == self.stale_after:
+                return self._challenge(headers, fresh=True, stale=True)
+            if self.repeat_nonce_on_register and headers.get("contact"):
+                return self._challenge(headers, fresh=False)
+
+        if self.reject_status is not None:
+            return self._build(self.reject_status, "Refused", headers)
 
         contacts = headers.get("contact", [])
 
@@ -373,6 +406,27 @@ class FakeRegistrar:
         while len(self.bindings) > self.max_contacts:
             self.bindings.pop(0)
             self.evictions += 1
+
+    def _challenge(
+        self, headers: dict[str, list[str]], *, fresh: bool, stale: bool = False
+    ) -> str:
+        """A 401 carrying a Digest challenge, shaped the way Asterisk shapes one."""
+        if fresh or not self._nonce:
+            self._nonce = secrets.token_hex(16)
+        if self.broken_challenge:
+            return self._build(
+                401,
+                "Unauthorized",
+                headers,
+                extra=[f'WWW-Authenticate: Basic realm="{REALM}"'],
+            )
+        row = (
+            f'WWW-Authenticate: Digest realm="{REALM}", nonce="{self._nonce}", '
+            f'qop="auth", algorithm=MD5'
+        )
+        if stale:
+            row += ", stale=true"
+        return self._build(401, "Unauthorized", headers, extra=[row])
 
     def _check_auth(self, header: str) -> bool:
         if not header.lower().startswith("digest"):

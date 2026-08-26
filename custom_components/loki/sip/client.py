@@ -31,6 +31,7 @@ from .errors import (
     SipEvictionError,
     SipFramingError,
     SipPermanentError,
+    SipRejectedError,
     SipTransportError,
     SipUnverifiableError,
 )
@@ -89,9 +90,15 @@ class SipState(StrEnum):
     VERIFYING = "verifying"
     REGISTERED = "registered"
     BACKOFF = "backoff"
-    # Terminal states. Each latches: a restart must not quietly retry a manoeuvre we
-    # have already decided is unsafe.
+    # States the client stops working in.
+    #
+    # BLOCKED and REJECTED are rechecked on their own slow curves: neither changed
+    # anything on the account, so looking again costs nothing but the look itself.
+    # EVICTED and FAILED latch across restarts, because reaching either means a
+    # manoeuvre we have already decided is unsafe would otherwise be retried
+    # quietly by the next start.
     BLOCKED = "blocked"
+    REJECTED = "rejected"
     EVICTED = "evicted"
     FAILED = "failed"
 
@@ -145,6 +152,22 @@ def _host_only(sent_by: str | None) -> str | None:
 BLOCKED_RETRY_MIN = 30.0
 BLOCKED_RETRY_BASE = 60.0
 BLOCKED_RETRY_MAX = 900.0
+
+# Looking again at an account the registrar refused to register. Slow on purpose,
+# and bounded by two opposite costs.
+#
+# Too often: a refused REGISTER is a failed-authentication event in the registrar's
+# log, and enough of them inside one window is how an IP gets banned -- which would
+# then hold the doorbell down even after the credentials were renewed. Five minutes
+# doubling to an hour keeps it under two per ten-minute window at every point on
+# the curve.
+#
+# Too rarely: every second between the account being fixed and the next look is a
+# second the doorbell is deaf. An hour is the most that can cost, and only when
+# nothing in Home Assistant changed -- a new SMS login reloads the entry and starts
+# the client again at once.
+REJECTED_RETRY_BASE = 300.0
+REJECTED_RETRY_MAX = 3600.0
 
 # Which terminal state each permanent failure lands in. Anything not listed is a
 # plain failure; eviction and blocking are called out because they mean something
@@ -303,6 +326,10 @@ class SipConfig:
     blocked_retry_min: float = BLOCKED_RETRY_MIN
     blocked_retry_base: float = BLOCKED_RETRY_BASE
     blocked_retry_max: float = BLOCKED_RETRY_MAX
+    # How soon to look again after the registrar refused the account. Configurable
+    # for the same reason: the real values are minutes and hours long.
+    rejected_retry_base: float = REJECTED_RETRY_BASE
+    rejected_retry_max: float = REJECTED_RETRY_MAX
     # How long a flow must have stayed healthy for its death to be read as the far
     # side's session limit rather than a failure of ours. Configurable for the same
     # reason the baseline is: the real value is minutes long.
@@ -358,9 +385,12 @@ class LokiSipClient:
         self._transactions = TransactionTable()
         self._branch_deadlines: dict[tuple[str, str, str], asyncio.Task[None]] = {}
         self._challenges: dict[str, DigestChallenge] = {}
-        self._seen_nonces: set[str] = set()
         self._failures = 0
         self._blocks = 0
+        # Refusals by the registrar, counted separately from both. They ride their
+        # own curve, and mixing them into `_failures` would make a rejected password
+        # push the transport backoff towards half an hour as a side effect.
+        self._rejections = 0
         self._stopping = False
         self._current = SipState.DISABLED
         # When the current flow reached its steady state, if it has. What the retry
@@ -431,6 +461,35 @@ class LokiSipClient:
                     )
                     if self._stopping:
                         return
+                    await asyncio.sleep(delay)
+                    continue
+                except SipRejectedError as err:
+                    # Ahead of SipPermanentError on purpose: this is a subclass of it,
+                    # and the broader clause below would stop the client for good.
+                    # Reordering these two silently restores the behaviour this branch
+                    # exists to end -- a doorbell that stays deaf after the account is
+                    # already fixed, until somebody notices a card and flicks a switch.
+                    if not self._rejections:
+                        # Once, not once per recheck: a card raised on every attempt
+                        # would be indistinguishable from a new problem each time.
+                        self._events.on_terminal(
+                            SipState.REJECTED, type(err).__name__, str(err)
+                        )
+                    delay = self._rejected_delay()
+                    self._rejections += 1
+                    self._set_state(
+                        SipState.REJECTED, f"{err}; проверю снова через {delay:.0f} с"
+                    )
+                    if self._stopping:
+                        return
+                    # Slept on the connection we already have, deliberately. If the
+                    # refusal came after a registration -- a password rotated under a
+                    # client that was already registered -- the binding it created
+                    # outlives it by up to one expiry, and the reader task goes on
+                    # answering the INVITEs that binding still routes here. Closing
+                    # now would throw those last minutes of working doorbell away to
+                    # save a socket. The registrar drops the connection on its own if
+                    # it minds, and the next flow reconnects regardless.
                     await asyncio.sleep(delay)
                     continue
                 except SipPermanentError as err:
@@ -509,6 +568,21 @@ class LokiSipClient:
             config.blocked_retry_base * 2 ** min(self._blocks, 4),
         )
 
+    def _rejected_delay(self) -> float:
+        """When to ask a registrar that refused us whether it still refuses.
+
+        A doubling curve, because a refusal standing for hours will not stop standing
+        in the next minute, and because how often we ask is the whole of the ban risk.
+        It starts at five minutes rather than at once for the opposite reason: the
+        cure is nearly always a new SMS login, and that reloads the config entry and
+        starts a fresh client immediately, without waiting for any curve.
+        """
+        config = self._config
+        return min(
+            config.rejected_retry_max,
+            config.rejected_retry_base * 2 ** min(self._rejections, 4),
+        )
+
     def _blocking_expiry(self) -> float | None:
         """The longest expiry among the bindings that blocked us, if any said."""
         left = [
@@ -580,6 +654,7 @@ class LokiSipClient:
             # costs the registrar nothing and keeps the reported snapshot fresh.
             self._failures = 0
             self._blocks = 0
+            self._rejections = 0
             self._healthy_since = time.monotonic()
             await self._idle()
             return
@@ -591,6 +666,13 @@ class LokiSipClient:
         # on its own leftover would go on to hide the day the resident's phone really
         # does take the account, and the doorbell would just stop with no explanation.
         self._blocks = 0
+        # Counted per flow, not per exchange. Resetting it on any answered REGISTER
+        # looked reasonable -- the probe authenticates too, so it proves the same
+        # credentials -- but a registrar that accepts the probe and refuses the
+        # registration would then clear the count on every single retry: the curve
+        # would never double, and the repair card would be raised again every five
+        # minutes for as long as it lasted.
+        self._rejections = 0
         self._healthy_since = time.monotonic()
         self._set_state(
             SipState.REGISTERED,
@@ -1004,31 +1086,70 @@ class LokiSipClient:
             await self._send(request)
 
             response = await self._final_response()
+            status = response.status or 0
 
-            if response.status not in (401, 407) or attempt == 2:
+            if status not in (401, 407):
                 return self._check_final(response)
 
-            if not self._absorb_challenge(response):
-                return self._check_final(response)
+            challenge = self._offered_challenge(response)
+            if challenge is None:
+                raise SipRejectedError(
+                    f"не удалось ответить на запрос авторизации ({status}): "
+                    "регистратор не прислал понятного нам challenge"
+                )
+
+            if auth and challenge.realm in self._challenges and not challenge.stale:
+                # RFC 2617 §3.2.1: a re-challenge that does not say `stale` means the
+                # username or password was wrong. Not "the nonce aged out" -- that is
+                # what `stale` is for, and the live registrar draws exactly this line:
+                # a refused digest comes back carrying the very same nonce and no
+                # flag, while an expired one (about every forty seconds) comes back
+                # fresh and marked stale.
+                #
+                # Both conditions before it matter. Without `auth` this is the first
+                # ask of the connection, which nobody has answered yet; without the
+                # realm check, a registrar that starts challenging for a second realm
+                # would be reported as rejecting a password it never saw.
+                #
+                # The status is named because the ways of arriving here read
+                # identically in a log otherwise, and they call for different repairs.
+                raise SipRejectedError(
+                    f"регистратор отклонил учётные данные SIP ({status}) — "
+                    "вероятно, они устарели"
+                )
+
+            if attempt == 2:
+                raise SipRejectedError(
+                    f"регистратор запрашивает авторизацию снова и снова ({status})"
+                )
+
+            self._remember_challenge(challenge)
 
         raise SipTransportError("unreachable")
 
     def _check_final(self, response: SipMessage) -> SipMessage:
-        """Turn a final status into either a result or a decision to stop."""
+        """Turn a final status into either a result or a decision.
+
+        Three outcomes, not two. A refusal by the registrar is its own kind: nothing
+        on the account changed because of it, so it is rechecked slowly rather than
+        latched -- see ``SipRejectedError``.
+        """
         status = response.status or 0
         if status == 200:
             return response
         if status in (401, 407):
-            raise SipPermanentError(
-                "регистратор отклонил учётные данные SIP — вероятно, они устарели"
-            )
+            # Not reachable from `_register_exchange`, which answers challenges
+            # itself. Kept so that a future caller which does not cannot fall through
+            # into "unexpected response" and be retried as a transport blip.
+            raise SipRejectedError(f"регистратор требует авторизацию ({status})")
         if status == 403:
-            raise SipPermanentError(
-                "аутентификация прошла, но SIP на этом аккаунте не разрешён (403)"
+            raise SipRejectedError(
+                f"аутентификация прошла, но SIP на этом аккаунте не разрешён ({status})"
             )
         if status == 404:
-            raise SipPermanentError(
-                "регистратор не знает этот адрес (404) — данные учётной записи устарели"
+            raise SipRejectedError(
+                f"регистратор не знает этот адрес ({status}) — "
+                "данные учётной записи устарели"
             )
         if status >= 600:
             # A registrar must never send one; something else is in the path.
@@ -1037,25 +1158,30 @@ class LokiSipClient:
             )
         raise SipTransportError(f"неожиданный ответ {status}")
 
-    def _absorb_challenge(self, response: SipMessage) -> bool:
-        """Remember a challenge to answer. False if it cannot be answered."""
+    def _offered_challenge(self, response: SipMessage) -> DigestChallenge | None:
+        """The first Digest challenge in a 401/407, if it carries one we can read."""
         proxy = response.status == 407
         name = "proxy-authenticate" if proxy else "www-authenticate"
         rows = [header.value for header in response.headers if header.name == name]
         offers = challenges_from(rows, proxy=proxy)
-        if not offers:
-            return False
+        return offers[0] if offers else None
 
-        challenge = offers[0]
-        if challenge.nonce in self._seen_nonces and not challenge.stale:
-            # The server replayed a nonce we already answered: the credentials are
-            # wrong, and hammering it is how an IP ends up banned.
-            return False
-        self._seen_nonces.add(challenge.nonce)
-        # The official client accepts any realm, so we do the same rather than pinning
-        # one we have never seen.
+    def _remember_challenge(self, challenge: DigestChallenge) -> None:
+        """Keep a challenge to answer, carrying its nonce counter where it applies.
+
+        A registrar may re-offer the nonce we are already using. Replacing the object
+        would restart ``nc`` at one for that nonce, and a server that tracks the
+        counter -- RFC 7616 §3.4.3 says it may -- reads a repeated one as a replay.
+        Keeping the object we hold lets the counter go on where it was.
+
+        The official client accepts any realm, so a challenge for a realm we have not
+        seen is stored rather than refused.
+        """
+        existing = self._challenges.get(challenge.realm)
+        if existing is not None and existing.nonce == challenge.nonce:
+            existing.stale = challenge.stale
+            return
         self._challenges[challenge.realm] = challenge
-        return True
 
     def _auth_headers(self) -> list[str]:
         """Credentials for every challenge we have been given."""
@@ -1095,7 +1221,6 @@ class LokiSipClient:
         # A fresh connection is a fresh registration identity as far as digest is
         # concerned; keeping stale nonces would produce a replay on the first request.
         self._challenges.clear()
-        self._seen_nonces.clear()
         while not self._responses.empty():
             self._responses.get_nowait()
         self._reader_task = asyncio.create_task(self._reader_main())

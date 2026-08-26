@@ -6,6 +6,7 @@ in the integration may parse it -- see ``normalize_stream`` for why that matters
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import ipaddress
 import logging
@@ -13,7 +14,13 @@ import re
 from typing import Any, Self
 from urllib.parse import urlsplit
 
-from .const import HLS_PORT, RTSP_PORT
+from .const import (
+    CONF_SIP,
+    CONF_SIP_URL,
+    CONF_SIP_USER,
+    HLS_PORT,
+    RTSP_PORT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -221,3 +228,23 @@ def parse_device_list(payload: dict[str, Any]) -> list[LokiDevice]:
     return sorted(
         devices.values(), key=lambda device: (not device.is_door, device.name)
     )
+
+
+def sip_identity(data: Mapping[str, Any]) -> tuple[str, str] | None:
+    """The registrar and extension a stored SIP state belongs to, if both are known.
+
+    Takes a config entry's whole ``data`` mapping and not the ``sip`` block inside it,
+    because "this account has no SIP at all" and "its SIP names no host" have to be
+    answered the same way: there is nothing here to compare against.
+
+    Deliberately not the password. A sign-in reissues that every time, and reading a
+    new password as a new identity would throw the SIP state away on every routine
+    re-login -- ten more minutes of baseline, and a doorbell silent through them, for
+    an account that never moved.
+    """
+    sip = data.get(CONF_SIP)
+    if not isinstance(sip, Mapping):
+        return None
+    url = str(sip.get(CONF_SIP_URL) or "").strip()
+    user = str(sip.get(CONF_SIP_USER) or "").strip()
+    return (url, user) if url and user else None

@@ -12,6 +12,7 @@ from custom_components.loki.models import (
     LokiDevice,
     normalize_stream,
     parse_device_list,
+    sip_identity,
 )
 
 HOST = "203.0.113.10"
@@ -262,3 +263,48 @@ def test_parse_device_list_tolerates_missing_and_malformed_arrays() -> None:
     assert parse_device_list({}) == []
     assert parse_device_list({"dom": None, "video": "nope"}) == []
     assert parse_device_list({"dom": [None, 42, {"id": 1, "name": "ok"}]}) != []
+
+
+# --------------------------------------------------------------- SIP identity
+
+
+def test_sip_identity_ignores_the_password() -> None:
+    """A sign-in reissues the password every time; the account has not moved.
+
+    This is the whole point of the comparison. Counting the password would make every
+    routine re-login look like a different address-of-record, and the stored SIP state
+    -- including the record that the ten-minute baseline was already paid -- would be
+    thrown away each time, buying ten minutes of silence for nothing.
+    """
+    before = {"sip": {"url": "registrar.example", "phone": "1000000", "password": "a"}}
+    after = {"sip": {"url": "registrar.example", "phone": "1000000", "password": "b"}}
+
+    assert sip_identity(before) == ("registrar.example", "1000000")
+    assert sip_identity(after) == sip_identity(before)
+
+
+def test_sip_identity_notices_a_different_extension_or_registrar() -> None:
+    """The opposite harm: state carried onto an account it was never earned on."""
+    base = {"sip": {"url": "registrar.example", "phone": "1000000", "password": "a"}}
+
+    moved_user = {"sip": {**base["sip"], "phone": "1000001"}}
+    moved_host = {"sip": {**base["sip"], "url": "other.example"}}
+
+    assert sip_identity(moved_user) != sip_identity(base)
+    assert sip_identity(moved_host) != sip_identity(base)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"sip": None},
+        {"sip": "nonsense"},
+        {"sip": {"url": "", "phone": "1000000"}},
+        {"sip": {"url": "registrar.example"}},
+        {"sip": {"url": "registrar.example", "phone": "   "}},
+    ],
+)
+def test_sip_identity_is_unknown_rather_than_wrong(data: dict) -> None:
+    """Half an identity is not an identity: there is nothing here to compare."""
+    assert sip_identity(data) is None

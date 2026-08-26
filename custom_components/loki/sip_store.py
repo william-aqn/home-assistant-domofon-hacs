@@ -12,7 +12,8 @@ Three separate reasons, all of which cost the resident their doorbell if forgott
   that promise is worth nothing if a restart quietly retries the manoeuvre we already
   decided was unsafe. Cleared only by an explicit human gesture: switching SIP off and
   back on again. Which states get latched is the bridge's decision, not this module's
-  -- being *blocked* deliberately does not, because looking again changes nothing.
+  -- being *blocked* or *rejected* deliberately does not, because neither changed
+  anything on the account and looking again costs only the look.
 
 * **Our own Contact URIs.** The source port changes with every connection, and the
   live registrar does not echo ``+sip.instance``, so after a restart the only handle
@@ -39,8 +40,28 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
+from .sip.client import SipState
 
 STORAGE_VERSION = 1
+
+# Until 1.8.4 every refusal by the registrar -- credentials it would not accept, an
+# address-of-record it did not know, an account not allowed to use SIP -- was latched
+# as `failed`. That latch outlived the very re-login that cured it: the credentials
+# were renewed, the entry reloaded, and the client still refused to start until
+# somebody found the card and toggled a switch. Such refusals are their own state now,
+# rechecked on a slow curve and never latched, so a value written by the old
+# classification is translated on load and dropped by the bridge on the next start.
+#
+# Matched on the message because the message is all the old file recorded. The
+# failures that must go on latching never carried these words: they are about a
+# registrar that reports no bindings at all. The English one is there because the
+# unsupported-algorithm refusal was raised from `digest.py` and never translated.
+_REJECTION_MARKERS = (
+    "учётные данные",
+    "не знает этот адрес",
+    "не разрешён",
+    "digest algorithm",
+)
 
 # Bounded so a backend that answers with a fresh URI each time cannot grow the file
 # without limit. Far above the number of doors any one account has.
@@ -155,6 +176,22 @@ class SipStoredState:
                 ):
                     resolved[key] = value
 
+        terminal = raw.get("terminal") if isinstance(raw.get("terminal"), str) else None
+        terminal_detail = (
+            raw.get("terminal_detail")
+            if isinstance(raw.get("terminal_detail"), str)
+            else None
+        )
+        if (
+            terminal == SipState.FAILED.value
+            and terminal_detail
+            and any(marker in terminal_detail for marker in _REJECTION_MARKERS)
+        ):
+            # Translation only. Which states are honoured on restart stays the
+            # bridge's decision; this just stops it from being asked the wrong
+            # question about a file an older version wrote.
+            terminal = SipState.REJECTED.value
+
         return cls(
             instance_id=(
                 instance_id
@@ -162,14 +199,8 @@ class SipStoredState:
                 else str(uuid.uuid4())
             ),
             first_registration_done=bool(raw.get("first_registration_done")),
-            terminal=raw.get("terminal")
-            if isinstance(raw.get("terminal"), str)
-            else None,
-            terminal_detail=(
-                raw.get("terminal_detail")
-                if isinstance(raw.get("terminal_detail"), str)
-                else None
-            ),
+            terminal=terminal,
+            terminal_detail=terminal_detail,
             resolved=resolved,
             contacts=_parse_contacts(raw.get("contacts"), raw.get("contacts_at")),
             last_received=(

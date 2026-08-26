@@ -45,6 +45,7 @@ from .const import (
     OPT_SIP_STRICT_GUARD,
 )
 from .coordinator import LokiConfigEntry
+from .models import sip_identity
 from .protocol import normalize_phone
 from .reauth import async_record_auth_time
 from .repairs import async_create_reauth_unrecoverable
@@ -323,26 +324,56 @@ class LokiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._entry_data = data
         if self.source == SOURCE_RECONFIGURE:
             entry = self._get_reconfigure_entry()
-            # The SIP state belongs to the old account: its instance id, its remembered
-            # Contact URIs, its resolved doors. Carrying them over would let the client
-            # claim a binding on the NEW account that was never ours -- the one harm
-            # the whole SIP design exists to prevent -- so it goes.
-            await SipStore(self.hass, entry.entry_id).async_remove()
+            # Asserted before anything is destroyed. An abort after the SIP state was
+            # already deleted would leave the entry exactly as it was except for the
+            # one part of it that cannot be rebuilt without ten minutes of silence.
             await self.async_set_unique_id(self._phone)
             self._abort_if_unique_id_mismatch(reason="already_configured")
+            await self._async_drop_sip_state_if_moved(entry, data)
             return self.async_update_reload_and_abort(entry, data=data)
 
         if self.source == SOURCE_REAUTH:
+            entry = self._get_reauth_entry()
             # Re-assert the account identity: the entry is keyed on the phone number,
             # and a reauth must not quietly rebind it to a different account.
             await self.async_set_unique_id(self._phone)
             self._abort_if_unique_id_mismatch()
-            return self.async_update_reload_and_abort(
-                self._get_reauth_entry(), data=data
-            )
+            await self._async_drop_sip_state_if_moved(entry, data)
+            return self.async_update_reload_and_abort(entry, data=data)
 
         # The entry is created by async_step_panel, after the last question.
         return None
+
+    async def _async_drop_sip_state_if_moved(
+        self, entry: LokiConfigEntry, data: Mapping[str, Any]
+    ) -> None:
+        """Forget the stored SIP state if this sign-in moved us to another identity.
+
+        That state belongs to an address-of-record, not to a config entry: the
+        instance id the registrar knows this device by, the Contact URIs a restart
+        uses to recognise its own leftover binding, the doors resolved on that
+        account, and the record that the first registration has already been paid for.
+
+        Both directions cost the doorbell, so the decision is made on the evidence
+        rather than on which flow we happen to be in:
+
+        * carried onto a *different* address-of-record, the remembered Contacts could
+          have the client claim a binding that was never ours, and
+          ``first_registration_done`` would skip the ten-minute baseline on an account
+          it has never watched -- which may be the one the resident's phone sits on;
+        * dropped on the *same* one, the next start pays that baseline again for
+          nothing. Ten more minutes without a doorbell, immediately after a re-login
+          whose whole purpose was to bring the doorbell back -- and a re-login is
+          exactly what a registrar that refused our credentials asks for.
+
+        A sign-in that returns no SIP block leaves the state alone: there is no new
+        identity to compare against, and forgetting the old one buys nothing.
+        """
+        new = sip_identity(data)
+        if new is None or new == sip_identity(entry.data):
+            return
+        _LOGGER.debug("SIP identity changed; the stored SIP state goes with it")
+        await SipStore(self.hass, entry.entry_id).async_remove()
 
     async def async_step_panel(
         self, user_input: dict[str, Any] | None = None

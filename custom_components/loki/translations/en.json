@@ -39,7 +39,7 @@
       },
       "reconfigure": {
         "title": "A different phone number",
-        "description": "Currently using **{phone}**.\n\nEnter the new number — an SMS code will be sent to it. Doors and cameras are kept: their device cards are keyed on the intercom system's own ids, not on the phone number.\n\n⚠️ SIP credentials are issued per number, so the SIP state is reset and registration has to be switched on again.",
+        "description": "Currently using **{phone}**.\n\nEnter the new number — an SMS code will be sent to it. Doors and cameras are kept: their device cards are keyed on the intercom system's own ids, not on the phone number.\n\n⚠️ SIP credentials are issued per number. If the service returns the same SIP identity, the SIP state is kept and registration comes back at once; if it returns a different one, Loki starts afresh and spends about ten minutes watching the account again before it registers.",
         "data": {
           "phone": "New phone number"
         },
@@ -114,6 +114,7 @@
           "registered": "Registered",
           "backoff": "Waiting to retry",
           "blocked": "Stopped: account in use",
+          "rejected": "Refused by the registrar",
           "evicted": "Stopped: displaced another device",
           "failed": "Failed"
         }
@@ -187,9 +188,13 @@
       "title": "Loki: SIP stopped — registering displaced another device",
       "description": "A binding that was not ours disappeared after we registered. Loki withdrew its own registration and stopped.\n\nDetails: {detail}\n\n**Check that the intercom still rings the phone.** If it does not, restart the operator's app on the phone and it will register again.\n\nDo not turn SIP back on until Home Assistant has a phone number of its own, or the same thing will happen."
     },
+    "sip_terminal_rejected": {
+      "title": "Loki: SIP is not working — the registrar refused account “{title}”",
+      "description": "The SIP registrar refused to register this account, so intercom calls do not reach Home Assistant. The resident's phone still rings as usual.\n\nReason: {detail}\n\n**Most often the SIP credentials are simply stale.** They are issued once, by the SMS sign-in, and any new sign-in with the same number — in the operator's phone app, for instance — invalidates the previous ones. A fresh sign-in fixes it:\n\n- if Home Assistant is showing a “Re-authentication required” card, use that one: it keeps the SIP state, and registration returns within seconds;\n- if there is no such card: Settings → Devices & services → Loki → entry menu → “Reconfigure”, with the same phone number. If the service returns the same SIP identity, registration comes back at once; if it returns a different one, Loki watches the account for about ten minutes first.\n\n**Leave the “SIP” switch alone.** Loki rechecks by itself: first after a few minutes, then less often, but at least once an hour. The card disappears as soon as registration succeeds; `sensor.*_sip_status` shows where it is."
+    },
     "sip_terminal_failed": {
       "title": "Loki: SIP stopped for account “{title}”",
-      "description": "The SIP client stopped and will not restart itself.\n\nReason: {detail}\n\nMost often this means the SIP credentials are stale, which a fresh SMS sign-in fixes. To try again, switch “SIP” off and on."
+      "description": "The SIP client stopped and will not restart itself.\n\nReason: {detail}\n\nThis happens when carrying on would risk the resident's doorbell — for example, the registrar stopped reporting its binding list, leaving no way to check whether we displaced another device. The log has the details. To try again, switch “SIP” off and on."
     }
   },
   "exceptions": {

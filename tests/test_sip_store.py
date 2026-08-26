@@ -9,6 +9,8 @@ The module imports Home Assistant, so these skip when it is absent and run in CI
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 import time
 
 import pytest
@@ -183,3 +185,83 @@ def test_the_resolved_cache_evicts_by_least_recent_use() -> None:
     assert len(state.resolved) == MAX_RESOLVED
     assert "sip:0@h" in state.resolved
     assert "sip:1@h" not in state.resolved
+
+
+# --------------------------------------------------------- the 1.8.4 migration
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "регистратор отклонил учётные данные SIP — вероятно, они устарели",
+        "регистратор не знает этот адрес (404) — данные учётной записи устарели",
+        "аутентификация прошла, но SIP на этом аккаунте не разрешён (403)",
+    ],
+)
+def test_a_refusal_latched_by_an_older_version_stops_being_a_stop(detail: str) -> None:
+    """Until 1.8.4 a refusal by the registrar was latched as `failed`.
+
+    That latch outlived the one thing that cures a refusal -- a new SMS login -- so
+    the credentials were renewed, the entry reloaded, and SIP still did not start.
+    Read as the state such a refusal would be written as today, it stops being
+    honoured on restart.
+    """
+    state = SipStoredState.from_dict(
+        {"instance_id": "abc", "terminal": "failed", "terminal_detail": detail}
+    )
+
+    assert state.terminal == "rejected"
+    # Kept: the card and the log both quote it, and it is the only record of what
+    # the older version actually saw.
+    assert state.terminal_detail == detail
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"terminal": "failed", "terminal_detail": "регистратор не сообщает привязки"},
+        {"terminal": "failed"},
+        {"terminal": "evicted", "terminal_detail": "чужая привязка исчезла"},
+    ],
+)
+def test_a_latch_that_is_not_a_refusal_survives_untouched(raw: dict) -> None:
+    """The failures that must survive a restart still do.
+
+    A registrar that reports no bindings is the one worth latching: retrying means
+    registering blind on an account the resident's phone may be holding, which is the
+    harm the whole scheme exists to prevent.
+    """
+    assert SipStoredState.from_dict(raw).terminal == raw["terminal"]
+
+
+def test_the_migrated_state_is_one_the_bridge_does_not_latch() -> None:
+    """The two halves of the repair have to agree, and they live in separate files.
+
+    ``sip_bridge`` imports Home Assistant, so the set is read out of the source the
+    same way the sensor's option list is. A `rejected` that ended up in it would
+    make this migration pointless: the client would go on refusing to start after
+    the account was fixed.
+    """
+    tree = ast.parse(
+        (
+            Path(__file__).resolve().parents[1]
+            / "custom_components"
+            / "loki"
+            / "sip_bridge.py"
+        ).read_text(encoding="utf-8")
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AnnAssign):
+            continue
+        target = node.target
+        if isinstance(target, ast.Name) and target.id == "LATCHED_ACROSS_RESTARTS":
+            names = {
+                element.attr
+                for element in ast.walk(node.value)
+                if isinstance(element, ast.Attribute)
+                and isinstance(element.value, ast.Name)
+                and element.value.id == "SipState"
+            }
+            assert names == {"EVICTED", "FAILED"}, names
+            return
+    pytest.fail("LATCHED_ACROSS_RESTARTS not found in sip_bridge.py")

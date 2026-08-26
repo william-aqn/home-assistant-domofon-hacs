@@ -12,7 +12,7 @@ import hashlib
 import pytest
 
 from custom_components.loki.sip.digest import DigestChallenge, challenges_from
-from custom_components.loki.sip.errors import SipPermanentError
+from custom_components.loki.sip.errors import SipPermanentError, SipRejectedError
 from custom_components.loki.sip.uri import (
     display_name,
     has_header_param,
@@ -146,11 +146,19 @@ def test_sha256_algorithm_is_supported() -> None:
 
 
 def test_unknown_algorithm_is_refused_rather_than_guessed() -> None:
-    """Guessing would send a wrong response and burn an authentication attempt."""
+    """Guessing would send a wrong response and burn an authentication attempt.
+
+    Raised as a refusal rather than a stop: which algorithm the registrar demands is
+    its configuration, not ours, and latching would keep the doorbell off long after
+    the far side changed its mind. It is still a SipPermanentError, so nothing that
+    treats one as "do not retry this connection" is surprised.
+    """
     challenge = DigestChallenge(realm="r", nonce="n", algorithm="whirlpool")
 
-    with pytest.raises(SipPermanentError, match="algorithm"):
+    with pytest.raises(SipRejectedError, match="алгоритм"):
         challenge.header(USER, PASSWORD, "REGISTER", URI)
+
+    assert issubclass(SipRejectedError, SipPermanentError)
 
 
 def test_proxy_challenge_uses_the_proxy_header_name() -> None:

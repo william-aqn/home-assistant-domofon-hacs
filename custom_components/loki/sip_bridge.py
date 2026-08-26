@@ -61,6 +61,11 @@ RESOLVE_TIMEOUT = 8.0
 # repeat the harm. Being blocked is not: it only means somebody else was registered at
 # the time, and looking again changes nothing -- so a restart is allowed to re-check,
 # and the doorbell comes back on its own once the account is free.
+#
+# Being rejected is not either, and for a stronger reason: the registrar refused, so
+# nothing of ours ever reached the account's binding table. Latching it meant that
+# renewing the credentials -- the one cure there is -- fixed nothing until somebody
+# found the card and flicked a switch.
 LATCHED_ACROSS_RESTARTS: frozenset[SipState] = frozenset(
     {SipState.EVICTED, SipState.FAILED}
 )
@@ -348,6 +353,17 @@ class SipBridge:
                 kind,
                 detail,
                 self._blocked_diagnostics(),
+            )
+        elif state is SipState.REJECTED:
+            # Not "for good" either, and saying so would send the reader looking for
+            # a switch to flick. The client keeps asking on its own curve, and a new
+            # SMS login reloads the entry and gets an answer within seconds.
+            _LOGGER.warning(
+                "SIP не зарегистрирован — регистратор отказал (%s): %s; "
+                "проверю снова сам. Обычная причина — устаревшие данные SIP, "
+                "их обновляет повторный вход по SMS",
+                kind,
+                detail,
             )
         else:
             _LOGGER.error("SIP остановлен окончательно (%s): %s", kind, detail)
