@@ -1114,8 +1114,7 @@ class LokiSipClient:
                 # The status is named because the ways of arriving here read
                 # identically in a log otherwise, and they call for different repairs.
                 raise SipRejectedError(
-                    f"регистратор отклонил учётные данные SIP ({status}) — "
-                    "вероятно, они устарели"
+                    f"регистратор отклонил учётные данные SIP ({status})"
                 )
 
             if attempt == 2:
