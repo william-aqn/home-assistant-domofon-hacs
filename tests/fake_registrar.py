@@ -96,6 +96,7 @@ class FakeRegistrar:
         max_contacts: int = 3,
         require_auth: bool = True,
         report_bindings: bool = True,
+        blind_probes: int = 0,
         rewrite_contact: bool = False,
         nat_port: int | None = 44444,
         ignore_reap: bool = False,
@@ -113,6 +114,11 @@ class FakeRegistrar:
         # A registrar that does not report bindings makes the whole safety scheme
         # blind, so the probe has to detect it. This switch reproduces that.
         self.report_bindings = report_bindings
+        # The same, but only for the first few answers. Models the far more likely
+        # shape: a list fetched a moment too early, or a registrar having a bad
+        # minute. A client that latches on one such answer puts the doorbell out
+        # until a person intervenes.
+        self.blind_probes = blind_probes
         self.rewrite_contact = rewrite_contact
         self.reply_delay = reply_delay
         # A registrar that keeps a binding it was asked to drop, when the same message
@@ -360,7 +366,14 @@ class FakeRegistrar:
 
         if not contacts:
             # RFC 3261 §10.2.3: report the bindings, change nothing.
-            return self._build(200, "OK", headers, bindings=True)
+            #
+            # Counted here and not in the response builder: a 200 to a *registering*
+            # REGISTER echoes the bindings too, and letting those consume the budget
+            # made a test that meant to blind the verification probe blind the
+            # registration instead -- and pass whatever the client did.
+            blind = self.blind_probes > 0
+            self.blind_probes -= 1 if blind else 0
+            return self._build(200, "OK", headers, bindings=not blind)
 
         rows = [item for row in contacts for item in _split(row, ",")]
         # Whether this message registers anything at all, as opposed to being a pure

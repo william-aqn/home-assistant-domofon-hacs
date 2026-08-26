@@ -193,10 +193,33 @@ async def test_a_registrar_that_hides_bindings_is_refused() -> None:
     registrar = WireTap(password=PASSWORD, report_bindings=False)
     recorder = Recorder()
 
-    await _run_until(registrar, recorder, {}, done="registered")
+    await _run_until(registrar, recorder, {"confirm_delay": 0.05}, done="registered")
 
     assert recorder.terminal is not None
     assert recorder.terminal[1] == "SipUnverifiableError"
+
+
+@pytest.mark.asyncio
+async def test_a_binding_reported_late_is_not_a_blind_registrar() -> None:
+    """One silent answer must not latch a failure that outlives restarts.
+
+    The verification probe runs a moment after the REGISTER, and a registrar that
+    answers it before it has finished storing the binding looks exactly like one that
+    reports nothing at all. Believing that on a single observation is how a healthy
+    account ends up with SIP switched off until somebody finds a repair card -- which
+    is what the production stand spent days doing, for a refusal that had long since
+    passed.
+
+    Two blind answers: the opening probe, which sees an empty account anyway, and the
+    verification probe, which is the one that matters.
+    """
+    registrar = WireTap(password=PASSWORD, blind_probes=2)
+    recorder = Recorder()
+
+    await _run_until(registrar, recorder, {"confirm_delay": 0.05}, done="registered")
+
+    assert recorder.terminal is None, "a second look settled it; nothing to report"
+    assert any(state is SipState.REGISTERED for state, _ in recorder.states)
 
 
 @pytest.mark.asyncio

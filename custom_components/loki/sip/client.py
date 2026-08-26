@@ -70,7 +70,11 @@ KEEPALIVE = 90.0
 # A binding this close to its own expiry vanished on its own, not because of us.
 EXPIRY_SLACK = 90.0
 
-# A single observation is not enough to latch a permanent failure.
+# A single observation is not enough to latch a permanent failure. Used by both
+# checks that can latch one: "somebody's binding vanished" and "the registrar does not
+# report ours". A binding can go missing for a moment because it expired on its own,
+# because a phone reconnected on a new source port, or because the registrar answered
+# a probe before it had finished storing what we had just registered.
 EVICTION_CONFIRM_DELAY = 5.0
 
 # How long our branch may stay unresolved. Must be comfortably under a proxy's Timer C
@@ -326,6 +330,9 @@ class SipConfig:
     blocked_retry_min: float = BLOCKED_RETRY_MIN
     blocked_retry_base: float = BLOCKED_RETRY_BASE
     blocked_retry_max: float = BLOCKED_RETRY_MAX
+    # How long to wait before looking a second time at something that would latch.
+    # Configurable so tests do not have to spend it.
+    confirm_delay: float = EVICTION_CONFIRM_DELAY
     # How soon to look again after the registrar refused the account. Configurable
     # for the same reason: the real values are minutes and hours long.
     rejected_retry_base: float = REJECTED_RETRY_BASE
@@ -726,11 +733,13 @@ class LokiSipClient:
         self._set_state(SipState.VERIFYING, None)
         after, verify_response = await self._probe()
         self._publish(SipState.VERIFYING, after, verify_response)
+        # Whatever the second look settled on, if there was one: the eviction check
+        # below must judge the same list this one accepted.
+        after = await self._confirm_bindings_visible(after)
         # In the registrar's words, not ours -- see `own_binding_uris`.
         self._own_bindings = tuple(
             binding.uri for binding in after if self._is_ours(binding)
         )
-        self._assert_bindings_visible(after)
         await self._assert_no_eviction(before, after, time.monotonic() - started)
 
     async def _register_once(self, *, expires: int, reap: Sequence[str]) -> SipMessage:
@@ -896,17 +905,40 @@ class LokiSipClient:
         """Bindings that belong to somebody else."""
         return [binding for binding in bindings if not self._is_ours(binding)]
 
-    def _assert_bindings_visible(self, after: Sequence[Binding]) -> None:
-        """Refuse to hold a registration we cannot supervise.
+    async def _confirm_bindings_visible(
+        self, after: Sequence[Binding]
+    ) -> Sequence[Binding]:
+        """Refuse to hold a registration we cannot supervise. Asked twice first.
 
         If our own binding is missing from the list we just fetched, the registrar is
         not reporting bindings -- and then every eviction check is blind. Registering
-        anyway would mean gambling with the resident's doorbell.
+        anyway would mean gambling with the resident's doorbell, so this failure
+        latches across restarts.
+
+        Which is exactly why it is not believed on one observation, the same rule the
+        eviction check below follows. The registration is a moment old here, and a
+        registrar that answered the probe before it had finished storing the binding
+        looks identical to one that reports nothing at all -- and the live one has
+        been measured misbehaving for a while and then coming back. Getting this wrong
+        costs every call until a person notices a repair card; the second look costs
+        one contact-less REGISTER, which changes nothing on the account.
+
+        Returns the list to judge the eviction on: the second look if there was one,
+        because it is the newer truth.
         """
-        if not any(self._is_ours(binding) for binding in after):
-            raise SipUnverifiableError(
-                "регистратор не сообщает привязки — проверить вытеснение невозможно"
-            )
+        if any(self._is_ours(binding) for binding in after):
+            return after
+
+        await asyncio.sleep(self._config.confirm_delay)
+        recheck, response = await self._probe()
+        self._publish(SipState.VERIFYING, recheck, response)
+        if any(self._is_ours(binding) for binding in recheck):
+            _LOGGER.debug("Our binding was reported on the second observation")
+            return recheck
+
+        raise SipUnverifiableError(
+            "регистратор не сообщает привязки — проверить вытеснение невозможно"
+        )
 
     async def _assert_no_eviction(
         self, before: Sequence[Binding], after: Sequence[Binding], elapsed: float
@@ -919,9 +951,9 @@ class LokiSipClient:
         # One observation is not enough to latch a permanent, user-visible failure: a
         # binding can disappear because it expired on its own, or because the phone
         # reconnected and minted a new source port. Confirm before acting.
-        await asyncio.sleep(EVICTION_CONFIRM_DELAY)
+        await asyncio.sleep(self._config.confirm_delay)
         recheck, _response = await self._probe()
-        vanished = self._vanished(before, recheck, elapsed + EVICTION_CONFIRM_DELAY)
+        vanished = self._vanished(before, recheck, elapsed + self._config.confirm_delay)
         if not vanished:
             _LOGGER.debug("Binding difference settled on the second observation")
             return
