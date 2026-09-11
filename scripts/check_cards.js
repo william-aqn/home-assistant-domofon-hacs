@@ -60,10 +60,17 @@ const stubElement = () => {
     // Children are kept so a check can reach a button the card built but did not
     // keep a name for -- the two in the confirmation strip.
     append(...nodes) {
-      for (const node of nodes) if (node) this.children.push(node);
+      for (const node of nodes) {
+        if (!node) continue;
+        node.parent = this;
+        this.children.push(node);
+      }
     },
     appendChild(node) {
-      if (node) this.children.push(node);
+      if (node) {
+        node.parent = this;
+        this.children.push(node);
+      }
       return node;
     },
     // Listeners are kept, not dropped. A check that calls the handler by hand
@@ -93,7 +100,14 @@ const stubElement = () => {
     removeAttribute(name) {
       delete attrs[name];
     },
-    remove() {},
+    // A real detach, not a no-op: the chips row is rebuilt by emptying it, and a
+    // remove() that did nothing would make it grow a copy of itself per rebuild.
+    remove() {
+      const kids = this.parent && this.parent.children;
+      const at = kids ? kids.indexOf(this) : -1;
+      if (at >= 0) kids.splice(at, 1);
+      this.parent = null;
+    },
     insertBefore() {},
     // What the panel hands the card it creates; kept so the check can read it.
     setConfig(config) {
@@ -427,7 +441,16 @@ if (STYLE_BLOCK) {
 /** Four doors, alphabetical by entity id -- the order the wall starts in -- and,
  * when asked, plain cameras: a picture with no open button on the device. */
 function doorsHass(extra, plain = []) {
-  const hass = { states: {}, entities: {}, devices: {}, panels: {}, ...extra };
+  // callWS answers like an installation with no labels: the chips row stays away
+  // and the page is what it was. A fixture with labels is built where it is needed.
+  const hass = {
+    states: {},
+    entities: {},
+    devices: {},
+    panels: {},
+    callWS: async () => [],
+    ...extra,
+  };
   for (const id of plain) {
     hass.states[`camera.${id}`] = {
       state: "idle",
@@ -1105,9 +1128,280 @@ async function checkLayout() {
   for (const each of [card, plain, guest, nowhere, broken]) each._teardown();
 }
 
+// ---- the group filter --------------------------------------------------------
+// Labels rather than areas: a door sits in exactly one area and the backend fills
+// that in from its own lopsided hierarchy, while labels are many per camera and the
+// user assigns them. The filter is a view of the wall -- it never changes the order
+// the household shares, and it never brings back a camera somebody put away.
+
+/** The same four doors, with labels on some of them. */
+function labelledHass() {
+  const hass = doorsHass();
+  hass.callWS = async (msg) =>
+    msg.type === "config/label_registry/list"
+      ? [
+          { label_id: "yard", name: "Двор" },
+          { label_id: "gates", name: "Ворота" },
+        ]
+      : [];
+  // «Двор» on two cameras, «Ворота» on one of those two and on a third -- and that
+  // third wears it on its DEVICE, which is where Home Assistant's own table puts a
+  // label when several are tagged at once.
+  hass.entities["camera.a"].labels = ["yard"];
+  hass.entities["camera.b"].labels = ["yard", "gates"];
+  hass.devices["dev-c"].labels = ["gates"];
+  // A door that can ring, so the filter can be asked to let a visitor through.
+  hass.entities["binary_sensor.c"] = { device_id: "dev-c", platform: "loki" };
+  hass.states["binary_sensor.c"] = { state: "off", last_changed: new Date().toISOString() };
+  return hass;
+}
+
+async function checkGroups() {
+  const Wall = defined["loki-wall-card"];
+  const press = (node, shift) =>
+    node.dispatchEvent({ type: "click", shiftKey: Boolean(shift) });
+  const chips = (wall) =>
+    [...wall._groups.children]
+      .map((b) => `${b.children[0].textContent}·${b.children[1].textContent}`)
+      .join(" ");
+  const wallWith = async (hass, config) => {
+    const wall = new Wall();
+    wall.setConfig({ ...config });
+    wall.hass = hass;
+    await settle();
+    return wall;
+  };
+
+  const bare = await wallWith(doorsHass());
+  check(
+    "an installation with no labels gets no chips and the page it had",
+    bare._groups.hidden === true && bare._tiles.size === 4
+  );
+  bare._teardown();
+
+  const hass = labelledHass();
+  const wall = await wallWith(hass);
+  check(
+    "the chips come off the wall as it stands, named and counted",
+    wall._groups.hidden === false && chips(wall) === "Все·4 Ворота·2 Двор·2",
+    chips(wall)
+  );
+
+  press(wall._groupChips.get("yard"));
+  check(
+    "picking a group narrows the wall and leaves the shared order alone",
+    [...wall._tiles.keys()].sort().join() === "camera.a,camera.b"
+      && wall._arranged().active.length === 4,
+    [...wall._tiles.keys()].join()
+  );
+
+  press(wall._liveBtn, false);
+  check(
+    "«Все вживую» asks about the group, not about all cameras, and counts only it",
+    wall._confirmQuestion.textContent.includes("группы «Двор»")
+      && !wall._confirmQuestion.textContent.includes("со всех камер")
+      && wall._confirmQuestion.textContent.includes("Камер: 2."),
+    wall._confirmQuestion.textContent
+  );
+  press(yesOfConfirm(wall), false);
+  const wasLive = wall._live === true;
+  press(wall._groupChips.get(null));
+  check(
+    "changing the group stops the video rather than widening it unasked",
+    wasLive && wall._live === false,
+    String(wall._live)
+  );
+
+  // A tablet parked on «Двор» must still show the person at the front door.
+  press(wall._groupChips.get("yard"));
+  const quiet = [...wall._tiles.keys()].sort().join();
+  wall.hass = {
+    ...hass,
+    states: { ...hass.states, "binary_sensor.c": { state: "on", last_changed: new Date().toISOString() } },
+  };
+  check(
+    "a door being rung shows through the filter",
+    quiet === "camera.a,camera.b"
+      && [...wall._tiles.keys()].sort().join() === "camera.a,camera.b,camera.c",
+    [...wall._tiles.keys()].join()
+  );
+  wall.hass = hass;
+
+  wall._setEditing(true);
+  check(
+    "the pencil ignores the filter, because the editor drags against the full list",
+    wall._groups.hidden === true
+      && wall._tiles.size === 4
+      && wall._group === "yard",
+    `${wall._tiles.size} | ${wall._group}`
+  );
+  wall._setEditing(false);
+  check(
+    "and the group is back in force on the way out",
+    wall._group === "yard" && wall._tiles.size === 2,
+    String(wall._tiles.size)
+  );
+  wall._teardown();
+
+  // Tags can sit on cameras that are put away. They stay put away -- the filter is
+  // a view of the wall, not a way back onto it -- and the page says how many.
+  const parked = new Wall();
+  parked.setConfig({});
+  parked.layoutStore = fakeStore({
+    entry_id: "e1",
+    order: [],
+    hidden: ["camera.b"],
+    tile_size: null,
+  });
+  parked.hass = labelledHass();
+  await settle();
+  check(
+    "a put-away camera is not counted in its group's chip",
+    chips(parked).includes("Двор·1"),
+    chips(parked)
+  );
+  press(parked._groupChips.get("yard"));
+  check(
+    "and the page says how many of the group are off the wall",
+    parked._parked.hidden === false && parked._parked.textContent.includes(": 1."),
+    parked._parked.textContent
+  );
+  parked._teardown();
+
+  // ?group= on the page's address, for a tablet parked on one group -- and a group
+  // that has stopped existing must not leave a wall nobody can widen.
+  const kiosk = await wallWith(labelledHass(), { group: "gates" });
+  check(
+    "the address can park the page on a group",
+    kiosk._group === "gates" && kiosk._tiles.size === 2,
+    [...kiosk._tiles.keys()].join()
+  );
+  kiosk._teardown();
+
+  const stale = await wallWith(labelledHass(), { group: "no-such-label" });
+  check(
+    "a group that no longer exists falls back to «Все» rather than an empty wall",
+    stale._group === null && stale._tiles.size === 4
+  );
+  stale._teardown();
+
+  // The id of a label is not something a user can read anywhere; its name is.
+  const byName = await wallWith(labelledHass(), { group: "двор" });
+  check(
+    "the address takes the label's name as readily as its id",
+    byName._group === "yard" && byName._tiles.size === 2,
+    `${byName._group} | ${byName._tiles.size}`
+  );
+  byName._teardown();
+
+  // The panel re-configures the card in place when the window crosses its narrow
+  // breakpoint -- a tablet turned sideways. The chips are rebuilt with the row they
+  // describe, or the wall stays narrowed with nothing on screen to widen it.
+  const turned = await wallWith(labelledHass());
+  press(turned._groupChips.get("yard"));
+  turned.setConfig({ tile_size: "compact" });
+  turned.hass = labelledHass();
+  await settle();
+  check(
+    "a card reconfigured in place gets its chips back, not a blank row",
+    chips(turned) === "Все·4 Ворота·2 Двор·2"
+      && turned._groups.hidden === false
+      && turned._group === "yard"
+      && turned._tiles.size === 2,
+    `${chips(turned)} | ${turned._group}`
+  );
+  turned._teardown();
+
+  // A wall told exactly which cameras to show is already hand-picked; a choice made
+  // on the sidebar page, in the same browser, must not narrow it behind anyone.
+  const picked = await wallWith(labelledHass(), {
+    cameras: ["camera.a", "camera.b", "camera.c", "camera.d"],
+    group: "yard",
+  });
+  check(
+    "a card given its cameras by hand is not filtered by the page's choice",
+    picked._groups.hidden === true && picked._tiles.size === 4,
+    String(picked._tiles.size)
+  );
+  picked._teardown();
+
+  // An empty roster is what a page looks like for a moment while it loads. Taking
+  // the group away then would cost it for the life of the page.
+  const loading = new Wall();
+  loading.setConfig({ group: "yard" });
+  loading.layoutStore = { load: async () => ({ entry_id: "e1", order: [], hidden: [], tile_size: null }), save: async () => {} };
+  loading.hass = { states: {}, entities: {}, devices: {}, panels: {}, callWS: async () => [] };
+  await settle();
+  check(
+    "a wall with nothing on it yet does not forget the chosen group",
+    loading._group === "yard"
+  );
+  loading._teardown();
+
+  // The stream somebody opened on a door that rang is not taken away the instant
+  // the call ends -- that is the moment they are looking hardest.
+  const watching = new Wall();
+  watching.setConfig({});
+  const ringing = labelledHass();
+  ringing.states["binary_sensor.c"] = { state: "on", last_changed: new Date().toISOString() };
+  watching.hass = ringing;
+  await settle();
+  press(watching._groupChips.get("yard"));
+  press(watching._liveBtn, false);
+  press(yesOfConfirm(watching), false);
+  const watched = watching._tiles.has("camera.c") && watching._live === true;
+  watching.hass = labelledHass();
+  check(
+    "a door being watched stays on the wall when its call ends",
+    watched && watching._tiles.has("camera.c"),
+    `${watched} | ${[...watching._tiles.keys()].join()}`
+  );
+  press(watching._liveBtn, false);
+  check(
+    "and leaves once the watching stops",
+    watching._live === false && !watching._tiles.has("camera.c"),
+    [...watching._tiles.keys()].join()
+  );
+  watching._teardown();
+
+  // The pencil belongs to an admin; telling a guest to use one they have not got is
+  // worse than telling them nothing.
+  const guest = new Wall();
+  guest.setConfig({});
+  guest.layoutStore = fakeStore({ entry_id: "e1", order: [], hidden: ["camera.b"], tile_size: null });
+  guest.hass = labelledHass();
+  await settle();
+  press(guest._groupChips.get("yard"));
+  const admin = new Wall();
+  admin.setConfig({});
+  admin.layoutStore = fakeStore({ entry_id: "e1", order: [], hidden: ["camera.b"], tile_size: null });
+  const asAdmin = labelledHass();
+  asAdmin.user = { is_admin: true };
+  admin.hass = asAdmin;
+  await settle();
+  press(admin._groupChips.get("yard"));
+  check(
+    "the note about put-away cameras mentions the pencil only to whoever has one",
+    !guest._parked.textContent.includes("карандаш")
+      && admin._parked.textContent.includes("карандаш"),
+    `${guest._parked.textContent} | ${admin._parked.textContent}`
+  );
+  guest._teardown();
+  admin._teardown();
+}
+
+/** The confirmation's red button, which the wall does not keep a name for. */
+function yesOfConfirm(wall) {
+  return wall._confirm.children.find((node) => node.className === "danger");
+}
+
 checkLayout()
   .catch((err) => {
     check("layout checks run to the end", false, (err && err.stack) || String(err));
+  })
+  .then(checkGroups)
+  .catch((err) => {
+    check("group checks run to the end", false, (err && err.stack) || String(err));
   })
   .then(() => {
     if (failures.length) {

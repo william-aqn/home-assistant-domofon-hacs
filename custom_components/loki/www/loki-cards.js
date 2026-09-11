@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.9.0";
+const CARD_VERSION = "1.10.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -103,11 +103,17 @@ const t = {
   shotDone: "Сняты текущие кадры",
   shotFail: "Кадры снять не удалось — нет видеопотока",
   shotNone: "На карточке нет камер",
-  confirmLive: "Включить живое видео со всех камер? Это заметная нагрузка.",
-  confirmLiveNoTimer:
-    "Включить живое видео со всех камер и не выключать само? Это заметная нагрузка.",
+  confirmLive: "Включить живое видео со всех камер",
+  confirmLiveGroup: "Включить живое видео группы",
+  confirmNoTimer: " и не выключать само",
+  confirmLoad: "Это заметная нагрузка.",
   yes: "Да",
   no: "Нет",
+  groupAll: "Все",
+  groupsAria: "Группы камер",
+  groupEmpty: "В этой группе нет камер на странице",
+  groupParked: "Ещё камеры этой группы убраны со страницы",
+  groupParkedHow: "Вернуть их можно карандашом.",
   panelTitle: "Домофоны",
   backToAll: "Все домофоны",
   openPage: "открыть страницу домофона",
@@ -461,6 +467,54 @@ class WallLayout {
  * the same on the phone as on the tablet that made it. Two websocket commands,
  * both registered by panel_layout.py.
  */
+/**
+ * The labels a camera wears, entity's and device's together.
+ *
+ * Labels rather than areas, and this is the whole reason the filter exists at all:
+ * a door belongs to exactly one area, the backend fills that area in from its own
+ * hierarchy, and on a real account that hierarchy is lopsided -- measured, 40 of 52
+ * devices in one area. Labels are many per camera, empty until somebody says
+ * otherwise, and edited in Home Assistant's own device table, several at a time.
+ *
+ * ``labels`` on an entity is ABSENT rather than empty when it wears none: the
+ * registry sends the display form, where that key is dropped when it is falsy. On a
+ * device it is always a list. Neither is worth a crash.
+ */
+function cameraLabels(hass, camera) {
+  const entry = (hass && hass.entities && hass.entities[camera]) || null;
+  const device = entry && entry.device_id && hass.devices
+    ? hass.devices[entry.device_id]
+    : null;
+  const own = (entry && entry.labels) || [];
+  const inherited = (device && device.labels) || [];
+  return [...new Set([...own, ...inherited])];
+}
+
+/** Label ids carry no names; the registry does. Readable by anyone, not just admins. */
+const labelStore = {
+  load: (hass) => hass.callWS({ type: "config/label_registry/list" }),
+};
+
+/** What this screen was last looking at. Per browser, and never worth a crash. */
+const GROUP_KEY = "loki-wall-group";
+
+function storedGroup() {
+  try {
+    return window.localStorage.getItem(GROUP_KEY) || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function storeGroup(id) {
+  try {
+    if (id) window.localStorage.setItem(GROUP_KEY, id);
+    else window.localStorage.removeItem(GROUP_KEY);
+  } catch (err) {
+    // A private window, or site data switched off. The page works, it just forgets.
+  }
+}
+
 const panelLayoutStore = {
   load: (hass) => hass.callWS({ type: "loki/panel_layout/get" }),
   save: (hass, layout) => hass.callWS({ type: "loki/panel_layout/set", ...layout }),
@@ -761,6 +815,7 @@ const STYLE = `
   .loki-empty[hidden],
   .loki-pill[hidden],
   .loki-sizes[hidden],
+  .loki-groups[hidden],
   .loki-divider[hidden],
   .loki-confirm[hidden] {
     display: none;
@@ -1265,6 +1320,43 @@ const STYLE = `
     height: 1px;
     background: var(--divider-color, rgba(127, 127, 127, 0.3));
   }
+  /* Wraps, unlike the size switch next to it: an account can carry eight labels
+     and a phone is narrow. */
+  .loki-groups {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 16px 10px;
+  }
+  .loki-groups button {
+    font: inherit;
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.4));
+    background: none;
+    color: var(--primary-text-color);
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .loki-groups button ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  .loki-groups button.on {
+    color: var(--text-primary-color, #fff);
+    background: var(--primary-color, #03a9f4);
+    border-color: transparent;
+  }
+  /* The count is the number of streams «Все вживую» is about to open, so it is not
+     decoration: it is the only place that number appears before the question does. */
+  .loki-groups button i {
+    font-style: normal;
+    opacity: 0.65;
+    font-variant-numeric: tabular-nums;
+  }
+
   .loki-sizes {
     display: inline-flex;
     border: 1px solid var(--primary-color, #03a9f4);
@@ -1696,6 +1788,16 @@ class LokiWallCard extends HTMLElement {
     this._store = null;
     this._layout = null;
     this._layoutPending = false;
+    // label_id -> name, once the registry answers. Null until then, and the filter
+    // waits for it: chips and filtering have to arrive together, or the wall is
+    // narrowed with nothing on screen to widen it again.
+    this._labels = null;
+    this._labelsPending = false;
+    // The chosen group, as a label_id. Null is «Все».
+    this._group = null;
+    this._groupSeeded = false;
+    this._groupsSig = "";
+    this._groupChips = new Map();
     this._editing = false;
     this._drag = null;
   }
@@ -1708,6 +1810,14 @@ class LokiWallCard extends HTMLElement {
       cameras: [],
       ...(config || {}),
     };
+    // Seeded once, not on every setConfig: the panel re-configures the card when the
+    // window crosses the narrow breakpoint, and a tablet turned sideways must not
+    // lose the group somebody picked. ``group`` comes from ?group= on the page's
+    // address -- a kiosk parked on the yard -- and otherwise from this browser.
+    if (!this._groupSeeded) {
+      this._groupSeeded = true;
+      this._group = this._config.group || storedGroup();
+    }
     if (this._built) {
       this._teardown();
       this.innerHTML = "";
@@ -1817,6 +1927,80 @@ class LokiWallCard extends HTMLElement {
       );
   }
 
+  /** The label registry, fetched once. A label made later needs a reload. */
+  _ensureLabels() {
+    if (this._labels || this._labelsPending || !this._hass) return;
+    this._labelsPending = true;
+    const hass = this._hass;
+    Promise.resolve()
+      .then(() => labelStore.load(hass))
+      .then(
+        (list) => this._adoptLabels(list),
+        (err) => {
+          // Shown as a page with no chips, which is the page as it was before.
+          console.warn("Loki: метки не загрузились", err);
+          this._adoptLabels([]);
+        }
+      );
+  }
+
+  _adoptLabels(list) {
+    this._labelsPending = false;
+    this._labels = new Map(
+      (Array.isArray(list) ? list : [])
+        .filter((label) => label && label.label_id)
+        .map((label) => [label.label_id, label.name || label.label_id])
+    );
+    if (this._hass && this._built) this._update();
+  }
+
+  /** Does this camera wear the chosen label? */
+  _inGroup(camera) {
+    return cameraLabels(this._hass, camera).includes(this._group);
+  }
+
+  /** Is somebody at this door right now? */
+  _ringing(camera) {
+    const door = resolveDoor(this._hass, camera);
+    const call = door.call ? this._hass.states[door.call] : null;
+    return Boolean(call && call.state === "on");
+  }
+
+  /**
+   * The wall as filtered: the chosen group, plus any door being rung.
+   *
+   * The exception is not a nicety. A tablet parked on «Двор» has to show the person
+   * standing at the front door -- a filter that hides a ringing door turns a
+   * convenience into a way to miss a visit, which is the one failure the rest of
+   * this integration is built to avoid.
+   */
+  _visible(active) {
+    if (!this._group || !this._labels) return active;
+    return active.filter(
+      (camera) =>
+        this._inGroup(camera)
+        || this._ringing(camera)
+        // A door that rang and is being watched stays until the watching stops: the
+        // call ending is exactly when somebody is looking hardest, and taking the
+        // tile away would kill the stream mid-look.
+        || (this._live && this._tiles.has(camera))
+    );
+  }
+
+  /** One chip per label worn by a camera on the wall, with how many wear it. */
+  _groupsOf(cameras) {
+    if (!this._labels || !this._labels.size) return [];
+    const counts = new Map();
+    for (const camera of cameras) {
+      for (const id of cameraLabels(this._hass, camera)) {
+        if (this._labels.has(id)) counts.set(id, (counts.get(id) || 0) + 1);
+      }
+    }
+    return [...counts]
+      .map(([id, count]) => ({ id, name: this._labels.get(id), count }))
+      .sort((a, b) => a.name.localeCompare(b.name, "ru"));
+  }
+
   _adoptLayout(store, data) {
     // The store may have been swapped or taken away while the answer was on its way.
     if (store !== this._store) return;
@@ -1920,6 +2104,25 @@ class LokiWallCard extends HTMLElement {
     actions.append(this._shotBtn, this._liveBtn, this._editBtn, this._sizes, this._doneBtn);
     header.append(this._titleEl, actions);
 
+    // The filter. Rebuilt only when the chips themselves change -- a row rebuilt on
+    // every state push from Home Assistant would lose focus and hover once a second.
+    // Rebuilt with the row it describes. Both outlived it once: setConfig tears the
+    // card down and _build makes a fresh, empty row, but the chips computed next are
+    // byte-identical, so the memo said "nothing changed" and the new row was never
+    // filled -- a wall stuck on one group with no chip left to widen it. The panel
+    // reaches this by itself, on the narrow breakpoint: a tablet turned sideways.
+    this._groupsSig = "";
+    this._groupChips = new Map();
+    this._groups = el("div", "loki-groups");
+    this._groups.setAttribute("role", "group");
+    this._groups.setAttribute("aria-label", t.groupsAria);
+    this._groups.hidden = true;
+
+    // Tags can sit on cameras that are put away, and those stay put away: the
+    // filter is a view of the wall, not a way back onto it.
+    this._parked = el("div", "loki-note");
+    this._parked.hidden = true;
+
     // Built once and shown on demand: a dialog imported from Home Assistant would be
     // a private API, and a native confirm() looks like a browser error.
     this._confirm = el("div", "loki-confirm");
@@ -1962,9 +2165,11 @@ class LokiWallCard extends HTMLElement {
 
     card.append(
       header,
+      this._groups,
       this._confirm,
       this._note,
       this._hint,
+      this._parked,
       this._stamp,
       this._empty,
       this._grid
@@ -1976,6 +2181,10 @@ class LokiWallCard extends HTMLElement {
   _update() {
     const hass = this._hass;
     this._ensureLayout();
+    this._ensureLabels();
+    // Deliberately NOT filtered: the editor drags against this list, and
+    // WallLayout.move splices at the index it is given. An index taken from a
+    // subset would quietly reshuffle the order the whole household shares.
     const { active, hidden, pending } = this._arranged();
     const editing = this._editing;
     const reachable = streamReachable(hass, this._config.stream_sensor);
@@ -1995,15 +2204,66 @@ class LokiWallCard extends HTMLElement {
         && hass.user.is_admin
     );
 
+    // A card told exactly which cameras to show is already a filtered wall, and the
+    // choice it would obey was made on another page in the same browser. Narrowing
+    // somebody's hand-picked dashboard behind their back is not what they asked for.
+    const configured = Boolean(this._config.cameras && this._config.cameras.length);
+    const filtering = !editing && !configured;
+    // ``?group=`` may name the label rather than carry its id: the id is not
+    // something a user can see anywhere, and «Двор» is.
+    if (this._group && this._labels && !this._labels.has(this._group)) {
+      const wanted = String(this._group).toLowerCase();
+      const named = [...this._labels].find(
+        ([, name]) => name.toLowerCase() === wanted
+      );
+      if (named) this._group = named[0];
+    }
+    // The chips come off the wall as it stands, so a label nobody wears has no chip
+    // and a group whose cameras are all put away has none either. A chosen group
+    // that has stopped existing falls back to «Все» rather than an empty wall --
+    // but only against a wall that has something on it. An empty roster is what a
+    // page looks like for a moment while it loads, and forgetting the group then
+    // would cost it for the life of the page.
+    const groups = filtering ? this._groupsOf(active) : [];
+    if (
+      this._group
+      && this._labels
+      && filtering
+      && active.length > 0
+      && !groups.some((group) => group.id === this._group)
+    ) {
+      this._pickGroup(null, false);
+    }
+    const shownActive = filtering ? this._visible(active) : active;
+    this._paintGroups(groups, active.length);
+
     this._titleEl.textContent = this._config.title;
-    const nothing = !pending && active.length === 0 && !(editing && hidden.length);
+    const nothing =
+      !pending && shownActive.length === 0 && !(editing && hidden.length);
     this._empty.hidden = !nothing;
-    this._empty.textContent = hidden.length ? t.allPutAway : t.noDoors;
+    this._empty.textContent = this._group
+      ? t.groupEmpty
+      : hidden.length
+        ? t.allPutAway
+        : t.noDoors;
+
+    // How many of this group are off the wall, said once rather than left as a
+    // mystery: this is the second step of «пометить и увидеть», and without it a
+    // half-empty group reads as a bug.
+    const parked = this._group
+      ? hidden.filter((camera) => this._inGroup(camera)).length
+      : 0;
+    this._parked.hidden = !parked || editing;
+    // The pencil is an admin's, and telling a guest to use one they do not have is
+    // worse than telling them nothing.
+    this._parked.textContent = canEdit
+      ? `${t.groupParked}: ${parked}. ${t.groupParkedHow}`
+      : `${t.groupParked}: ${parked}.`;
     this._note.hidden = reachable || editing;
     this._hint.hidden = !editing;
     this._card.classList.toggle("loki-editing", editing);
 
-    const idle = !editing && active.length > 0;
+    const idle = !editing && shownActive.length > 0;
     this._shotBtn.hidden = !idle;
     // A frame can only come from the stream, so when the stream is gone this button
     // has nothing to do -- exactly like the live one next to it.
@@ -2041,9 +2301,16 @@ class LokiWallCard extends HTMLElement {
     // The question is asked before anything starts, so there is no timer to read:
     // what it has to describe is what «Да» would do, and that is the key plus the
     // setting.
-    this._confirmQuestion.textContent = `${
-      this._noTimer || byConfig ? t.confirmLiveNoTimer : t.confirmLive
-    } Камер: ${active.length}.`;
+    // The count is of what will actually open, and under a filter the subject of
+    // the question is the group, not "all cameras" -- saying both at once was the
+    // question contradicting itself in the same breath.
+    const groupName = this._group && this._labels ? this._labels.get(this._group) : "";
+    const subject = groupName
+      ? `${t.confirmLiveGroup} «${groupName}»`
+      : t.confirmLive;
+    const andHold = this._noTimer || byConfig ? t.confirmNoTimer : "";
+    this._confirmQuestion.textContent =
+      `${subject}${andHold}? ${t.confirmLoad} Камер: ${shownActive.length}.`;
 
     this._editBtn.hidden = editing || !canEdit;
     this._doneBtn.hidden = !editing;
@@ -2066,7 +2333,7 @@ class LokiWallCard extends HTMLElement {
       : `repeat(auto-fill, minmax(min(100%, ${minWidth}px), 1fr))`;
 
     // Put-away doors are on screen only in the editor, grey and below the line.
-    const shown = editing ? [...active, ...hidden] : active;
+    const shown = editing ? [...active, ...hidden] : shownActive;
     for (const [camera, tile] of this._tiles) {
       if (!shown.includes(camera)) {
         tile.media.destroy();
@@ -2077,7 +2344,7 @@ class LokiWallCard extends HTMLElement {
 
     // Keep DOM order in step with the arrangement, which the editor changes live --
     // on every hass update too, so a drag in progress is never undone underneath.
-    const nodes = active.map((camera) => this._tileFor(camera).root);
+    const nodes = shownActive.map((camera) => this._tileFor(camera).root);
     if (editing && hidden.length) {
       nodes.push(this._divider);
       for (const camera of hidden) nodes.push(this._tileFor(camera).root);
@@ -2133,6 +2400,49 @@ class LokiWallCard extends HTMLElement {
       tile.media.setHass(hass);
       tile.media.render(camera, live);
     }
+  }
+
+  /** Draw the chips, rebuilding only when the set of them changed. */
+  _paintGroups(groups, total) {
+    this._groups.hidden = !groups.length;
+    if (!groups.length) {
+      this._groupsSig = "";
+      return;
+    }
+    const chips = [{ id: null, name: t.groupAll, count: total }, ...groups];
+    const sig = chips.map((chip) => `${chip.id}:${chip.name}:${chip.count}`).join("|");
+    if (sig !== this._groupsSig) {
+      this._groupsSig = sig;
+      this._groupChips = new Map();
+      for (const node of [...this._groups.children]) node.remove();
+      for (const chip of chips) {
+        const button = el("button");
+        button.append(el("span", null, chip.name), el("i", null, String(chip.count)));
+        button.addEventListener("click", () => this._pickGroup(chip.id));
+        this._groups.appendChild(button);
+        this._groupChips.set(chip.id, button);
+      }
+    }
+    for (const [id, button] of this._groupChips) {
+      const on = id === this._group;
+      button.classList.toggle("on", on);
+      button.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  /**
+   * Pick a group.
+   *
+   * Any change stops live video, and that is not tidiness: widening from «Двор» to
+   * «Все» would otherwise take four streams to twenty-one without the question that
+   * exists precisely to ask about the other seventeen.
+   */
+  _pickGroup(id, remember = true) {
+    if (this._group === id) return;
+    this._group = id;
+    if (remember) storeGroup(id);
+    this._stopLive();
+    if (this._hass && this._built) this._update();
   }
 
   _tileFor(camera) {
@@ -2224,6 +2534,11 @@ class LokiWallCard extends HTMLElement {
     // Twenty streams behind an editor nobody is watching is the one thing this
     // card must not do; and the tiles are about to lose their live buttons anyway.
     if (on) this._stopLive();
+    // The filter is NOT cleared here, and that is deliberate: _update ignores it
+    // while the pencil is out (one mechanism, not two), so the group is simply
+    // remembered and back in force on the way out. What must not happen is the
+    // editor dragging inside a subset -- it writes one order for the whole
+    // household, and WallLayout.move splices at the index it is handed.
     if (this._hass && this._built) this._update();
   }
 
@@ -2875,6 +3190,10 @@ class LokiPanel extends HTMLElement {
       title: t.panelTitle,
       // A phone gets small tiles so a useful number fit; a desktop gets the default.
       tile_size: this._narrow ? "compact" : DEFAULT_TILE_SIZE,
+      // ``?group=<label_id>`` parks a tablet on one group, read off the address bar
+      // the same way ``?live=0`` is. Nothing is ever written back to it: the chips
+      // still work, and the address stays the thing somebody bookmarked.
+      group: new URLSearchParams(window.location.search).get("group") || undefined,
     };
   }
 
