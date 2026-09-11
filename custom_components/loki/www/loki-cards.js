@@ -19,7 +19,7 @@
  * already solved; it is simply no longer on the path you get by default.
  */
 
-const CARD_VERSION = "1.8.6";
+const CARD_VERSION = "1.9.0";
 
 // Stills cost one HTTP request every few seconds; a live stream costs a decoder and a
 // socket for as long as it is open. With twenty doors on an account, "show me
@@ -28,7 +28,8 @@ const CARD_VERSION = "1.8.6";
 // Thirty seconds because the job is "where is that person standing" -- long enough to
 // look along a row of doors, short enough that walking away from the tablet cannot
 // leave twenty streams running. Press it again for another thirty; the setting raises
-// it for anyone who wants longer.
+// it for anyone who wants longer, and Shift on the wall's "Все вживую" takes the timer
+// off altogether -- for the times when watching, not glancing, is the whole point.
 const DEFAULT_LIVE_TIMEOUT = 30;
 
 // How often a still is re-fetched.
@@ -85,8 +86,14 @@ const t = {
   open: "Открыть",
   live: "Вживую",
   stop: "Стоп",
+  // The door's button is an icon with no room for a word, so its tooltip carries
+  // both the name and the key. The accessible name stays the short one.
+  liveShift: "Вживую. Shift + нажатие — не выключится само",
+  stopShift: "Стоп. Shift + нажатие — не выключится само",
+  stopNoTimer: "Стоп — само не выключится",
   liveAll: "Все вживую",
   stopAll: "Остановить",
+  stopAllNoTimer: "Остановить ∞",
   shot: "Текущий кадр",
   shooting: "Обновляю…",
   shotHint:
@@ -97,6 +104,8 @@ const t = {
   shotFail: "Кадры снять не удалось — нет видеопотока",
   shotNone: "На карточке нет камер",
   confirmLive: "Включить живое видео со всех камер? Это заметная нагрузка.",
+  confirmLiveNoTimer:
+    "Включить живое видео со всех камер и не выключать само? Это заметная нагрузка.",
   yes: "Да",
   no: "Нет",
   panelTitle: "Домофоны",
@@ -110,6 +119,12 @@ const t = {
   pickDoor: "Выберите домофон в настройках карточки",
   noDoors: "Домофоны не найдены. Проверьте, что интеграция Loki настроена.",
   liveBlocked: "Видеохост недоступен — живое видео не откроется",
+  liveShiftHint: "Shift + нажатие — не выключится само",
+  liveStopHint: "Нажать — выключить. Shift + нажатие — не выключится само",
+  liveNoTimerHint: "Само не выключится. Нажать — выключить",
+  // The label leans on one glyph, and a screen reader either says "infinity" in
+  // English or drops it -- leaving a button indistinguishable from the timed one.
+  stopAllSpelled: "Остановить — само не выключится",
   opening: "Открываю…",
   hangup: "Завершить",
   hangingUp: "Завершаю…",
@@ -1149,6 +1164,14 @@ const STYLE = `
     white-space: nowrap;
   }
   .loki-pill ha-icon { --mdc-icon-size: 16px; width: 16px; height: 16px; }
+  /* Shift + click is also the browser's own gesture for extending a selection, and
+     three of these are pressed that way on purpose: the wall's live button, the
+     door's camera button, and the confirmation's «Да». Without this the press
+     paints a selection from wherever the caret was last -- across the whole screen
+     on the one-door page, where the card fills it. */
+  .loki-pill,
+  .loki-icon-btn,
+  .loki-confirm button { user-select: none; -webkit-user-select: none; }
   .loki-pill[disabled] { opacity: 0.4; cursor: default; }
   .loki-pill.on {
     color: var(--text-primary-color, #fff);
@@ -1286,6 +1309,8 @@ class LokiDoorCard extends HTMLElement {
     this._live = false;
     this._built = false;
     this._liveTimer = null;
+    // Whether this run was asked for with Shift held: live until somebody says stop.
+    this._noTimer = false;
     this._autoLive = false;
   }
 
@@ -1371,7 +1396,7 @@ class LokiDoorCard extends HTMLElement {
     this._ringing.hidden = true;
 
     this._liveBtn = iconButton(ICON_LIVE, t.live);
-    this._liveBtn.addEventListener("click", () => this._toggleLive());
+    this._liveBtn.addEventListener("click", (event) => this._toggleLive(event));
 
     this._shotBtn = iconButton(ICON_SHOT, t.shot);
     this._shotBtn.style.right = "42px";
@@ -1486,6 +1511,12 @@ class LokiDoorCard extends HTMLElement {
     this._tickTimer(ringing);
 
     const reachable = streamReachable(hass, this._config.stream_sensor);
+    // See the wall's copy: a stream with no timer behind it must not outlive the
+    // host it comes from, because the button that would stop it is disabled.
+    if (!reachable && this._live) {
+      this._stopLive();
+      return;
+    }
     this._note.hidden = reachable;
     // Disabled rather than hidden: the button is the answer to "why can I not see
     // live video", and its tooltip says so. Letting it through would open an RTSP
@@ -1493,12 +1524,29 @@ class LokiDoorCard extends HTMLElement {
     this._shotBtn.disabled = !reachable;
     this._shotBtn.title = reachable ? t.shot : t.shotBlocked;
     this._liveBtn.disabled = !reachable;
-    this._liveBtn.title = reachable ? (this._live ? t.stop : t.live) : t.liveBlocked;
-    this._liveBtn.classList.toggle("on", this._live && reachable);
-    this._liveBtn.firstChild.setAttribute(
-      "icon",
-      this._live && reachable ? ICON_STOP : ICON_LIVE
-    );
+    const watching = this._live && reachable;
+    // Whether this door will stop by itself -- while it runs, that is exactly "is a
+    // timer armed". See the wall's copy of this line for why not the flag.
+    const unlimited = this._live
+      ? this._liveTimer === null
+      : !(Number(this._config.live_timeout) > 0);
+    // Two different jobs. The tooltip is the only place a modifier key can announce
+    // itself, so it carries the hint. The accessible name stays short while the
+    // stream is timed -- a seven-word button is noise in a screen reader -- and
+    // spells out "само не выключится" when it is not, because the ∞ that says so
+    // lives on the badge and an icon button has nowhere to put it.
+    let title = t.liveBlocked;
+    let ariaName = t.live;
+    if (reachable && watching) {
+      title = unlimited ? t.stopNoTimer : t.stopShift;
+      ariaName = unlimited ? t.stopNoTimer : t.stop;
+    } else if (reachable) {
+      title = unlimited ? t.live : t.liveShift;
+    }
+    this._liveBtn.title = title;
+    this._liveBtn.setAttribute("aria-label", ariaName);
+    this._liveBtn.classList.toggle("on", watching);
+    this._liveBtn.firstChild.setAttribute("icon", watching ? ICON_STOP : ICON_LIVE);
 
     // ``live: true`` -- what the door's own page sets, and what a wall panel woken by
     // a ring wants: the stream, not a still somebody has to walk over and tap. Once
@@ -1506,12 +1554,18 @@ class LokiDoorCard extends HTMLElement {
     // has stopped it, or after somebody stopped it by hand, it stays stopped.
     if (this._config.live && !this._autoLive && reachable) {
       this._autoLive = true;
-      this._toggleLive();
+      // Start, never toggle. setConfig clears _autoLive but keeps _live, so editing
+      // any unrelated option on a card carrying ``live: true`` used to fire this
+      // gate at a stream already running -- and turn it off, Shift and all.
+      if (!this._live) this._toggleLive();
       return;
     }
 
-    this._liveBadge.hidden = !(this._live && reachable);
-    this._media.render(camera, this._live && reachable);
+    this._liveBadge.hidden = !watching;
+    // The badge is the one thing already on the picture saying the stream is up, so
+    // it is where "and it will not stop by itself" belongs.
+    this._liveBadge.textContent = unlimited ? "LIVE ∞" : "LIVE";
+    this._media.render(camera, watching);
   }
 
   /** Keep the call timer running, and only while there is a call. */
@@ -1537,17 +1591,43 @@ class LokiDoorCard extends HTMLElement {
     this._bar.style.width = `${(left * 100).toFixed(1)}%`;
   }
 
-  _toggleLive() {
-    this._live = !this._live;
+  /** The camera button. Shift means "and leave it on".
+   *
+   * The same press means the same thing here as on the wall, and it has to: a door
+   * opened from a notification and a wall glanced at along a row are the same person
+   * on the same tablet ten seconds apart. No question first, though -- one stream is
+   * not twenty, and the wall's dialog is about the cost of the other nineteen.
+   *
+   * Called with no event by the auto-live path below, which is the door's own page
+   * and a wall panel woken by a ring: those keep the timeout they were configured
+   * with, because nobody was standing there to ask for otherwise.
+   */
+  _toggleLive(event) {
+    const noTimer = Boolean(event && event.shiftKey);
     if (this._live) {
-      const seconds = Number(this._config.live_timeout) || 0;
-      if (seconds > 0) {
-        this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
-      }
-      if (this._hass) this._update();
-    } else {
-      this._stopLive();
+      // Shift on a door already live takes the timer off rather than stopping it;
+      // the stream is open and paid for, and stopping it is the plain press.
+      if (noTimer) this._holdLive();
+      else this._stopLive();
+      return;
     }
+    this._live = true;
+    this._noTimer = noTimer;
+    const seconds = noTimer ? 0 : Number(this._config.live_timeout) || 0;
+    if (seconds > 0) {
+      this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
+    }
+    if (this._hass) this._update();
+  }
+
+  /** Take the timer off a door that is already live. */
+  _holdLive() {
+    if (this._liveTimer) {
+      window.clearTimeout(this._liveTimer);
+      this._liveTimer = null;
+    }
+    this._noTimer = true;
+    if (this._hass && this._built) this._update();
   }
 
   _stopLive() {
@@ -1555,6 +1635,8 @@ class LokiDoorCard extends HTMLElement {
       window.clearTimeout(this._liveTimer);
       this._liveTimer = null;
     }
+    // The key is spent with the stream it opened: the next press starts its own.
+    this._noTimer = false;
     if (!this._live) return;
     this._live = false;
     if (this._hass && this._built) this._update();
@@ -1606,6 +1688,9 @@ class LokiWallCard extends HTMLElement {
     this._tiles = new Map();
     this._built = false;
     this._liveTimer = null;
+    // Whether this run of the wall was asked for with Shift: live until somebody
+    // says stop, with no timer behind it.
+    this._noTimer = false;
     // The shared arrangement, when there is one. The sidebar page attaches a store;
     // a dashboard card never does, and shows its configured list as it is.
     this._store = null;
@@ -1798,7 +1883,7 @@ class LokiWallCard extends HTMLElement {
     this._liveIcon = icon(ICON_LIVE);
     this._liveLabel = el("span", null, t.liveAll);
     this._liveBtn.append(this._liveIcon, this._liveLabel);
-    this._liveBtn.addEventListener("click", () => this._askLive());
+    this._liveBtn.addEventListener("click", (event) => this._askLive(event));
 
     // The pencil. Only on a wall with a store behind it, and only for an admin:
     // the integration refuses anyone else's save, and a button that leads to a
@@ -1842,12 +1927,16 @@ class LokiWallCard extends HTMLElement {
     const question = el("div", "loki-question", t.confirmLive);
     const yes = el("button", "danger", t.yes);
     const no = el("button", null, t.no);
-    yes.addEventListener("click", () => {
+    yes.addEventListener("click", (event) => {
       this._confirm.hidden = true;
+      // Shift counts here too: the question is the last place to add "and leave it
+      // on" to a press that started without the key held.
+      if (event && event.shiftKey) this._noTimer = true;
       this._startLive();
     });
     no.addEventListener("click", () => {
       this._confirm.hidden = true;
+      this._noTimer = false;
     });
     this._confirm.append(question, yes, no);
     this._confirmQuestion = question;
@@ -1890,6 +1979,14 @@ class LokiWallCard extends HTMLElement {
     const { active, hidden, pending } = this._arranged();
     const editing = this._editing;
     const reachable = streamReachable(hass, this._config.stream_sensor);
+    // There is nothing to watch while the video host is away, and a wall held open
+    // with Shift has no timer to end it -- before 1.9.0 the timeout did this by
+    // itself. The button is disabled in that state, so a stream nobody can cancel
+    // must not sit out the outage and re-open when the host comes back.
+    if (!reachable && this._live) {
+      this._stopLive();
+      return;
+    }
     const canEdit = Boolean(
       this._store
         && this._layout
@@ -1914,15 +2011,39 @@ class LokiWallCard extends HTMLElement {
     this._shotBtn.title = reachable ? t.shotHint : t.shotBlocked;
     this._liveBtn.hidden = !idle;
     this._liveBtn.disabled = !reachable;
-    this._liveBtn.title = reachable ? "" : t.liveBlocked;
-    this._liveBtn.classList.toggle("on", this._live && reachable);
-    this._liveLabel.textContent = this._live && reachable ? t.stopAll : t.liveAll;
-    this._liveIcon.setAttribute(
-      "icon",
-      this._live && reachable ? ICON_STOP : ICON_LIVE
-    );
+    const watching = this._live && reachable;
+    const byConfig = !(Number(this._config.live_timeout) > 0);
+    // Whether this wall will stop by itself -- the fact, not the key that was held.
+    // While it runs, that fact is exactly "is a timer armed": true for Shift, for
+    // ``Сам выключить видео через`` = 0, and for a setting edited underneath a
+    // running stream, which _noTimer alone would have got backwards in both
+    // directions. Idle, the setting is all there is to go on -- the key that has
+    // not been answered for yet belongs to the question below, not to the button.
+    const unlimited = this._live ? this._liveTimer === null : byConfig;
+    // The tooltip is where the shortcut lives. A modifier key leaves no mark on the
+    // screen, so the button it belongs to is the only honest place to say it exists
+    // -- and there is nothing to offer on a wall that already never stops.
+    let hint = unlimited ? "" : t.liveShiftHint;
+    if (!reachable) hint = t.liveBlocked;
+    else if (watching) hint = unlimited ? t.liveNoTimerHint : t.liveStopHint;
+    this._liveBtn.title = hint;
+    this._liveBtn.classList.toggle("on", watching);
+    // The infinity sign rather than nothing: with nothing to stop it there is no
+    // other sign that this wall will still be streaming in an hour. In words as
+    // well as in the glyph -- the glyph alone does not survive a screen reader.
+    let label = t.liveAll;
+    if (watching) label = unlimited ? t.stopAllNoTimer : t.stopAll;
+    this._liveLabel.textContent = label;
+    if (watching && unlimited) this._liveBtn.setAttribute("aria-label", t.stopAllSpelled);
+    else this._liveBtn.removeAttribute("aria-label");
+    this._liveIcon.setAttribute("icon", watching ? ICON_STOP : ICON_LIVE);
     if (!reachable || editing) this._confirm.hidden = true;
-    this._confirmQuestion.textContent = `${t.confirmLive} Камер: ${active.length}.`;
+    // The question is asked before anything starts, so there is no timer to read:
+    // what it has to describe is what «Да» would do, and that is the key plus the
+    // setting.
+    this._confirmQuestion.textContent = `${
+      this._noTimer || byConfig ? t.confirmLiveNoTimer : t.confirmLive
+    } Камер: ${active.length}.`;
 
     this._editBtn.hidden = editing || !canEdit;
     this._doneBtn.hidden = !editing;
@@ -2372,18 +2493,50 @@ class LokiWallCard extends HTMLElement {
     }, 8000);
   }
 
-  /** Turning twenty streams on deserves a question, not a single tap. */
-  _askLive() {
+  /** Turning twenty streams on deserves a question, not a single tap.
+   *
+   * Shift is the modifier for "and leave it on". The timer is there so that walking
+   * away from the tablet cannot leave a wall of streams running; somebody standing
+   * in front of it watching is the one case it gets in the way of, and Shift is how
+   * that person says so. There is no touch equivalent, and deliberately so: a wall
+   * panel is exactly where a stream left on by accident costs the most.
+   */
+  _askLive(event) {
+    const noTimer = Boolean(event && event.shiftKey);
     if (this._live) {
-      this._stopLive();
+      // On a wall already live, Shift means "take the timer off", not "stop": these
+      // streams are open and paid for, and stopping them is what the plain press is
+      // for. No question either -- nothing new is being started.
+      if (noTimer) this._holdLive();
+      else this._stopLive();
       return;
     }
-    this._confirm.hidden = !this._confirm.hidden;
+    const asking = !this._confirm.hidden;
+    const changed = asking && noTimer !== this._noTimer;
+    this._noTimer = noTimer;
+    // A second press takes the question back. Unless the key changed which question
+    // it is -- that is somebody adding Shift to the press they just made, not
+    // backing out of it.
+    this._confirm.hidden = asking && !changed;
+    // Taken back is taken back, the same as pressing «Нет»: the two ways out must
+    // not disagree about what the wall was told.
+    if (this._confirm.hidden) this._noTimer = false;
+    if (this._hass && this._built) this._update();
+  }
+
+  /** Take the timer off a wall that is already live. */
+  _holdLive() {
+    if (this._liveTimer) {
+      window.clearTimeout(this._liveTimer);
+      this._liveTimer = null;
+    }
+    this._noTimer = true;
+    if (this._hass && this._built) this._update();
   }
 
   _startLive() {
     this._live = true;
-    const seconds = Number(this._config.live_timeout) || 0;
+    const seconds = this._noTimer ? 0 : Number(this._config.live_timeout) || 0;
     if (seconds > 0) {
       this._liveTimer = window.setTimeout(() => this._stopLive(), seconds * 1000);
     }
@@ -2395,6 +2548,9 @@ class LokiWallCard extends HTMLElement {
       window.clearTimeout(this._liveTimer);
       this._liveTimer = null;
     }
+    // The key is spent with the streams it opened. The next press asks its own
+    // question, and a flag left standing would have answered it in advance.
+    this._noTimer = false;
     if (!this._live) return;
     this._live = false;
     for (const tile of this._tiles.values()) tile.solo = false;
